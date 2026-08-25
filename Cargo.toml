@@ -10,6 +10,9 @@ rust-version = "1.82"
 [workspace.dependencies]
 nalgebra = "0.35"
 approx = "0.5"
+ron = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"

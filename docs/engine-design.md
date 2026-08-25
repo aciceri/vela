@@ -81,8 +81,10 @@ sweep without a window, the separation has failed. The CLI is the proof.
   file are **degrees** (human authoring); the API is radians.
 - **File geometry frame** (naval-architecture style): origin at the
   intersection of baseline, centerline, and aft perpendicular; **x forward,
-  y to port, z up** (right-handed). Hull assumed symmetric about y = 0; offsets
-  give the starboard half.
+  y to port, z up** (right-handed). The hull is symmetric about `y = 0` and
+  offsets are stored as non-negative **half-breadths**, which the loader
+  mirrors to both sides — the way published offset tables are written, and it
+  sidesteps the question of which side the file means.
 - **Dynamics frame** (engine-internal): Fossen body convention — x forward,
   y starboard, z down, origin at a fixed body reference point. The loader
   converts once; no other code ever sees the file frame.
@@ -94,13 +96,19 @@ Canonical hull representation is **sections** (station offset tables):
 ```ron
 hull: (
     stations: [
-        ( x: 0.0,  points: [ (y: 0.0, z: 0.10), (y: 0.42, z: 0.35), ... ] ),
-        ( x: 0.5,  points: [ ... ] ),
+        ( x: 0.0,  points: [ (y: 0.0, z: 0.26), (y: 0.53, z: 0.34), ... ] ),
+        ( x: 0.77, points: [ ... ] ),
         // ... 15–30 stations, transom to stem
     ],
-    deck_z: ...,          // deck edge line, needed for large-heel clipping
 )
 ```
+
+Each contour runs from the keel — which must sit on the centerline — outward
+and upward to the deck edge, with heights non-decreasing. The last point *is*
+the deck edge: there is no separate `deck_z`, because a single deck height
+cannot express sheer, and the deck line is already implied by where the
+contours stop. Bulbous forms, where breadth grows and then height falls back,
+are outside this representation and are rejected at load.
 
 Rationale:
 
@@ -114,8 +122,8 @@ Rationale:
 - Sections are compact, diffable, and hand-editable; meshes are none of those.
 
 For users who start from a mesh (STL/OBJ from a hull modeler), a converter
-lives in `vela-cli` (`vela-cli import-hull model.stl`) — mesh-to-sections is a
-tooling problem, not an engine-format problem.
+belongs in `vela-cli` — mesh-to-sections is a tooling problem, not an engine
+format problem. Not implemented yet.
 
 The *visual* hull model is explicitly **not** part of the boat physics file; a
 frontend may associate one by name/reference. Physics files must not grow

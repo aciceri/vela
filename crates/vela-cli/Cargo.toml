@@ -1,0 +1,9 @@
+[package]
+name = "vela-cli"
+description = "Headless driver for the Vela physics engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vela-core = { path = "../vela-core" }

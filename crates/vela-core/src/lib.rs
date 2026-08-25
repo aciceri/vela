@@ -27,12 +27,21 @@
 //!
 //! The world frame is NED (north, east, down), so gravity is `+z`.
 
+pub mod boat;
+pub mod clip;
 pub mod frames;
+pub mod geometry;
+pub mod hydrostatics;
+pub mod loft;
 pub mod mass;
 pub mod rigid_body;
 pub mod state;
 pub mod wrench;
 
+pub use boat::{BoatSpec, SpecError};
+pub use geometry::{Tri, TriMesh};
+pub use hydrostatics::{Flotation, FlotationError, Hydrostatics, Water};
+pub use loft::{loft_hull, LoftOptions};
 pub use mass::{MassError, MassProperties};
 pub use rigid_body::{Acceleration, RigidBody};
 pub use state::BodyState;

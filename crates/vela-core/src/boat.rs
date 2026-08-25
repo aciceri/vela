@@ -1,0 +1,427 @@
+//! The boat data format: geometry and mass properties, nothing else.
+//!
+//! Files are RON (canonical) or JSON (accepted for interop); both map onto the
+//! same serde types. Everything is SI, and the file works in the **file frame**
+//! documented in [`crate::frames`] — x forward, y half-breadth, z up from the
+//! baseline. The loader converts once, and no other code sees file-frame
+//! quantities.
+//!
+//! The hull is stored as **station offsets**, not a mesh. Strip theory, the
+//! Michell integral and the DSYHS parameter extraction all consume sections
+//! natively, so a mesh would be converted back to sections anyway, with loss.
+//! The physics mesh is lofted from these at load time by [`crate::loft`]; the
+//! visual mesh is a frontend concern and deliberately absent from this format.
+
+use crate::frames::file_to_body;
+use crate::mass::{MassError, MassProperties};
+use nalgebra::Vector3;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Format version understood by this build. Additive changes keep the number;
+/// anything that invalidates existing files bumps it.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// A complete boat definition.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BoatSpec {
+    pub schema_version: u32,
+    pub name: String,
+    pub hull: HullSpec,
+    pub mass: MassSpec,
+}
+
+/// Hull geometry as a longitudinal sequence of transverse sections.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HullSpec {
+    /// Stations ordered from aft to forward, strictly increasing in `x`.
+    pub stations: Vec<Station>,
+}
+
+/// One transverse section.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Station {
+    /// Longitudinal position, m, measured forward from the aft perpendicular.
+    pub x: f64,
+    /// Contour points ordered from the keel outward and upward to the deck
+    /// edge. The hull is assumed symmetric, so these are half-breadths.
+    pub points: Vec<Offset>,
+}
+
+/// A single offset: half-breadth and height above the baseline.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct Offset {
+    /// Half-breadth, m. Zero on the centerline, never negative — the loader
+    /// mirrors to both sides.
+    pub y: f64,
+    /// Height above the baseline, m.
+    pub z: f64,
+}
+
+/// Mass, centre of gravity and radii of gyration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MassSpec {
+    pub displacement_kg: f64,
+    /// Centre of gravity in the file frame, m.
+    pub cog: Point3Spec,
+    /// Radii of gyration about the body axes through the CoG, m.
+    pub gyradii: GyradiiSpec,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct Point3Spec {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct GyradiiSpec {
+    pub rx: f64,
+    pub ry: f64,
+    pub rz: f64,
+}
+
+/// Why a boat file was rejected.
+///
+/// Loading is strict on purpose: a hull that is subtly malformed produces
+/// plausible-looking but wrong hydrostatics, which is far more expensive to
+/// discover later than a refusal now.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpecError {
+    Syntax(String),
+    UnsupportedSchema {
+        found: u32,
+        expected: u32,
+    },
+    TooFewStations(usize),
+    StationsNotIncreasing {
+        index: usize,
+        x: f64,
+    },
+    TooFewPoints {
+        station: usize,
+        count: usize,
+    },
+    KeelOffCentreline {
+        station: usize,
+        y: f64,
+    },
+    NegativeHalfBreadth {
+        station: usize,
+        point: usize,
+        y: f64,
+    },
+    HeightNotAscending {
+        station: usize,
+        point: usize,
+    },
+    DegenerateSection {
+        station: usize,
+    },
+    Mass(MassError),
+}
+
+impl fmt::Display for SpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Syntax(message) => write!(f, "malformed boat file: {message}"),
+            Self::UnsupportedSchema { found, expected } => {
+                write!(f, "schema_version {found} is not supported (expected {expected})")
+            }
+            Self::TooFewStations(n) => {
+                write!(f, "a hull needs at least 2 stations, found {n}")
+            }
+            Self::StationsNotIncreasing { index, x } => write!(
+                f,
+                "station {index} at x = {x} does not lie forward of its predecessor"
+            ),
+            Self::TooFewPoints { station, count } => write!(
+                f,
+                "station {station} has {count} offsets; at least 2 are needed to form a contour"
+            ),
+            Self::KeelOffCentreline { station, y } => write!(
+                f,
+                "station {station} starts at half-breadth {y}; contours must start on the centerline"
+            ),
+            Self::NegativeHalfBreadth { station, point, y } => write!(
+                f,
+                "station {station} offset {point} has negative half-breadth {y}"
+            ),
+            Self::HeightNotAscending { station, point } => write!(
+                f,
+                "station {station} offset {point} drops below the previous one; \
+                 contours run from keel to deck and cannot fold back"
+            ),
+            Self::DegenerateSection { station } => {
+                write!(f, "station {station} has zero extent")
+            }
+            Self::Mass(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SpecError {}
+
+impl From<MassError> for SpecError {
+    fn from(error: MassError) -> Self {
+        Self::Mass(error)
+    }
+}
+
+impl BoatSpec {
+    /// Parses and validates RON.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecError`] on malformed syntax or a hull that fails validation.
+    pub fn parse_ron(text: &str) -> Result<Self, SpecError> {
+        let spec: Self =
+            ron::from_str(text).map_err(|error| SpecError::Syntax(error.to_string()))?;
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Parses and validates JSON.
+    ///
+    /// # Errors
+    ///
+    /// As [`BoatSpec::parse_ron`].
+    pub fn parse_json(text: &str) -> Result<Self, SpecError> {
+        let spec: Self =
+            serde_json::from_str(text).map_err(|error| SpecError::Syntax(error.to_string()))?;
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// # Errors
+    ///
+    /// [`SpecError`] describing the first problem found.
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(SpecError::UnsupportedSchema {
+                found: self.schema_version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        self.hull.validate()?;
+        self.mass_properties()?;
+        Ok(())
+    }
+
+    /// Mass properties converted into the body frame.
+    ///
+    /// Radii of gyration survive the conversion untouched: the file and body
+    /// frames share their axes and differ only in the direction of two of them,
+    /// and a radius about an axis does not care which way the axis points.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecError::Mass`] if the mass or gyradii are not physical.
+    pub fn mass_properties(&self) -> Result<MassProperties, SpecError> {
+        let cog = file_to_body(Vector3::new(
+            self.mass.cog.x,
+            self.mass.cog.y,
+            self.mass.cog.z,
+        ));
+        let gyradii = Vector3::new(
+            self.mass.gyradii.rx,
+            self.mass.gyradii.ry,
+            self.mass.gyradii.rz,
+        );
+        Ok(MassProperties::from_gyradii(
+            self.mass.displacement_kg,
+            cog,
+            gyradii,
+        )?)
+    }
+}
+
+impl HullSpec {
+    /// # Errors
+    ///
+    /// [`SpecError`] describing the first problem found.
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if self.stations.len() < 2 {
+            return Err(SpecError::TooFewStations(self.stations.len()));
+        }
+
+        for (index, station) in self.stations.iter().enumerate() {
+            if index > 0 && station.x <= self.stations[index - 1].x {
+                return Err(SpecError::StationsNotIncreasing {
+                    index,
+                    x: station.x,
+                });
+            }
+            if station.points.len() < 2 {
+                return Err(SpecError::TooFewPoints {
+                    station: index,
+                    count: station.points.len(),
+                });
+            }
+            if station.points[0].y.abs() > 1e-9 {
+                return Err(SpecError::KeelOffCentreline {
+                    station: index,
+                    y: station.points[0].y,
+                });
+            }
+            for (point, offset) in station.points.iter().enumerate() {
+                if offset.y < 0.0 {
+                    return Err(SpecError::NegativeHalfBreadth {
+                        station: index,
+                        point,
+                        y: offset.y,
+                    });
+                }
+                if point > 0 && offset.z < station.points[point - 1].z - 1e-12 {
+                    return Err(SpecError::HeightNotAscending {
+                        station: index,
+                        point,
+                    });
+                }
+            }
+            if station.extent() <= 0.0 {
+                return Err(SpecError::DegenerateSection { station: index });
+            }
+        }
+        Ok(())
+    }
+
+    /// Waterline length between the outermost stations, m.
+    #[must_use]
+    pub fn length(&self) -> f64 {
+        match (self.stations.first(), self.stations.last()) {
+            (Some(first), Some(last)) => last.x - first.x,
+            _ => 0.0,
+        }
+    }
+
+    /// Greatest half-breadth anywhere on the hull, m.
+    #[must_use]
+    pub fn max_half_breadth(&self) -> f64 {
+        self.stations
+            .iter()
+            .flat_map(|s| s.points.iter())
+            .map(|p| p.y)
+            .fold(0.0, f64::max)
+    }
+}
+
+impl Station {
+    /// Arc length of the contour, used to reject sections that are a single
+    /// repeated point.
+    #[must_use]
+    pub fn extent(&self) -> f64 {
+        self.points
+            .windows(2)
+            .map(|pair| {
+                let (a, b) = (pair[0], pair[1]);
+                ((b.y - a.y).powi(2) + (b.z - a.z).powi(2)).sqrt()
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+        (
+            schema_version: 1,
+            name: "test",
+            hull: (
+                stations: [
+                    (x: 0.0, points: [(y: 0.0, z: 0.0), (y: 1.0, z: 1.0)]),
+                    (x: 2.0, points: [(y: 0.0, z: 0.0), (y: 1.0, z: 1.0)]),
+                ],
+            ),
+            mass: (
+                displacement_kg: 1000.0,
+                cog: (x: 1.0, y: 0.0, z: 0.5),
+                gyradii: (rx: 0.5, ry: 1.0, rz: 1.0),
+            ),
+        )
+    "#;
+
+    fn spec() -> BoatSpec {
+        BoatSpec::parse_ron(MINIMAL).expect("valid spec")
+    }
+
+    #[test]
+    fn parses_a_minimal_hull() {
+        let spec = spec();
+        assert_eq!(spec.name, "test");
+        assert_eq!(spec.hull.stations.len(), 2);
+        assert!((spec.hull.length() - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cog_is_converted_into_the_body_frame() {
+        let mass = spec().mass_properties().expect("valid mass");
+        // File z is up from the baseline, body z is down: the sign flips.
+        assert!((mass.cog().z + 0.5).abs() < 1e-12);
+        assert!((mass.cog().x - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejects_a_future_schema() {
+        let text = MINIMAL.replace("schema_version: 1", "schema_version: 99");
+        assert_eq!(
+            BoatSpec::parse_ron(&text).expect_err("must be rejected"),
+            SpecError::UnsupportedSchema {
+                found: 99,
+                expected: SCHEMA_VERSION
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_stations_out_of_order() {
+        let text = MINIMAL.replace("x: 2.0", "x: -1.0");
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::StationsNotIncreasing { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_contour_that_misses_the_centerline() {
+        let text = MINIMAL.replacen("(y: 0.0, z: 0.0)", "(y: 0.3, z: 0.0)", 1);
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::KeelOffCentreline { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_contour_that_folds_back_downward() {
+        let text = MINIMAL.replacen(
+            "(y: 0.0, z: 0.0), (y: 1.0, z: 1.0)",
+            "(y: 0.0, z: 0.0), (y: 1.0, z: 1.0), (y: 1.2, z: 0.5)",
+            1,
+        );
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::HeightNotAscending { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_non_physical_mass() {
+        let text = MINIMAL.replace("displacement_kg: 1000.0", "displacement_kg: -5.0");
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::Mass(_))
+        ));
+    }
+
+    #[test]
+    fn json_and_ron_agree() {
+        let from_ron = spec();
+        let json = serde_json::to_string(&from_ron).expect("serializable");
+        let from_json = BoatSpec::parse_json(&json).expect("valid json");
+        assert_eq!(from_ron.name, from_json.name);
+        assert_eq!(from_ron.hull.stations.len(), from_json.hull.stations.len());
+    }
+}
