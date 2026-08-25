@@ -1,0 +1,473 @@
+# Vela — Functional Analysis of the Physics Engine
+
+Status: draft for discussion. Abstract level: no code, no crate layout beyond what the physics dictates.
+Language: English (project convention). Discussion happens wherever it happens.
+Companion: `engine-design.md` owns the interfaces (crate boundaries, boat data
+format, force-module contract).
+
+---
+
+## 1. Goal and scope
+
+A browser-based **physics simulator** (not an arcade game) of a sailing yacht:
+
+- Forces computed live from first principles or experiment-derived regressions — no precomputed
+  polar lookup as the primary model.
+- Boats are **data files**: hull geometry, rig/sail plan, appendages, mass properties
+  (mass, CoG, inertia tensor).
+- Rigid body with 6 degrees of freedom, integrated in the time domain.
+- Target: `wasm32-unknown-unknown`, 60 Hz render loop, single-threaded physics budget
+  (wasm threads require COOP/COEP headers we cannot assume from static hosting).
+
+In the academic taxonomy this is a **DVPP** — a *Dynamic Velocity Prediction Program*:
+a time-domain 6-DOF simulation balancing aerodynamic and hydrodynamic force models,
+as opposed to a classic steady-state VPP. First reported by Day et al. (2002); the
+architecture below matches the "system-based approach" of modern DVPPs
+[[Horel et al. 2020]](#bib-dvpp2020), which superpose independently-modeled force
+components rather than solving the flow around the whole boat.
+
+### Non-goals
+
+- No runtime CFD. RANS/LES stays offline, as an optional source of override
+  coefficients baked into boat files, and as a validation tool.
+- No aeroelastic membrane FEM for sails at runtime (see §4.3 for the parametric
+  substitute).
+- No shallow-water effects in v1 (the TMA spectrum extension is noted in §6 as a
+  future hook).
+
+---
+
+## 2. Architecture: two-stage pipeline
+
+The core architectural decision: **"real-time" constrains per-frame cost, not
+per-boat-load cost.** Generic hull handling is achieved by running cheap
+potential-flow computations at load time (seconds), producing compact runtime
+artifacts (tables, state-space models, fitted parameters) evaluated per frame
+(microseconds).
+
+```mermaid
+flowchart LR
+    subgraph LOAD["Boat load (~seconds, once)"]
+        G[Hull mesh / sections] --> M["Michell integral → Rw(Fn, heel) table"]
+        G --> ST["Strip theory (Lewis forms) → A(ω), B(ω)"]
+        ST --> SS["State-space fit of radiation memory (Cummins)"]
+        G --> HY["Hydrostatics: volume, wetted area, metacentrics"]
+        G --> SV["Savitsky parameters (planing regime)"]
+        R[Rig / sail plan] --> PN["Sail panelization + AIC matrix factorization"]
+    end
+    subgraph FRAME["Per frame (60+ Hz)"]
+        W["Wind field sample"] --> VLM["VLM RHS solve → sail forces"]
+        PN2["Refactorize AIC only on trim change"] -.-> VLM
+        CLIP["Hull mesh clip vs FFT wave surface"] --> FK["Hydrostatic + Froude-Krylov pressure integration"]
+        RW["Interp Rw table"] --> SUM
+        RAD["Radiation state-space eval"] --> SUM
+        ITTC["ITTC-57 friction + form factor"] --> SUM
+        APP["Appendage lift/drag (EKM + downwash)"] --> SUM
+        VLM --> SUM["Force/moment summation"]
+        FK --> SUM
+        SUM --> INT["6-DOF integrator"]
+    end
+    M -.-> RW
+    SS -.-> RAD
+    PN -.-> PN2
+```
+
+Physics lives in a pure-Rust crate with **zero renderer dependencies**: testable
+headless in native builds (regression suites, polar generation), with the
+Bevy/wasm frontend as a replaceable consumer. This also insulates the physics
+from Bevy's release churn.
+
+A second consequence: the boat file stores **only geometry and mass properties**.
+No baked coefficients required (though an override slot exists, §9). Anyone can
+author a boat without running a preprocessing toolchain.
+
+---
+
+## 3. Rigid body and state
+
+- Single rigid body, 6 DOF. State: position, orientation (unit quaternion),
+  linear and angular velocity in body frame. Standard marine-craft kinematics
+  and notation per Fossen [[Fossen 2011]](#bib-fossen).
+- Force superposition (the DVPP "system-based" decomposition): aerodynamic
+  (sails + windage), hydrostatic/Froude-Krylov, radiation, hull resistance,
+  appendage lift/drag, damping corrections.
+- Integrator: fixed-step **semi-implicit (symplectic) Euler or RK4**, hand-rolled.
+  Adaptive-step ODE library solvers are the wrong shape for a real-time loop
+  (variable cost per frame, no interpolation contract with rendering).
+  Quaternion renormalization each step.
+- Physics step decoupled from render rate: physics at fixed `dt` (e.g. 120 Hz
+  substeps for stiff heel dynamics), render interpolates. The VLM may run at a
+  lower cadence (10–20 Hz) with force interpolation — aerodynamic time scales
+  are slow relative to the frame rate.
+
+Added mass is **not optional**: for a hull in water the hydrodynamic added mass is
+the same order as the boat's mass, and omitting it produces wrong accelerations in
+every transient (tacks, gusts, waves). It enters through the strip-theory
+coefficients (§5.3) as the constant infinite-frequency added mass matrix, with the
+frequency-dependent remainder handled by the radiation memory term.
+
+---
+
+## 4. Aerodynamics
+
+### 4.1 Sails — Vortex Lattice Method (upwind / attached-flow regime)
+
+Live VLM over the sail plan, a few hundred panels:
+
+- Horseshoe/ring vortices, no-penetration boundary condition → dense linear
+  system `A·Γ = b`.
+- **The AIC matrix `A` depends only on geometry.** Factorize (LU) only when the
+  flying shape changes (trim input); per-frame work is a right-hand-side solve —
+  O(N²), sub-millisecond at N ≈ 300.
+- Output: lift distribution, induced drag, force and moment including heeling
+  moment from the vertical distribution — the main advantage over sail-area
+  coefficient models, which ignore planform and twist entirely.
+
+VLM for sail plans in upwind conditions is well established
+[[Ramolini 2009]](#bib-vlm-upwind); full-scale validation of VLM-based FSI
+against instrumented boats shows inviscid methods hold up well while flow is
+attached [[Augier et al. 2016]](#bib-inviscid). Real-time *unsteady* VLM
+(deformable wake) is demonstrably feasible on current hardware
+[[AIAA 2025]](#bib-uvlm-rt) — we keep the steady VLM with quasi-steady onset
+flow as the baseline and treat UVLM as a possible upgrade, not a requirement.
+
+Viscous corrections the VLM cannot see, applied on top: friction drag of the
+sail surface (flat-plate estimate), mast and rigging parasite drag (windage),
+per Larsson & Eliasson [[L&E]](#bib-le) and the IMS/ORC aero model lineage
+[[Hazen 1980]](#bib-hazen), [[ORC VPP doc]](#bib-orc).
+
+### 4.2 Separated-flow regime (downwind) — blended semi-empirical model
+
+Potential flow dies at large effective angles of attack. Strategy:
+
+- Per sail, estimate an effective angle of attack; beyond a stall threshold,
+  **blend VLM output toward wind-tunnel-derived force coefficients**
+  (smooth blending weight, no discontinuity in forces).
+- Downwind coefficient sources: parametric spinnaker wind-tunnel series —
+  camber ratio, aspect ratio, sweep systematically varied
+  [[Lasher & Richards 2005]](#bib-spi); the Politecnico di Milano twisted-flow
+  wind tunnel campaigns and the semi-empirical models built on them
+  [[Fossati 2009]](#bib-fossati); cross-tunnel comparisons quantify the
+  uncertainty band we inherit (~10–15% on lift)
+  [[Campbell 2014]](#bib-tunnels).
+- On a dead run the dominant parameter is projected area
+  [[Lasher & Richards 2005]](#bib-spi) — the blended model degrades gracefully
+  to bluff-body drag, which is the physically correct limit.
+
+This is the honest state of the art short of RANS: every VPP in production use
+does the same. Accuracy downwind is coefficient-limited, and we document that.
+
+### 4.3 Flying shape — parametric, not FSI
+
+Sail controls (halyard, cunningham, vang, sheet, traveler, backstay) do not act
+on a rigid mesh; they act on the **flying shape**. Runtime membrane FEM (the
+ARAVANTI-style FSI loop [[Augier et al. 2016]](#bib-inviscid)) is out of scope.
+Instead:
+
+- The sail is defined by a small set of shape parameters per section: camber,
+  draft position, twist, entry/exit angles.
+- Controls map to shape parameters through smooth empirical response functions
+  (sail-trim literature and L&E give the qualitative derivatives; tuning against
+  published flying-shape measurements [[Deparday et al. 2014]](#bib-deparday)).
+- The VLM panels are regenerated from the parametric shape; AIC refactorization
+  happens only on shape change (see §4.1).
+
+This keeps controls physically meaningful (vang tension reduces twist → changes
+vertical force distribution → changes heeling moment) at negligible runtime cost.
+
+### 4.4 Wind model
+
+- Mean wind: speed + direction, **vertical shear** (log/power profile) and the
+  resulting apparent-wind twist over sail height — first-order effects on sail
+  loading, cheap to compute.
+- Gustiness: optional stochastic modulation (Ornstein-Uhlenbeck or filtered
+  noise on speed/direction). Abstract requirement: temporally correlated, no
+  white-noise steps.
+
+---
+
+## 5. Hydrodynamics — hull
+
+Two models coexist by design (see §10 Validation): the DSYHS regression model
+(phase 1 runtime, later demoted to test oracle) and the generic pipeline
+(phase 3 runtime).
+
+### 5.1 DSYHS regression model (phase 1)
+
+Polynomial regressions from the Delft Systematic Yacht Hull Series (~70 hulls,
+consistent tank campaign): residuary resistance, heel and induced-resistance
+corrections. Primary source: Keuning & Katgert (2008), the latest bare-hull
+formulation, extended to Fn ≈ 0.75 [[K&K 2008]](#bib-kk2008); foundation series
+paper [[Gerritsma et al. 1981]](#bib-gerritsma); the textbook treatment with
+worked coefficients in [[L&E]](#bib-le) and [[Fossati 2009]](#bib-fossati).
+Accuracy within the parameter envelope: ~5% on upright resistance
+[[K&K 2008]](#bib-kk2008).
+
+**Load-time validation gate:** hull parameters (L/B, B/T, Cp, LCB, Fn range)
+are checked against the DSYHS envelope; out-of-range hulls are refused by this
+model (they route to the generic pipeline once it exists). Regression
+polynomials extrapolate silently and catastrophically — refusing is a feature.
+
+### 5.2 Generic resistance pipeline (phase 3)
+
+Resistance decomposition, one method per physical component:
+
+| Component | Method | Stage | Source |
+|---|---|---|---|
+| Friction | ITTC-57 line + form factor from wetted geometry | per frame (closed formula) | [[ITTC-57]](#bib-ittc) |
+| Wave-making | Michell thin-ship integral → `Rw(Fn, heel)` table | load time | [[Michell 1898]](#bib-michell), [[Tuck 1989]](#bib-tuck) |
+| Planing lift/drag | Savitsky method, blended in above Fn ≈ 0.6–0.8 | load time (params) | [[Savitsky 1964]](#bib-savitsky) |
+| Heel/leeway induced | appendage model (§5.4) + hull side-force share | per frame | [[KKV 2006]](#bib-kkv) |
+
+Michell caveats, acknowledged: accuracy degrades at low Fn (< 0.30) and for
+beamy, non-slender hulls; modern viscous/nonlinear corrections exist and are
+adoptable incrementally [[Improved Michell 2020]](#bib-michell2020), as is the
+Neumann-Michell refinement [[Noblesse et al. 2013]](#bib-nm). The
+displacement→planing transition band is the least accurate region of the whole
+model — same limitation as commercial predictors
+[[Savitsky review 2021]](#bib-savitsky-rev). We state this in user-facing docs
+rather than pretending otherwise.
+
+### 5.3 Seakeeping: added mass, radiation damping, memory
+
+Frequency-domain coefficients from **strip theory** over 20–40 hull sections
+(Lewis conformal-mapping sections: closed-form 2D added mass/damping), then
+time-domain via the **Cummins equation** [[Cummins 1962]](#bib-cummins),
+[[Ogilvie 1964]](#bib-ogilvie): constant infinite-frequency added mass plus a
+convolution over velocity history (fluid memory).
+
+The convolution is unsuitable for a real-time loop; standard practice replaces
+it with a fitted low-order **state-space model** (2–4 states per significant
+DOF), identified from the frequency-domain data — the Perez & Fossen FDI
+methodology, with known guardrails on passivity and low-frequency asymptotics
+[[Perez & Fossen 2008]](#bib-pf2008), [[Perez & Fossen 2009]](#bib-pf2009),
+[[Taghipour et al. 2008]](#bib-taghipour). Runtime cost: a handful of
+multiply-adds per DOF per step. The MSS toolbox is the reference implementation
+to port the fitting algorithm from [[MSS]](#bib-mss).
+
+Roll is special: strip-theory potential damping in roll is far too small;
+viscous/eddy/appendage roll damping is added empirically (Ikeda-type components
+or a calibrated quadratic damping term) — noted as a calibration point, not an
+afterthought.
+
+### 5.4 Appendages: keel and rudder
+
+Wing-theory model per appendage:
+
+- Lift-curve slope from effective aspect ratio; the hull acts as an endplate —
+  the **Extended Keel Method** mirrors the planform at the hull
+  [[Gerritsma, via EKM]](#bib-ekm).
+- **Keel→rudder downwash**: the keel's circulation reduces the rudder's
+  effective angle of attack (classically ~60% of leeway for typical layouts;
+  improved formulations in [[KKV 2006]](#bib-kkv)). Without this, yaw balance
+  and helm feel are wrong.
+- Profile drag from section data (NACA polars); induced drag from lifting-line.
+- Stall: clamp + post-stall coefficient blend, same philosophy as §4.2.
+- Yaw moment and center of lateral resistance emerge from the keel/rudder/hull
+  force split — the property that makes tacking, luffing, and lee/weather helm
+  behave.
+
+Unsteady lift effects during fast maneuvers (transient circulation buildup,
+Wagner-type lag) are documented as a known simplification; quasi-steady is
+acceptable at yacht time scales [[Modeling transient lift 2019]](#bib-transient).
+
+### 5.5 Buoyancy and wave excitation — mesh clipping
+
+Per frame, on the actual hull triangle mesh (2–5k triangles):
+
+- Clip each triangle against the instantaneous FFT wave surface
+  ("marching-triangles" clipping, linear interpolation along crossing edges).
+- Integrate hydrostatic pressure + incident-wave dynamic pressure
+  (**Froude-Krylov**) over the submerged set.
+- This yields, generically for any geometry: buoyancy, nonlinear restoring at
+  large heel (righting-moment curve emerges from geometry, including deck-edge
+  immersion), and wave excitation forces. Diffraction is neglected (justifiable
+  for wavelengths long relative to beam; stated limitation).
+
+The technique is proven in real-time contexts [[Kerner 2015]](#bib-kerner) and
+in recent literature with sub-3% volume error at 60 Hz
+[[SIGGRAPH Asia 2025]](#bib-siggraph); our contribution is pairing it with the
+radiation model of §5.3 so that the 6-DOF response in waves is properly damped —
+the piece game implementations fake with tuned drag.
+
+---
+
+## 6. Waves and sea surface
+
+- Directional spectrum: **Pierson-Moskowitz** (fully developed) and **JONSWAP**
+  (fetch-limited, peak-enhancement γ) [[Hasselmann et al. 1973]](#bib-jonswap),
+  with a directional spreading function; Horvath's empirically-based directional
+  spectrum and "swell" parameter as the quality upgrade
+  [[Horvath 2015]](#bib-horvath).
+- Synthesis: Tessendorf FFT height field + horizontal displacement (choppy
+  waves), tileable, on a grid sized so that `dx ≪ V²/g`
+  [[Tessendorf 2001]](#bib-tessendorf).
+- **One surface, two consumers**: the same spectral realization drives rendering
+  (GPU) and physics (CPU-side height/velocity/pressure queries for §5.5). The
+  physics query path needs the height field *and* the incident-wave kinematics
+  (orbital velocities, dynamic pressure at depth via linear wave theory decay).
+- Future hooks, out of v1 scope: TMA shallow-water correction; local
+  wave-particle patches for boat wake interaction
+  [[Hybrid ocean 2025]](#bib-hybrid).
+
+---
+
+## 7. Frame budget (estimate, single wasm thread)
+
+| Item | Cadence | Est. cost |
+|---|---|---|
+| VLM RHS solve (N≈300) | 10–20 Hz | ~0.1–0.3 ms |
+| AIC refactorization | on trim change | ~1–3 ms (amortized) |
+| Mesh clip + pressure integration (2–5k tris) | every physics step | ~0.3–1 ms |
+| Radiation state-space, resistance tables, appendages | every physics step | ≪ 0.1 ms |
+| FFT surface (256²–512²) | every frame | GPU-side; CPU inverse for physics patch ~0.5 ms |
+| 6-DOF integration | every physics step | negligible |
+
+These are estimates to be validated by benchmarks in native and wasm builds
+before any architectural commitment hardens. If the clip step dominates, a
+lower-resolution physics proxy mesh (decimated hull) is the first lever.
+
+---
+
+## 8. Numerical libraries (constraints, not bindings)
+
+- `nalgebra` for linear algebra types; `faer` for the dense LU of the AIC
+  (pure Rust, no system BLAS — wasm-safe).
+- `rustfft` for spectral synthesis (wasm-clean).
+- No `ndarray` unless a concrete need appears; no adaptive ODE crate (§3).
+- Determinism: fixed `dt` + no platform intrinsics in the physics path keeps
+  native and wasm trajectories comparable for regression testing (within FP
+  reassociation noise; exact bit-parity is not a goal).
+
+---
+
+## 9. Boat data model (abstract schema)
+
+Boat file (RON or JSON), geometry-only by principle:
+
+- **Hull**: triangle mesh or section offsets (sections preferred: strip theory
+  and Michell both consume sections natively; mesh derivable).
+- **Appendages**: per foil — planform (root/tip chord, span, sweep), section
+  family, location.
+- **Rig & sails**: per sail — parametric shape definition (§4.3), luff/foot
+  dimensions, sheeting geometry; mast/rigging windage elements.
+- **Mass**: displacement, CoG, inertia tensor (or radii of gyration).
+- **Overrides** (optional, forward-compatibility): externally computed
+  coefficient tables (e.g. offline CFD for a wave-piercer outside all slender
+  theories) that replace individual pipeline stages. The schema reserves this
+  slot from day one.
+
+Load-time validation: DSYHS envelope check (§5.1), slenderness sanity for
+Michell, mass/hydrostatics consistency (does it float level?).
+
+---
+
+## 10. Validation strategy
+
+Layered, automated, running in CI on the native build:
+
+1. **Unit oracles**: VLM against analytic elliptic-wing results and published
+   AR-sweep lift slopes; Michell against Wigley-hull benchmark data; strip
+   theory against published Lewis-form coefficients.
+2. **DSYHS as regression oracle**: for in-envelope hulls, the generic pipeline
+   (§5.2) must reproduce K&K 2008 resistance within a stated tolerance band
+   across Fn/heel/leeway sweeps. The phase-1 DSYHS implementation *is* the
+   oracle — no wasted work.
+3. **Polar-level checks**: steady-state polars generated by driving the DVPP to
+   equilibrium, compared against published VPP polars for a reference design
+   (e.g. a Sysser hull with a standard rig, or ORC certificates).
+4. **Behavioral invariants**: energy sanity (no perpetual acceleration),
+   passivity of the fitted radiation models (a known failure mode of
+   state-space fits [[Perez & Fossen 2008]](#bib-pf2008)), symmetric response
+   port/starboard, righting-moment curve monotonicity checks against
+   hydrostatics.
+5. **ML-assisted extension (watchlist, not commitment)**: recent work trains
+   GPR/ML surrogates on tank + CFD data to extend beyond the DSYHS envelope
+   [[ML resistance 2022]](#bib-ml2022), [[GPR 2024]](#bib-gpr2024) — a candidate
+   future replacement for the Michell stage on unconventional hulls, consuming
+   the same override slot (§9).
+
+---
+
+## 11. Build order (risk-ordered)
+
+| Phase | Deliverable | New physics |
+|---|---|---|
+| 1 | Boat sails on flat water, playable | DSYHS hull + EKM appendages + tabular sail coefficients (Hazen/ORC-style), 6-DOF, wind shear |
+| 2 | Physical sail trim | VLM + parametric flying shape + downwind blending |
+| 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle |
+| 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation |
+
+Rationale: phase 1 produces a testable sailing boat in weeks; every later phase
+replaces one force component behind a stable interface and is validated against
+the previous phase plus the oracles of §10. The classic failure mode — building
+the VLM first and never having a boat that sails — is designed out.
+
+---
+
+## 12. Bibliography
+
+Textbooks / foundations:
+
+- <a id="bib-le"></a>Larsson, L. & Eliasson, R., *Principles of Yacht Design*. Primary reference for hull model structure, aero coefficients, appendage treatment.
+- <a id="bib-fossati"></a>Fossati, F., *Aero-Hydrodynamics and the Performance of Sailing Yachts*, 2009. VPP force models end-to-end; wind-tunnel sail coefficient methodology.
+- <a id="bib-fossen"></a>Fossen, T.I., *Handbook of Marine Craft Hydrodynamics and Motion Control*, Wiley 2011. 6-DOF notation, kinematics, seakeeping-to-time-domain machinery.
+
+Hull resistance:
+
+- <a id="bib-gerritsma"></a>Gerritsma, Onnink & Versluis, "Geometry, resistance and stability of the Delft Systematic Yacht Hull Series", ISP 28, 1981. https://repository.tudelft.nl/islandora/object/uuid:b1ea34c0-a2ad-40ca-a532-c3ec094c7205
+- <a id="bib-kk2008"></a>Keuning & Katgert, "A bare hull resistance prediction method derived from the results of the DSYHS extended to higher speeds", HISWA/Lorient 2008. https://repository.tudelft.nl/islandora/object/uuid:98063fdf-c4de-47b1-bb75-e10f65878bf9
+- <a id="bib-michell"></a>Michell, J.H., "The wave resistance of a ship", Phil. Mag. 1898.
+- <a id="bib-tuck"></a>Tuck, E.O., "The wave resistance formula of J.H. Michell (1898) and its significance to recent research in ship hydrodynamics", ANZIAM J. 1989. https://www.cambridge.org/core/journals/anziam-journal/article/wave-resistance-formula-of-jh-michell-1898-and-its-significance-to-recent-research-in-ship-hydrodynamics/6D0B69CE2AE6BDC1D06BA675F1C4DEDD
+- <a id="bib-michell2020"></a>"Improved estimation of ship wave-making resistance", Ocean Engineering 2020 (viscous/nonlinear corrections extending Michell to non-slender hulls). https://www.sciencedirect.com/science/article/abs/pii/S0029801820301517
+- <a id="bib-nm"></a>Noblesse et al., "The Neumann-Michell theory of ship waves", J. Eng. Math. 2013.
+- <a id="bib-savitsky"></a>Savitsky, D., "Hydrodynamic Design of Planing Hulls", Marine Technology 1964.
+- <a id="bib-savitsky-rev"></a>"A review of Savitsky pre-planing method to the resistance of semi-displacement passenger ships", AIP Conf. Proc. 2409, 2021 (accuracy bands in the transition regime). https://pubs.aip.org/aip/acp/article/2409/1/020021/750108
+- <a id="bib-ittc"></a>ITTC 1957 model-ship correlation line (ITTC Recommended Procedures).
+
+Appendages / maneuvering:
+
+- <a id="bib-ekm"></a>Gerritsma's Extended Keel Method — treatment in L&E and in Keuning et al.; side-force prediction from DSYHS: https://repository.tudelft.nl/islandora/object/uuid:d2653979-33b2-4c51-ac45-2101374107ba
+- <a id="bib-kkv"></a>Keuning, Katgert & Vermeulen, "The Yaw Balance of Sailing Yachts Upright and Heeled", CSYS 2006/2007 (keel→rudder downwash, effective AR, yaw moment under heel).
+- <a id="bib-transient"></a>"Modeling of transient hydrodynamic lifting forces of sailing yachts and study of their effect on maneuvering in waves", Ocean Engineering 2019. https://www.sciencedirect.com/science/article/abs/pii/S0029801819300228
+
+Seakeeping / time-domain:
+
+- <a id="bib-cummins"></a>Cummins, W.E., "The impulse response function and ship motions", Schiffstechnik 1962.
+- <a id="bib-ogilvie"></a>Ogilvie, T.F., "Recent progress toward the understanding and prediction of ship motions", ONR Symp. 1964.
+- <a id="bib-pf2008"></a>Perez & Fossen, "Time- vs. frequency-domain identification of parametric radiation force models for marine structures", MIC 2008 (FDI methodology; passivity and asymptotic pitfalls).
+- <a id="bib-pf2009"></a>Perez & Fossen, "A Matlab toolbox for parametric identification of radiation-force models of ships and offshore structures", MIC 2009.
+- <a id="bib-taghipour"></a>Taghipour, Perez & Moan, "Hybrid frequency-time domain models for dynamic response analysis of marine structures", Ocean Engineering 2008. https://www.researchgate.net/publication/223453652
+- <a id="bib-mss"></a>MSS — Marine Systems Simulator (Fossen & Perez), reference implementation. https://github.com/cybergalactic/MSS
+
+DVPP context:
+
+- <a id="bib-dvpp2020"></a>Horel et al., "Development of a 6-DOF Dynamic Velocity Prediction Program for offshore racing yachts", Ocean Engineering 2020. https://www.sciencedirect.com/science/article/abs/pii/S0029801820306624
+- Day, A.H. et al., first 6-DOF time-domain sailing simulation tool, 2002 (cited therein).
+- <a id="bib-lourens"></a>Lourens & Wellens, "Predicting crashes of a foiling ocean racing yacht in waves by means of a DVPP", IJME 2025. https://journals.sagepub.com/doi/10.1177/0020868X251368220
+
+Sail aerodynamics:
+
+- <a id="bib-vlm-upwind"></a>"Application of a Vortex Lattice Method to the analysis of sail plans in upwind condition", 2009. https://www.researchgate.net/publication/267554991
+- <a id="bib-inviscid"></a>Augier, Bot, Hauville, Durand et al., "Inviscid approach for upwind sails aerodynamics. How far can we go?", JWEIA 2016 (full-scale FSI/VLM validation, ARAVANTI). https://www.sciencedirect.com/science/article/abs/pii/S016761051530177X
+- <a id="bib-uvlm-rt"></a>"Feasibility of Real-time Aeroelasticity Modeling Using the Unsteady Vortex Lattice Method", AIAA Aviation 2025. https://doi.org/10.2514/6.2025-3844
+- <a id="bib-spi"></a>Lasher & Richards, "The aerodynamics of symmetric spinnakers", JWEIA 93, 2005 (parametric wind-tunnel series). https://www.sciencedirect.com/science/article/abs/pii/S0167610505000243
+- <a id="bib-tunnels"></a>Campbell, I., "A comparison of downwind sail coefficients from tests in different wind tunnels", Ocean Engineering 2014. https://www.sciencedirect.com/science/article/abs/pii/S0029801814002492
+- <a id="bib-deparday"></a>Deparday et al., "Dynamic measurement of pressures, sail shape and forces on a full-scale spinnaker", 2014. https://www.researchgate.net/publication/266477724
+- <a id="bib-hazen"></a>Hazen, G., "A model of sail aerodynamics for diverse rig types", New England Sailing Yacht Symposium 1980 (basis of IMS/ORC aero model).
+- <a id="bib-orc"></a>ORC VPP Documentation (published annually; open description of a production VPP force model). https://orc.org/organization/vpp-documentation
+
+Waves / real-time ocean:
+
+- <a id="bib-tessendorf"></a>Tessendorf, J., "Simulating Ocean Water", SIGGRAPH course notes 2001/2004. https://people.computing.clemson.edu/~jtessen/reports/papers_files/coursenotes2004.pdf
+- <a id="bib-jonswap"></a>Hasselmann, K. et al., JONSWAP — "Measurements of wind-wave growth and swell decay during the Joint North Sea Wave Project", 1973.
+- <a id="bib-horvath"></a>Horvath, C., "Empirical directional wave spectra for computer graphics", DigiPro 2015.
+- <a id="bib-kerner"></a>Kerner, J., "Water interaction model for boats in video games" (parts 1–2), Gamasutra/Game Developer 2015–2016. https://www.gamedeveloper.com/programming/water-interaction-model-for-boats-in-video-games
+- <a id="bib-siggraph"></a>"An Analytical Integrator for Solid-Fluid Coupled Buoyancy Forces", SIGGRAPH Asia 2025 Technical Communications. https://dl.acm.org/doi/10.1145/3757376.3771383
+- <a id="bib-hybrid"></a>"Real-Time Interactive Hybrid Ocean: Spectrum-Consistent Wave Particle-FFT Coupling", arXiv 2025. https://arxiv.org/abs/2511.02852
+
+Data-driven extensions (watchlist):
+
+- <a id="bib-ml2022"></a>"A machine learning approach to improve sailboat resistance prediction", Ocean Engineering 2022. https://www.sciencedirect.com/science/article/abs/pii/S0029801822010022
+- <a id="bib-gpr2024"></a>"Predicting Sailing Yacht Hull Resistance Using Gaussian Process Regression", 2024. https://ebooks.iospress.nl/DOI/10.3233/PMST240010
+- "Data-Driven Models for Yacht Hull Resistance Optimization: Exploring Geometric Parameters Beyond the Boundaries of the DSYHS", 2024. https://www.researchgate.net/publication/380846722
