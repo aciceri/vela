@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+nalgebra = "0.35"
+approx = "0.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
