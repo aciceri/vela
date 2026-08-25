@@ -286,6 +286,17 @@ large amplitude), integrate *that module's internal ODE* implicitly — the
 module owns its states, so this is a module-local decision invisible to the
 contract. The contract must not change to accommodate stiffness.
 
+**Precedent already set, in the integrator itself.** The rigid-body inertial
+terms `C(ν) ν` turned out to be exactly this case, and the resolution followed
+this rule. Evaluating the gyroscopic term `ω × (I ω)` explicitly makes a freely
+tumbling body *gain* energy (measured +1.6 % over 60 s at 120 Hz); evaluating it
+at the end of the step merely flips the error's sign; evaluating it at the
+**midpoint**, reached by two fixed-point iterations, conserves quadratic
+invariants and cuts the drift to −2e-8 with `dt³` scaling. Cost: two
+back-substitutions against the already-factorized mass matrix, and *zero* extra
+force evaluations — the one-evaluation-per-step budget is intact, and the
+`ForceModule` contract never learned about any of it.
+
 ### 3.6 Telemetry: first-class, not debug leftovers
 
 Every module publishes a named breakdown
