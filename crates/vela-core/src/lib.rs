@@ -47,6 +47,7 @@ pub mod rigid_body;
 pub mod sections;
 pub mod sim;
 pub mod state;
+pub mod tasai;
 pub mod telemetry;
 pub mod wrench;
 

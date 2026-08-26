@@ -20,6 +20,7 @@ use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
 use vela_core::lewis::{area_coefficient_bounds, station_geometry, LewisForm};
 use vela_core::sections::{hull_form, FormOptions};
+use vela_core::tasai;
 use vela_core::{
     loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, Sim, StillWater, TriMesh, UniformWind,
     Water, SEA_WATER_DENSITY,
@@ -49,6 +50,7 @@ USAGE:
     vela-cli sail             <boat.ron> [--tws M/S] [--twa DEG] [--downwind]
     vela-cli polar            <boat.ron> [--tws M/S] [--points N]
     vela-cli lewis            <boat.ron> [--waterline M]
+    vela-cli radiation        <boat.ron> [--waterline M]
 
 COMMANDS:
     mesh              Report the lofted physics mesh without solving anything
@@ -59,6 +61,7 @@ COMMANDS:
     sail              Solve one sailing condition and show its force balance
     polar             Solve the whole polar, optimising sails and trim
     lewis             Fit Lewis forms to the stations and check the envelope
+    radiation         Heave added mass and damping across frequency
 
 OPTIONS:
     --points N      Contour points per station (default 16)
@@ -130,6 +133,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         "polar" => report_polar(&spec, &options),
         "sail" => report_sail(&spec, &options),
         "lewis" => report_lewis(&spec, &options),
+        "radiation" => report_radiation(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
@@ -813,5 +817,105 @@ fn report_lewis(spec: &BoatSpec, options: &Options) -> Result<String, String> {
              parameters can. Journee & Massie, Offshore Hydromechanics, section 7.3.\n",
         );
     }
+    Ok(out)
+}
+
+/// Heave added mass and radiation damping for the whole hull, by strip theory.
+///
+/// Each station is replaced by its Lewis form, solved for its two-dimensional
+/// coefficients at each frequency, and the results are integrated along the
+/// hull by the trapezoidal rule over station spacing. That integral is the
+/// three-dimensional heave added mass and damping — the terms whose absence
+/// leaves the vertical modes of a time-domain simulation undamped.
+///
+/// The energy residual is reported per frequency rather than buried, because it
+/// is the one number that says whether the multipole truncation was adequate
+/// for these sections at this frequency. See `vela_core::tasai`.
+fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+    let hull = spec.hull.as_ref().ok_or_else(|| {
+        format!(
+            "{} has no hull offsets, so it has no sections to solve",
+            spec.name
+        )
+    })?;
+    let waterline = match options.waterline {
+        Some(height) => height,
+        None => parameters(spec)?.canoe_draft,
+    };
+
+    // Only stations with something immersed carry a coefficient; the dry ends
+    // contribute nothing and have no Lewis form to speak of.
+    let mut wet: Vec<(f64, LewisForm)> = Vec::new();
+    for station in &hull.stations {
+        if let Some(section) = station_geometry(station, waterline) {
+            wet.push((station.x, LewisForm::fit(&section)));
+        }
+    }
+    if wet.len() < 2 {
+        return Err(format!(
+            "{} has {} immersed station(s); strip theory needs a length to integrate over",
+            spec.name,
+            wet.len()
+        ));
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — heave radiation by strip theory, waterline {:.4} m above baseline\n\
+         {} immersed stations from x = {:.2} to {:.2} m\n\n",
+        spec.name,
+        waterline,
+        wet.len(),
+        wet[0].0,
+        wet[wet.len() - 1].0
+    ));
+    out.push_str(
+        "  omega     xi_b     added mass      damping    energy residual\n\
+         \x20[rad/s]      [-]           [kg]       [kg/s]              [-]\n",
+    );
+
+    let midship = &wet[wet.len() / 2].1;
+    let mut frequency = 0.25;
+    while frequency <= 3.001 {
+        // Integrate both coefficients along the hull. Trapezoidal over the
+        // station positions, which are not required to be evenly spaced.
+        let mut mass = 0.0;
+        let mut damping = 0.0;
+        let mut worst_residual: f64 = 0.0;
+        let mut solved: Vec<(f64, f64, f64)> = Vec::with_capacity(wet.len());
+        for (x, form) in &wet {
+            let coefficients = tasai::heave_coefficients(
+                form,
+                frequency,
+                SEA_WATER_DENSITY,
+                vela_core::STANDARD_GRAVITY,
+                tasai::TasaiOptions::default(),
+            )
+            .ok_or("the frequency sweep must stay positive")?;
+            worst_residual = worst_residual.max(coefficients.energy_residual.abs());
+            solved.push((*x, coefficients.added_mass, coefficients.damping));
+        }
+        for pair in solved.windows(2) {
+            let span = pair[1].0 - pair[0].0;
+            mass += 0.5 * (pair[0].1 + pair[1].1) * span;
+            damping += 0.5 * (pair[0].2 + pair[1].2) * span;
+        }
+
+        // The reduced frequency is reported against the midship section,
+        // because that is the scale the truncation advice is stated in.
+        let reduced = frequency * frequency * midship.beam() / (2.0 * vela_core::STANDARD_GRAVITY);
+        out.push_str(&format!(
+            "{frequency:7.2} {reduced:8.3} {mass:14.1} {damping:12.1} {:16.2e}\n",
+            worst_residual
+        ));
+        frequency += 0.25;
+    }
+
+    out.push_str(
+        "\nAdded mass and damping are integrated along the hull, so they are the\n\
+         three-dimensional heave coefficients, in kg and kg/s.\n\
+         Residual is the largest departure from the energy identity over the\n\
+         stations at that frequency; it measures multipole truncation, not physics.\n",
+    );
     Ok(out)
 }

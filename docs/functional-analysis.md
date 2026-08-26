@@ -230,11 +230,18 @@ rather than pretending otherwise.
 
 ### 5.3 Seakeeping: added mass, radiation damping, memory
 
-Frequency-domain coefficients from **strip theory** over 20–40 hull sections
-(Lewis conformal-mapping sections: closed-form 2D added mass/damping), then
-time-domain via the **Cummins equation** [[Cummins 1962]](#bib-cummins),
+Frequency-domain coefficients from **strip theory** over 20–40 hull sections,
+then time-domain via the **Cummins equation** [[Cummins 1962]](#bib-cummins),
 [[Ogilvie 1964]](#bib-ogilvie): constant infinite-frequency added mass plus a
 convolution over velocity history (fluid memory).
+
+An earlier draft of this section called the sectional coefficients "closed-form"
+once the Lewis mapping was in hand. That was wrong, and the correction is worth
+keeping because it changed the size of the phase. The mapping is closed form; the
+coefficients are not. Each section and frequency needs Ursell's multipole
+expansion as extended by Tasai — a linear solve for the strengths of a standing
+wave series, driven by a progressive wave system known analytically, followed by
+a pressure integral. Two mapped sections that differ only in scale share no work.
 
 The convolution is unsuitable for a real-time loop; standard practice replaces
 it with a fitted low-order **state-space model** (2–4 states per significant
@@ -249,6 +256,57 @@ Roll is special: strip-theory potential damping in roll is far too small;
 viscous/eddy/appendage roll damping is added empirically (Ikeda-type components
 or a calibrated quadratic damping term) — noted as a calibration point, not an
 afterthought.
+
+#### 5.3a Status: the sectional coefficients are built and verified
+
+`vela_core::lewis` maps sections; `vela_core::tasai` solves the heave radiation
+problem on the mapped section. Both are transcribed from Delft sources, since
+the primary source of this engine puts added mass *"out of scope"*: the mapping
+from [[Journée & Massie]](#bib-jm2001) §7.3, the multipole method from the
+[[SEAWAY theoretical manual]](#bib-seaway) §4.1.1, which gives it in the form a
+working program uses rather than as a derivation.
+
+Four independent checks, because a transcription of five pages of indexed
+equations deserves more than one:
+
+1. **The source's own energy identity**, `M_0 A_0 - N_0 B_0 = π²/2`. It comes
+   from equating two independent routes to the damping — the pressure integral
+   and the energy the radiated waves carry off — so it involves every quantity
+   in the method and holds at every frequency. This is the check that would have
+   caught a slipped index, and it is reported at runtime, not just asserted in a
+   test, because it doubles as the truncation diagnostic.
+2. **The published figure.** Figure 4.12 of the manual plots these coefficients
+   for a containership midship section whose offsets §3.4 prints. Shape, the
+   location and depth of the added-mass minimum, and the damping peak all land
+   within figure-reading tolerance.
+3. **Dimensional scaling**: geometrically similar sections at equal reduced
+   frequency give coefficients in the ratio of their areas. Independent of the
+   source entirely.
+4. **The closed form substituted for the source's series.** The manual avoids a
+   slowly-convergent integral with a power series after [[Porter 1960]]; that
+   integral is `-i e^w E_1(w)` in closed form, checked against direct quadrature
+   of the integral as printed.
+
+Two things the doing of it taught, neither of which was in the plan:
+
+- **The accuracy knob is the multipole count, and the scale that governs it is
+  the reduced frequency `ξ_b = ω²B/2g`, not `ω`.** The quadrature converges long
+  before it matters. A yacht is unusually comfortable here: its sections are
+  narrow, so the whole range of encounter frequencies that matters sits below
+  `ξ_b ≈ 1.5`, where twelve multipoles hold the identity to parts in a million.
+  The method's known weakness — short waves concentrating flow at the waterline,
+  where a series about the origin converges slowly — is a ship problem, and is
+  recorded in a test rather than hidden.
+- **Evaluating `E_1` needs a criterion on `|w| + Re w`, not on `|w|`.** That
+  quantity is the series' cancellation exponent, and it vanishes exactly on the
+  branch cut. The arguments this method produces all have non-positive real part
+  and approach the cut at every station's keel, which is precisely where the
+  continued fraction — the usual choice for large arguments — stops converging.
+  The obvious `|w|` cutoff routes the worst points to the worse method.
+
+What remains for phase 4: sway and roll sections (§4.1.2, §4.1.3 of the same
+source), the frequency sweep to `A(ω)`, `B(ω)` for the whole hull, the
+state-space fit below, and the viscous roll damping noted next.
 
 ### 5.4 Appendages: keel and rudder
 
