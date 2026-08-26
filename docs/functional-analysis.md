@@ -627,27 +627,67 @@ measuring there showed a response half again too large that was entirely the arm
 And 150 m is not a long wave for this boat: heave and pitch have natural periods
 of 2.0 s and 1.75 s, and the quasi-static limit wants to be far below both.
 
-#### Open: pitch responds about 4.6 times the wave slope
+#### Resolved: pitch is 4.6 times the wave slope, and that is arithmetic
 
-Measured, not suspected. A freely floating body in a long wave should pitch by
-the wave slope — ratio 1 in units of `ka`. This hull pitches 0.62° in a 600 m
-wave whose slope amplitude is 0.135°, and 2.5° in a 150 m wave whose slope is
-0.54°: the same factor at both, which rules out resonance, and the pitch natural
-period of 1.75 s puts both waves firmly in the quasi-static regime where the
-answer should be 1.
+The previous session left this open, suspecting a bug. It is not one, and the
+chase is worth recording because the wrong question was asked with a straight
+face.
 
-A constant factor points at a static imbalance rather than a dynamic one — the
-restoring and the excitation are the same pressure integral, so they should
-cancel exactly in the long-wave limit, and something is breaking that. It is
-**not** asserted either way in a test: writing `ratio == 1` would fail and
-writing `ratio == 4.6` would enshrine a probable bug. Heave is verified, pitch is
-recorded, and the next session starts here.
+A freely floating body in a long wave should pitch by the wave slope, and this
+hull gives 4.6 times it. Two hypotheses died cleanly. **Amplitude
+nonlinearity**: shrinking the wave from 0.14 m of amplitude to 2 mm left the
+ratio at 4.58 in every case, so the error is linear. **Held surge**: freeing it
+changed the ratio in the third decimal, so the constraint is innocent.
 
-One candidate found while looking: the frequency grid runs from `ω_max/N` upward,
-so with sixty samples to 30 rad/s the lowest is 0.5 rad/s and any wave longer
-than a 12.6 s period has its memory model **extrapolated** rather than fitted.
-That does not explain a quasi-static error, but it is a real limitation and a
-log-spaced grid would remove it.
+Then the numbers. Measured about the body origin, the pitch stiffness is
+`C₅₅ = 8.7e6` N·m/rad and the wave's pitching moment at a fixed attitude is
+194 kN·m — of which `C₅₃ζ` accounts for 207 kN·m and `C₅₅s` for only 13 kN·m. A
+ratio of sixteen to one: **the pitch is the small residual of a large
+cancellation.** From the moment balance,
+
+```text
+θ = s - (C₅₃/C₅₅)(h - ζ)
+```
+
+with `C₅₃/C₅₅ = 0.17` per metre, because the body origin sits 5.5 m from the
+centre of flotation. The slope `s = k a` vanishes as the wave lengthens while the
+heave residual stays proportional to `a`, so the ratio diverges even as both terms
+go to zero. At 20 km the heave residual is 0.8 %, which predicts 4.24 times a
+vanishing slope; measured 4.22.
+
+So the ratio is not a testable quantity — which is the actual lesson. It is a
+quotient of two things that both tend to zero, with a numerator floored by the
+heave accuracy.
+
+#### What replaced it
+
+A test with no vanishing denominator: hold the hull at the pose the wave implies —
+sunk by the elevation, trimmed by the slope — and require the net wrench to
+collapse. It does, and the way it collapses is the evidence:
+
+| wavelength | `kL` | residual wrench falls by |
+|---|---|---|
+| 150 m | 0.50 | 0.6× (worse) |
+| 600 m | 0.125 | 19× |
+| 2400 m | 0.031 | 552× |
+
+The wave-following pose becomes an equilibrium as `kL → 0`, quadratically, and at
+`kL = 0.5` it is not one at all — exactly as the long-wave approximation says. That
+tests what actually matters: the excitation and the restoring are the same
+pressure integral seen from two sides.
+
+The heave deviation itself scales as `kL` — 11.6 % at `kL = 0.5`, 0.8 % at
+`kL = 0.004` — which is the finite-length physics the long-wave limit drops rather
+than an error in it.
+
+#### Still worth fixing
+
+The frequency grid runs from `ω_max/N` upward, so sixty samples to 30 rad/s put
+the floor at 0.5 rad/s and any wave longer than a 12.6 s period has its memory
+model **extrapolated** rather than fitted. It played no part in the above — the
+quasi-static limit does not care about added mass — but it is a real limitation,
+and a log-spaced grid removes it.
+
 
 ### 5.4 Appendages: keel and rudder
 

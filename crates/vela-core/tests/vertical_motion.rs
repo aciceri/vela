@@ -341,3 +341,99 @@ fn a_seaway_moves_the_boat_and_a_calm_does_not() {
         "a calm moved the hull through {calm:.3} m, so the sea is not the cause"
     );
 }
+
+/// The wave-following pose becomes an equilibrium as the wave lengthens.
+///
+/// The right way to ask whether a hull rides a wave in *both* vertical modes, and
+/// the one that replaced a badly posed question.
+///
+/// The tempting test is to compare pitch against the wave slope and expect unity.
+/// It fails, by a factor of about 4.6, and the factor is neither a bug nor
+/// amplitude nonlinearity — it survives shrinking the wave to two millimetres and
+/// it survives freeing surge. It is arithmetic. From the moment balance,
+///
+/// ```text
+/// θ = s - (C₅₃/C₅₅)(h - ζ)
+/// ```
+///
+/// and for this hull `C₅₃/C₅₅` is 0.17 per metre because the body origin sits
+/// 5.5 m from the centre of flotation. The slope `s = k a` vanishes as the wave
+/// lengthens while the heave residual stays proportional to `a`, so the *ratio*
+/// diverges even as both terms go to zero: an eight-tenths of a per cent heave
+/// residual produces 4.2 times a vanishing slope. Measured 4.22 against 4.24
+/// predicted.
+///
+/// So the ratio is not a testable quantity. This is: hold the hull at the pose
+/// the wave implies — sunk by the elevation, trimmed by the slope — and the net
+/// wrench must go to zero as the wave lengthens. No ratio of vanishing
+/// quantities, and it tests the thing that matters, which is that the excitation
+/// and the restoring are the same integral seen from two sides.
+#[test]
+fn the_wave_following_pose_becomes_an_equilibrium_in_long_waves() {
+    let (mut calm, _) = settled(quick());
+    let rest = calm.state().clone();
+    let rest_pitch = rest.attitude.euler_angles().1;
+    // Scale force against a kilonewton and moment against the same over a
+    // waterline length, so the two are comparable in one number.
+    let norm = |w: &vela_core::wrench::Wrench| (w.force.z / 1e3).hypot(w.moment.y / 1.19e4);
+
+    let mut previous = f64::INFINITY;
+    for wavelength in [600.0_f64, 2400.0] {
+        let period = (2.0 * std::f64::consts::PI * wavelength / 9.81).sqrt();
+        let state = SeaState {
+            significant_height: 0.4,
+            peak_period: period,
+            components: 1,
+            heading: 0.0,
+            seed: 7,
+        };
+        let sea = Seaway::new(state, 9.81);
+        let mut sim = in_water(
+            Seaway2D::new(UniformWind::uniform(0.0, 0.0), state),
+            quick(),
+        );
+
+        // A quarter period off the crest, where the slope is largest.
+        let time = 0.25 * period;
+        let hold = |sim: &mut Sim, at: &vela_core::state::BodyState| {
+            while sim.time() < time {
+                sim.step(0.05);
+                sim.set_state(at.clone());
+            }
+        };
+
+        let amidships = 5.95;
+        let elevation = sea.elevation(amidships, 0.0, time);
+        let slope = (sea.elevation(amidships + 1.0, 0.0, time)
+            - sea.elevation(amidships - 1.0, 0.0, time))
+            / 2.0;
+
+        let mut at_rest = rest.clone();
+        at_rest.velocity = nalgebra::Vector3::zeros();
+        at_rest.angular_velocity = nalgebra::Vector3::zeros();
+        sim.set_state(at_rest.clone());
+        hold(&mut sim, &at_rest);
+        let unbalanced = norm(&sim.applied_wrench(0.05));
+
+        let mut following = at_rest.clone();
+        following.position.z = rest.position.z - elevation;
+        following.attitude =
+            nalgebra::UnitQuaternion::from_euler_angles(0.0, rest_pitch + slope, 0.0);
+        sim.set_state(following.clone());
+        hold(&mut sim, &following);
+        let balanced = norm(&sim.applied_wrench(0.05));
+
+        let reduction = unbalanced / balanced.max(1e-12);
+        assert!(
+            reduction > 10.0,
+            "at {wavelength} m the wave-following pose left {balanced:.3} of \
+             {unbalanced:.3}, a reduction of only {reduction:.1}x"
+        );
+        assert!(
+            balanced < previous,
+            "a longer wave must leave less unbalanced, got {balanced:.4} after {previous:.4}"
+        );
+        previous = balanced;
+    }
+    let _ = &mut calm;
+}
