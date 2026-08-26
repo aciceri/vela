@@ -357,6 +357,94 @@ This is the one place where engine and renderer share an algorithm rather than
 an interface; it is deliberate and documented, and the golden test is the
 fence.
 
+
+---
+
+## 4a. Built: what the implementation added to this design
+
+The contract above is implemented. Three things had to be decided that this
+document did not anticipate, and all three came from running the thing.
+
+### Kinematics live on `StepCtx`, not in the modules
+
+Every force model needs heel, trim, speed through the water, leeway and
+apparent wind, and every one of those carries a sign convention. They are
+derived **once**, on `StepCtx`, and no module is permitted its own definition.
+A module that recomputed leeway would be free to pick the other sign and
+nothing would catch it: the boat would still sail, with the keel lifting the
+wrong way.
+
+This paid for itself twice over. Two independent module authors flagged the
+same sign error in `trim_angle` — it returned the negated pitch on the strength
+of a plausible argument about the right-hand rule in a z-down frame, and the
+argument was backwards. Because the derivation had one home, the fix was one
+line, and it is now pinned by a test that asserts where the bow points rather
+than what the convention is called.
+
+### Captive degrees of freedom
+
+`Captive` restrains chosen modes, exactly as a towing-tank dynamometer
+restrains a model, and the assembled simulation runs with **trim and yaw held**.
+
+This is a data gap made structural, not a shortcut. The boat format carries no
+longitudinal position for keel, rudder or mast — published particulars do not
+include them — so every lateral and aerodynamic force acts at `x = 0` and
+produces no yaw moment. Integrating those modes would integrate an
+identically-zero moment where the real one is not zero, and the boat would
+settle to a heading and a trim that look like results and are artefacts. What
+remains free — surge, sway, heave, roll — is exactly the balance a classical
+velocity prediction solves, and needs no longitudinal information at all.
+
+The restraint absorbs force without hiding it: the residual moment stays
+visible in `last_wrench` and in the telemetry, which is what a captive
+measurement is for. Lifting the restriction is a schema change plus sourced
+positions, not a change to any force model.
+
+### Steady sailing is solved, not waited for
+
+`equilibrium::solve` drives the four free degrees of freedom to zero with a
+Newton iteration over `Sim::applied_wrench`. It exists because **there is no
+hydrodynamic damping in heave or roll yet**: buoyancy restores, nothing
+dissipates, and an undamped oscillator never settles. A time-domain run
+therefore cannot converge until radiation damping lands, and adding a damping
+coefficient nobody measured would put a fabricated number underneath every
+predicted speed.
+
+When damping arrives, a long run must settle to what this solver returns, which
+makes each a check on the other.
+
+Three properties of the force models had to be respected to make it converge,
+and each was found by measurement rather than by reading the code:
+
+- **Finite differences are sized by the mesh, not by floating point.** Buoyancy
+  is a pressure integral over a clipped triangle mesh, so a perturbation that
+  moves the waterline by far less than a triangle's height differentiates the
+  discretization. 1e-5 rad of heel — fifteen microns of waterline — produced a
+  Jacobian of quantisation noise; 1e-3 rad produces a derivative.
+- **The iteration must not start on a non-differentiable point.** The keel's
+  downwash on the rudder goes as `sqrt(|C_L|)`, so its derivative with respect
+  to leeway is *infinite* at zero leeway; the appendage heel factors are
+  written in `|φ|`, so upright is a corner. An iteration started from rest sits
+  on both. Seeding a degree of leeway and a few of heel, both taking the sign of
+  the initial athwartships force, puts the first Jacobian on a smooth branch.
+  Before that seeding, one tack converged and its mirror image stalled — the
+  most confusing possible symptom of a perfectly symmetric model.
+- **Newton steps need a physically sized trust region.** A full step from an
+  upright guess lands with the deck under water, where the models are so
+  nonlinear that halving never recovers. Capping the excursion per iteration —
+  a quarter of a metre per second, a centimetre of immersion, three degrees of
+  heel — keeps the direction and bounds the leap.
+
+### One model gap closed from the source
+
+Sail forces were not corrected for heel, and the consequence was not subtle: a
+41-footer solved to 40° of heel in a working breeze because nothing ever
+spilled wind out of the rig. The treatment is in the source after all —
+Larsson, Eliasson & Orych, Fig 8.22, on Hazen's model: the apparent wind is
+computed *in a plane that heels with the yacht*, the along-hull component
+unchanged and the athwartships one scaled by `cos φ`. It now lives in
+`StepCtx::apparent_wind_at`, which is where heel belongs: in the wind the rig
+sees, not in the coefficients.
 ---
 
 ## 5. Decisions taken here (summary for review)
@@ -380,3 +468,16 @@ fence.
 9. Sea surface shared with the renderer by *realization* (seed + spectrum +
    convention), not by data transfer; convention is version-locked and
    golden-tested.
+10. Convention-sensitive kinematics (heel, trim, leeway, apparent wind) are
+    derived once on `StepCtx`; modules are forbidden their own definitions.
+11. `Captive` restrains trim and yaw, because the boat format has no
+    longitudinal positions. The restraint absorbs force without hiding it.
+12. Steady sailing is solved by Newton over the free modes, not reached by
+    integration, until radiation damping exists.
+13. Heel enters the sail forces through the apparent wind in the heeled plane
+    (Fig 8.22), not through the coefficients.
+
+Known defect, tracked rather than absorbed: the lofted hull is not exactly
+symmetric — its upright centre of buoyancy sits 0.8 mm off the centreline — so
+the two tacks agree to 0.03 % rather than to machine precision. The offsets are
+symmetric half-breadths, so this is the lofting, not the data.

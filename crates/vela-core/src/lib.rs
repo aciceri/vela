@@ -29,26 +29,37 @@
 
 pub mod aero;
 pub mod appendages;
+pub mod assembly;
 pub mod boat;
 pub mod clip;
+pub mod controls;
 pub mod dsyhs;
+pub mod env;
+pub mod equilibrium;
 pub mod frames;
 pub mod geometry;
 pub mod hydrostatics;
 pub mod loft;
 pub mod mass;
+pub mod modules;
 pub mod rigid_body;
 pub mod sections;
+pub mod sim;
 pub mod state;
+pub mod telemetry;
 pub mod wrench;
 
 pub use boat::{BoatSpec, SpecError};
+pub use controls::Controls;
+pub use env::{Environment, StillWater, UniformWind};
 pub use geometry::{Tri, TriMesh};
 pub use hydrostatics::{Flotation, FlotationError, Hydrostatics, Water};
 pub use loft::{loft_hull, LoftOptions};
 pub use mass::{MassError, MassProperties};
 pub use rigid_body::{Acceleration, RigidBody};
+pub use sim::{ForceModule, Sim, StepCtx};
 pub use state::BodyState;
+pub use telemetry::Telemetry;
 pub use wrench::Wrench;
 
 /// Standard gravitational acceleration, m/s² (CGPM 1901 conventional value).

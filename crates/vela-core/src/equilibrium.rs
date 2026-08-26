@@ -1,0 +1,396 @@
+//! Solving for steady sailing.
+//!
+//! # Why a solver and not just a long run
+//!
+//! The engine integrates in time, so the obvious way to find steady sailing is
+//! to start the boat and wait. That does not work yet, and the reason is a
+//! stated gap rather than a bug: **there is no hydrodynamic damping in heave or
+//! roll.** Buoyancy supplies the restoring force, nothing removes energy, and
+//! an undamped oscillator does not settle — it rings at its natural frequency
+//! indefinitely. Radiation damping is what removes that energy in the real
+//! ship, and it arrives with the strip-theory work; until then a time-domain
+//! run cannot converge, and pretending otherwise by adding a damping
+//! coefficient nobody measured would put a fabricated number underneath every
+//! predicted speed.
+//!
+//! So steady sailing is *solved* instead. This is what a velocity prediction
+//! program has always done, it needs no damping, and it reuses the same force
+//! modules the time-domain loop uses — [`Sim::applied_wrench`] is the residual.
+//! When damping lands, a long run must settle to the same answer this returns,
+//! which makes each a check on the other.
+//!
+//! # The system
+//!
+//! Four unknowns against four equations, matching the degrees of freedom that
+//! [`crate::sim::Captive::velocity_prediction`] leaves free:
+//!
+//! | unknown | balances |
+//! |---|---|
+//! | surge speed | driving force against resistance |
+//! | sway speed | sail side force against the lateral plane |
+//! | sinkage | buoyancy against weight |
+//! | heel | heeling moment against righting moment |
+//!
+//! Leeway is not an unknown of its own: it is the ratio of sway to surge, and
+//! carrying both the ratio and its numerator would make the system singular.
+
+use crate::sim::Sim;
+use crate::state::BodyState;
+use nalgebra::{Matrix4, UnitQuaternion, Vector3, Vector4};
+use std::fmt;
+
+/// Nominal step handed to the force modules while solving.
+///
+/// None of the present modules is rate dependent, so the value cannot change
+/// the answer; it exists because the module contract takes a step, and a
+/// simulation-shaped number is less surprising to a reader than a zero.
+const EVALUATION_STEP: f64 = 1.0 / 120.0;
+
+/// Finite-difference perturbations, one per unknown, in SI units.
+///
+/// Sized by the *mesh*, not by floating-point precision, and the difference
+/// matters: the buoyancy module integrates pressure over a clipped triangle
+/// mesh, so its derivative is exact between waterline crossings but the
+/// crossings themselves move in discrete jumps as triangles enter and leave the
+/// water. A perturbation that moves the waterline by far less than a triangle's
+/// own height differentiates the discretization rather than the hull, and
+/// returns a derivative made of quantisation noise.
+///
+/// One milliradian of heel moves the waterline by roughly 1.5 mm on a yacht of
+/// this beam, which is the same order as a lofted triangle and is where a real
+/// signal starts. An earlier version used 1e-5 rad — fifteen microns of
+/// waterline movement — and the resulting Jacobian was noise: the line search
+/// collapsed after two iterations in every strong-wind case while converging
+/// happily in light air, which is the signature of a derivative that is fine
+/// when the step is large and meaningless when it is small.
+const PERTURBATION: [f64; 4] = [1e-3, 1e-3, 1e-3, 1e-3];
+
+/// Largest excursion allowed in one iteration, per unknown, in SI units:
+/// surge, sway, sinkage, heel.
+///
+/// Chosen as "a change a boat could plausibly make while still being described
+/// by the same linearisation" — half a knot of speed, a centimetre of
+/// immersion, three degrees of heel — rather than by tuning against a test.
+const MAX_STEP: [f64; 4] = [0.25, 0.25, 0.01, 0.05];
+
+/// Heel the iteration is seeded with, radians, when the caller gives none.
+///
+/// Five degrees or so: far enough off the corner at upright that a one-sided
+/// difference is taken on a smooth branch, small enough that it is not a guess
+/// about the answer.
+const HEEL_SEED: f64 = 0.09;
+
+/// Sway the iteration is seeded with, m/s, when the caller gives no heel.
+///
+/// Sized to put the leeway near a degree at a working boat speed: clear of the
+/// square-root singularity in the downwash term, and small enough not to be a
+/// guess about the answer.
+const SWAY_SEED: f64 = 0.05;
+
+/// A solved sailing condition.
+#[derive(Debug, Clone)]
+pub struct Equilibrium {
+    /// The state the boat sails in.
+    pub state: BodyState,
+    /// Speed through the water, m/s.
+    pub speed: f64,
+    /// Leeway angle, radians, positive when the lateral plane lifts to
+    /// starboard.
+    pub leeway: f64,
+    /// Heel angle, radians, positive starboard-down.
+    pub heel: f64,
+    /// Immersion of the body origin below the still-water plane, m.
+    pub sinkage: f64,
+    /// Norm of the converged residual, non-dimensional. See
+    /// [`Equilibrium::residual`] for the scaling.
+    pub residual: f64,
+    /// Newton iterations taken.
+    pub iterations: usize,
+}
+
+/// Why a sailing condition could not be found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EquilibriumError {
+    /// The iteration ran out of steps while still above tolerance.
+    ///
+    /// Carries the residual reached, because a run that stopped at 1e-7 is a
+    /// tolerance to relax and one that stopped at 1e-1 is a condition the boat
+    /// cannot sail — and the caller cannot tell those apart from a bare
+    /// failure.
+    NoConvergence { residual: f64, iterations: usize },
+    /// The Jacobian could not be factorized, which means two unknowns stopped
+    /// being independent — typically a boat that has come to a stop, where
+    /// sway and heel no longer influence anything.
+    Singular { residual: f64, iterations: usize },
+}
+
+impl fmt::Display for EquilibriumError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoConvergence {
+                residual,
+                iterations,
+            } => write!(
+                f,
+                "no sailing equilibrium after {iterations} iterations; \
+                 residual still {residual:.3e}"
+            ),
+            Self::Singular {
+                residual,
+                iterations,
+            } => write!(
+                f,
+                "the force balance became singular after {iterations} iterations \
+                 at residual {residual:.3e}; the boat is probably not sailing"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EquilibriumError {}
+
+/// Where the iteration starts and when it stops.
+#[derive(Debug, Clone, Copy)]
+pub struct EquilibriumOptions {
+    /// Initial guess for speed through the water, m/s.
+    pub initial_speed: f64,
+    /// Initial guess for the immersion of the body origin, m. The canoe body
+    /// draft is the natural choice: the hull is described from its baseline up,
+    /// so this is roughly where the waterplane sits.
+    pub initial_sinkage: f64,
+    /// Initial guess for heel, radians.
+    pub initial_heel: f64,
+    pub max_iterations: usize,
+    /// Convergence threshold on the non-dimensional residual.
+    pub tolerance: f64,
+}
+
+impl Default for EquilibriumOptions {
+    fn default() -> Self {
+        Self {
+            initial_speed: 3.0,
+            initial_sinkage: 0.4,
+            initial_heel: 0.0,
+            max_iterations: 60,
+            tolerance: 1e-9,
+        }
+    }
+}
+
+impl Equilibrium {
+    /// The residual scaling: forces by the boat's weight, moments by weight
+    /// times waterline length.
+    ///
+    /// Non-dimensionalising matters here rather than being tidy: a newton and a
+    /// newton-metre are not comparable, so an unscaled norm would let a large
+    /// moment hide behind a converged force or the reverse, depending only on
+    /// the size of the boat.
+    fn scale(weight: f64, length: f64) -> Vector4<f64> {
+        Vector4::new(weight, weight, weight, weight * length)
+    }
+}
+
+/// Solves for the steady sailing condition of an assembled simulation.
+///
+/// The simulation's controls and environment are used as they stand, so a
+/// caller sweeps a polar by changing the wind and solving again. The state is
+/// left at the solution.
+///
+/// # Errors
+///
+/// [`EquilibriumError`] if the iteration does not reach the tolerance.
+pub fn solve(
+    sim: &mut Sim,
+    reference_length: f64,
+    options: &EquilibriumOptions,
+) -> Result<Equilibrium, EquilibriumError> {
+    let weight = sim.body().mass_properties().mass() * sim.body().gravity();
+    let scale = Equilibrium::scale(weight, reference_length);
+
+    let mut unknowns = Vector4::new(
+        options.initial_speed,
+        0.0,
+        options.initial_sinkage,
+        options.initial_heel,
+    );
+    let mut residual = evaluate(sim, &unknowns, &scale);
+
+    // Move off two non-differentiable points before differentiating anything.
+    //
+    // The force models have exactly two places where a derivative does not
+    // exist, and an iteration started from rest sits on both of them:
+    //
+    // * **Zero leeway.** The keel's downwash on the rudder goes as
+    //   `sqrt(|C_L|)` with the sign of the leeway restored afterwards, so its
+    //   derivative with respect to leeway is *infinite* at zero. A finite
+    //   difference taken across it measures the square root, not a slope: the
+    //   observed `d(Fy)/d(sway)` came out half its true value, and the entry
+    //   then doubled on the next iteration a thousandth of a metre per second
+    //   away. That is the noise that made one tack converge and its mirror
+    //   stall.
+    // * **Zero heel.** The appendage heel factors are written in `|phi|` —
+    //   heeling to port must cost what heeling to starboard costs — so upright
+    //   is a corner, and a one-sided difference there measures the wrong branch
+    //   on one of the two tacks.
+    //
+    // The athwartships force at the starting guess says which way the boat is
+    // about to lie down and which way it is about to slip, and both take its
+    // sign: the sails push to leeward, and the lateral plane must answer with a
+    // leeway of the opposite sense. Seeding a degree of leeway and a few of
+    // heel puts the first Jacobian on a smooth branch. It is a starting point
+    // and not a constraint — the solver is free to come back through zero if
+    // that is where the balance turns out to be.
+    let tack = residual[1].signum();
+    if options.initial_heel == 0.0 && residual[1] != 0.0 {
+        unknowns[1] = SWAY_SEED * tack;
+        unknowns[3] = HEEL_SEED * tack;
+        residual = evaluate(sim, &unknowns, &scale);
+    }
+
+    let mut norm = residual.norm();
+
+    for iteration in 1..=options.max_iterations {
+        if norm < options.tolerance {
+            return Ok(finish(sim, &unknowns, norm, iteration - 1));
+        }
+
+        let jacobian = jacobian(sim, &unknowns, &residual, &scale);
+        let Some(step) = jacobian.lu().solve(&(-residual)) else {
+            return Err(EquilibriumError::Singular {
+                residual: norm,
+                iterations: iteration,
+            });
+        };
+
+        // Limit the step to a physically sized excursion before the line
+        // search sees it, preserving its direction. A full Newton step taken
+        // from an upright guess at a condition that heels twenty degrees can
+        // land with the deck under water or the boat stopped, where the force
+        // models are so nonlinear that halving never recovers — the line search
+        // then collapses on the first iteration and reports a failure that is
+        // an artefact of the starting point rather than a boat that cannot
+        // sail. Capping the excursion is a trust region whose radius is stated
+        // in metres, metres per second and radians instead of in norms.
+        let step = limited(step);
+
+        // Halve the step until it actually reduces the residual.
+        let mut fraction = 1.0;
+        loop {
+            let trial = unknowns + step * fraction;
+            let trial_residual = evaluate(sim, &trial, &scale);
+            let trial_norm = trial_residual.norm();
+            if trial_norm < norm {
+                unknowns = trial;
+                residual = trial_residual;
+                norm = trial_norm;
+                break;
+            }
+            fraction *= 0.5;
+            if fraction < 1e-4 {
+                // The direction is no longer productive. Report where it stalled
+                // rather than iterating on a step that changes nothing.
+                return Err(EquilibriumError::NoConvergence {
+                    residual: norm,
+                    iterations: iteration,
+                });
+            }
+        }
+    }
+
+    if norm < options.tolerance {
+        Ok(finish(sim, &unknowns, norm, options.max_iterations))
+    } else {
+        Err(EquilibriumError::NoConvergence {
+            residual: norm,
+            iterations: options.max_iterations,
+        })
+    }
+}
+
+/// Builds the state described by an unknown vector.
+///
+/// Pitch and yaw are held at zero: they are the restrained modes, and letting
+/// the solver move them would be solving for an attitude no equation
+/// constrains.
+fn state_of(unknowns: &Vector4<f64>) -> BodyState {
+    BodyState {
+        position: Vector3::new(0.0, 0.0, unknowns[2]),
+        attitude: UnitQuaternion::from_euler_angles(unknowns[3], 0.0, 0.0),
+        velocity: Vector3::new(unknowns[0], unknowns[1], 0.0),
+        angular_velocity: Vector3::zeros(),
+    }
+}
+
+/// The non-dimensional residual of the four free degrees of freedom.
+fn evaluate(sim: &mut Sim, unknowns: &Vector4<f64>, scale: &Vector4<f64>) -> Vector4<f64> {
+    sim.set_state(state_of(unknowns));
+    let wrench = sim.applied_wrench(EVALUATION_STEP);
+    Vector4::new(
+        wrench.force.x / scale[0],
+        wrench.force.y / scale[1],
+        wrench.force.z / scale[2],
+        wrench.moment.x / scale[3],
+    )
+}
+
+/// Forward-difference Jacobian.
+///
+/// Forward rather than central differences: four extra force evaluations per
+/// iteration instead of eight, and the residual at the base point is already in
+/// hand. The buoyancy module's mesh clip is the expensive part of an
+/// evaluation, so halving their number is worth the loss of one order in the
+/// derivative — which the step-halving line search absorbs.
+fn jacobian(
+    sim: &mut Sim,
+    unknowns: &Vector4<f64>,
+    residual: &Vector4<f64>,
+    scale: &Vector4<f64>,
+) -> Matrix4<f64> {
+    let mut jacobian = Matrix4::zeros();
+    for column in 0..4 {
+        let mut perturbed = *unknowns;
+        perturbed[column] += PERTURBATION[column];
+        let shifted = evaluate(sim, &perturbed, scale);
+        let derivative = (shifted - residual) / PERTURBATION[column];
+        jacobian.set_column(column, &derivative);
+    }
+    jacobian
+}
+
+fn finish(sim: &mut Sim, unknowns: &Vector4<f64>, residual: f64, iterations: usize) -> Equilibrium {
+    // Leave the simulation at the solution, and recompute its telemetry there,
+    // so a caller can read the force breakdown of the condition it just solved.
+    let state = state_of(unknowns);
+    sim.set_state(state.clone());
+    sim.applied_wrench(EVALUATION_STEP);
+
+    let surge = unknowns[0];
+    let sway = unknowns[1];
+    Equilibrium {
+        state,
+        speed: (surge * surge + sway * sway).sqrt(),
+        leeway: (-sway).atan2(surge),
+        heel: unknowns[3],
+        sinkage: unknowns[2],
+        residual,
+        iterations,
+    }
+}
+
+/// Scales a Newton step down until every component is within [`MAX_STEP`],
+/// keeping its direction.
+///
+/// Scaling the whole vector rather than clamping each component matters: a
+/// per-component clamp would bend the step away from the Newton direction and
+/// can point it somewhere the residual does not decrease at all, which is worse
+/// than a short step along the right line.
+fn limited(step: Vector4<f64>) -> Vector4<f64> {
+    let mut fraction: f64 = 1.0;
+    for index in 0..4 {
+        let magnitude = step[index].abs();
+        if magnitude > MAX_STEP[index] {
+            fraction = fraction.min(MAX_STEP[index] / magnitude);
+        }
+    }
+    step * fraction
+}

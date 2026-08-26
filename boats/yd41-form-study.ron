@@ -378,6 +378,43 @@
         lcf_percent: -7.1106,
     ),
 
+    // Appendages and rig are copied verbatim from boats/yd41.ron, where their
+    // provenance is documented in full: Appendix 1 and Fig 5.19 for the keel and
+    // rudder, Fig 12.15 for the rig, with every estimated value flagged there.
+    //
+    // They belong on this hull because this hull *is* the YD-41 — fitted to its
+    // published coefficients rather than lofted from an offset table the book
+    // never printed. A keel and rig from the same yacht are the only ones that
+    // make sense on it.
+    //
+    // What differs from yd41.ron, and does so deliberately: displacement is
+    // 6221 kg here against 5900 kg there. The fitted hull carries slightly more
+    // volume than the published particulars, and the mass follows the geometry
+    // so that the boat floats at the draft its own offsets describe. Sail and
+    // appendage forces do not depend on displacement; resistance and stability
+    // do, so the two files are not interchangeable and neither is a copy of the
+    // other.
+    appendages: (
+        keel:   (root_chord: 1.00, tip_chord: 0.78, span: 1.90, sweep_deg: 5.5),
+        rudder: (root_chord: 0.48, tip_chord: 0.22, span: 1.15, sweep_deg: 10.0),
+        keel_volume: 0.275,
+        keel_cb_height: 1.4013,
+    ),
+
+    rig: (
+        foretriangle_height: 16.20,
+        foretriangle_base: 5.10,
+        main_hoist: 16.70,
+        main_foot: 5.60,
+        jib_perpendicular: 5.40,
+        spinnaker_leech: 16.25,
+        boom_above_sheer: 1.70,
+        mast_above_sheer: 18.60,
+        mast_diameter: 0.16,
+        average_freeboard: 1.28,
+        max_beam: 4.20,
+    ),
+
     mass: (
         displacement_kg: 6221.0,
         cog: (x: 5.4509, y: 0.0, z: 0.2),

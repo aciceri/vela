@@ -11,12 +11,18 @@
 
 use std::process::ExitCode;
 
+use vela_core::aero::SailSet;
+use vela_core::assembly::velocity_prediction_sim;
 use vela_core::boat::HullSpec;
 use vela_core::dsyhs::{hull_resistance, HullParameters};
+use vela_core::equilibrium::{self, EquilibriumOptions};
 use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
 use vela_core::sections::{hull_form, FormOptions};
-use vela_core::{loft_hull, BoatSpec, LoftOptions, RigidBody, TriMesh, Water, SEA_WATER_DENSITY};
+use vela_core::{
+    loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, StillWater, TriMesh, UniformWind, Water,
+    SEA_WATER_DENSITY,
+};
 
 const USAGE: &str = "\
 vela — sailing yacht physics engine
@@ -26,18 +32,26 @@ USAGE:
     vela-cli hydrostatics  <boat.ron> [--points N]
     vela-cli form          <boat.ron> [--points N]
     vela-cli resistance    <boat.ron> [--speed M/S | --froude F] [--heel DEG]
+    vela-cli polar         <boat.ron> [--heel DEG]
+    vela-cli sail          <boat.ron> [--tws M/S] [--twa DEG] [--downwind]
 
 COMMANDS:
     mesh            Report the lofted physics mesh without solving anything
     hydrostatics    Solve the floating equilibrium and report hull properties
     resistance      Canoe body resistance at one speed, by component
     polar           Resistance across the Froude range the series covers
+    sail            Solve the steady sailing condition and show its balance
 
 OPTIONS:
     --points N      Contour points per station (default 16)
     --speed M/S     Speed through the water
     --froude F      Speed given as a Froude number instead
     --heel DEG      Heel angle in degrees (default 0)
+    --tws M/S       True wind speed (default 6)
+    --twa DEG       True wind angle off the bow (default 40)
+    --downwind      Carry main and spinnaker on an eased aspect ratio
+    --flat F        Flattening factor, 1.0 full (depowers lift, keeps the arm)
+    --reef R        Reef factor, 1.0 full sail (depowers area and lowers the arm)
 
 Commands needing geometry require a boat file with hull offsets; commands
 needing form parameters require the parameters block. Most boats have one or
@@ -49,6 +63,15 @@ struct Options {
     speed: Option<f64>,
     froude: Option<f64>,
     heel: f64,
+    /// True wind speed, m/s.
+    wind: f64,
+    /// True wind angle, radians, measured from the bow.
+    wind_angle: f64,
+    downwind: bool,
+    /// Flattening factor `F`: 1.0 is a normally trimmed sail, less is flatter.
+    flat: f64,
+    /// Reef factor `R`: 1.0 is full sail, less is reefed.
+    reef: f64,
 }
 
 fn main() -> ExitCode {
@@ -83,6 +106,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         "form" => report_form(&spec, &lofted(&spec, &options)?),
         "resistance" => report_resistance(&spec, &options),
         "polar" => report_polar(&spec, &options),
+        "sail" => report_sail(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
@@ -93,6 +117,11 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         speed: None,
         froude: None,
         heel: 0.0,
+        wind: 6.0,
+        wind_angle: 40.0_f64.to_radians(),
+        downwind: false,
+        flat: 1.0,
+        reef: 1.0,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
@@ -106,6 +135,11 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             "--speed" => options.speed = Some(number(rest.next(), "--speed")?),
             "--froude" => options.froude = Some(number(rest.next(), "--froude")?),
             "--heel" => options.heel = number(rest.next(), "--heel")?.to_radians(),
+            "--tws" => options.wind = number(rest.next(), "--tws")?,
+            "--twa" => options.wind_angle = number(rest.next(), "--twa")?.to_radians(),
+            "--downwind" => options.downwind = true,
+            "--flat" => options.flat = number(rest.next(), "--flat")?,
+            "--reef" => options.reef = number(rest.next(), "--reef")?,
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }
@@ -414,6 +448,79 @@ fn report_polar(spec: &BoatSpec, options: &Options) -> Result<String, String> {
             r.total()
         ));
         froude += 0.05;
+    }
+    Ok(out)
+}
+
+/// Solves the steady sailing condition and reports it with its force balance.
+///
+/// The boat is left heading north and the wind is placed at the requested angle
+/// off the bow, which makes the true wind angle and the wind's compass bearing
+/// the same number. That is a choice of where to put the origin of the
+/// heading, not a physical assumption: nothing in the model depends on absolute
+/// direction.
+fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+    let sails = if options.downwind {
+        SailSet::downwind()
+    } else {
+        SailSet::upwind()
+    };
+    // The aspect-ratio regime is the caller's to state, since the source gives
+    // no apparent wind angle at which one gives way to the other.
+    let base = if options.downwind {
+        Controls::eased(sails)
+    } else {
+        Controls::close_hauled(sails)
+    };
+    let controls = base.with_trim(base.trim.with_flat(options.flat).with_reef(options.reef));
+
+    let wind = UniformWind::uniform(options.wind, options.wind_angle);
+    let environment = StillWater::new(wind).with_water(Water::default());
+
+    let mut sim = velocity_prediction_sim(spec, Box::new(environment), controls, &options.loft)
+        .map_err(|error| format!("{}: {error}", spec.name))?;
+
+    let hull = parameters(spec)?;
+    let start = EquilibriumOptions {
+        initial_sinkage: hull.canoe_draft,
+        ..EquilibriumOptions::default()
+    };
+    let solution = equilibrium::solve(&mut sim, hull.waterline_length, &start)
+        .map_err(|error| format!("{}: {error}", spec.name))?;
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — steady sailing, TWS {:.2} m/s, TWA {:.1} deg, {}\n\n",
+        spec.name,
+        options.wind,
+        options.wind_angle.to_degrees(),
+        sails
+    ));
+    out.push_str(&format!(
+        "boat speed          {:>10.3} m/s   ({:.2} kn)\n",
+        solution.speed,
+        solution.speed * 1.943_844
+    ));
+    out.push_str(&format!(
+        "heel                {:>10.2} deg\n",
+        solution.heel.to_degrees()
+    ));
+    out.push_str(&format!(
+        "leeway              {:>10.2} deg\n",
+        solution.leeway.to_degrees()
+    ));
+    out.push_str(&format!(
+        "sinkage             {:>10.3} m\n",
+        solution.sinkage
+    ));
+    out.push_str(&format!(
+        "residual            {:>10.2e}   ({} iterations)\n\n",
+        solution.residual, solution.iterations
+    ));
+
+    out.push_str("force breakdown\n");
+    for (key, value) in sim.telemetry().iter() {
+        out.push_str(&format!("  {key:<38} {value:>12.3}\n"));
     }
     Ok(out)
 }
