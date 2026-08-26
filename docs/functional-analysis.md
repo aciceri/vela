@@ -308,6 +308,48 @@ What remains for phase 4: sway and roll sections (§4.1.2, §4.1.3 of the same
 source), the frequency sweep to `A(ω)`, `B(ω)` for the whole hull, the
 state-space fit below, and the viscous roll damping noted next.
 
+#### 5.3b Status: the hull-level coefficients, and what they say about a yacht
+
+`vela_core::strip` integrates the sectional coefficients into hull heave and
+pitch, following §2.5.1 of the same source: `X_h3 = ∫X'_h3 dx`, and
+`X_h5 = -∫X'_h3 x dx`. Zero forward speed, which the source itself argues for on
+practical grounds — *"for ships with moderate forward speed (`Fn ≤ 0.30`), the
+ordinary method provides a better fit with experimental data"* — and which is
+worth stating rather than assuming, because a yacht upwind sits right at that
+edge and because the speed terms break the `A_35 = A_53` symmetry the tests pin.
+
+Verified on invariants rather than on a stored answer: the parallel-axis
+relation under a shift of origin, zero coupling for a hull symmetric about the
+origin, positive-definiteness of the added-mass matrix (Cauchy-Schwarz, true for
+any hull with positive sectional added mass), and the analytic moments of a
+constant section — including the trapezoidal rule's exact error on the second
+moment, so that nobody later mistakes `A_55` for having converged when it has
+not.
+
+**Two results about the boat rather than the method**, both surprises:
+
+1. **A narrow section radiates over a much wider band than a ship's does.** The
+   frequency that governs radiation is the reduced one, `ξ_b = ω²B/2g`, so a
+   3.2 m section reaches a given `ξ_b` only at a far higher `ω`. Damping for the
+   YD-41 peaks near 2.25 rad/s and is still four-fifths of its peak at 4 rad/s.
+   A test written on ship intuition — "damping has vanished by 4 rad/s" — failed,
+   correctly, and is now written in `ξ_b`.
+2. **Heave added mass is several times the hull mass.** For the YD-41, 21.4 t
+   against 6.2 t of boat: the effective mass in heave is 4.4 times the
+   displacement. This is not an error, it is what a shallow wide canoe body does
+   — a flat plate has finite added mass and vanishing volume — and it means the
+   vertical dynamics of a yacht are dominated by the water, not the boat.
+
+With the hydrostatic stiffness the engine already computes, those give the first
+quantitative statement about how this hull will actually move: heave natural
+period 2.0 s at a damping ratio of 0.33. Both are where a 12 m yacht's should
+be, which is the strongest evidence so far that the chain from offsets to
+coefficients is right end to end.
+
+`vela-cli radiation` sweeps frequency and closes with that heave mode, solved at
+its own frequency by iteration, since the added mass sets the frequency that
+sets the added mass.
+
 ### 5.4 Appendages: keel and rudder
 
 Wing-theory model per appendage:

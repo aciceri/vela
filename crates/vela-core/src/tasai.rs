@@ -512,17 +512,67 @@ mod tests {
             .expect("a positive frequency has a solution")
     }
 
-    /// The closed form standing in for the source's power series.
+    /// The closed form is the source's own expansion, not a substitute for it.
     ///
-    /// The source replaces the wave integral with an expansion after Porter
-    /// rather than evaluate it, because its convergence is *"very slowly"*. This
-    /// module evaluates it exactly instead, so the substitution has to be shown
-    /// to be a substitution and not a change of method: direct quadrature of the
-    /// integral as printed, against `E_1`.
+    /// The source avoids the wave integral by expanding it after
+    /// [[Porter, 1960]], because it calls the integral's numerical convergence
+    /// *"very slowly"*. Its §4.1.2 prints that expansion in full, and it turns
+    /// out to be the same function: with `ζ = ν(y + i x)`, the source's `Q` and
+    /// `S` satisfy `Q + iS = γ + ln ζ + Σ ζⁿ/(n·n!) = -E_1(-ζ) + iπ`, and
+    /// substituting that into the source's own relation between `Q`, `S` and the
+    /// two integrals collapses to `-i e^w E_1(w)` exactly.
+    ///
+    /// So this test transcribes `Q` and `S` as printed and checks the identity
+    /// against [`progressive_wave`]. It is the strongest of the checks on this
+    /// part, because it does not merely agree with the source numerically — it
+    /// shows the code is evaluating the source's method rather than one of its
+    /// own choosing.
+    #[test]
+    fn the_closed_form_is_the_sources_porter_expansion() {
+        for &(nu, x, y) in &[
+            (1.0_f64, 1.0_f64, 1.0_f64),
+            (0.4, 3.0, 6.0),
+            (2.0, 0.3, 1.5),
+            (0.2, 12.7, 4.0),
+            (1.0, 0.05, 9.0),
+        ] {
+            // Source §4.1.2, transcribed: β = arctan(x/y), pₙ = (ν r)ⁿ/(n·n!),
+            // Q = γ + ln(ν r) + Σ pₙ cos(nβ), S = β + Σ pₙ sin(nβ).
+            let radius = (x * x + y * y).sqrt();
+            let beta = x.atan2(y);
+            let mut q = EULER_GAMMA + (nu * radius).ln();
+            let mut s = beta;
+            let mut p = 1.0;
+            for n in 1..=200 {
+                p *= nu * radius / n as f64;
+                let term = p / n as f64;
+                q += term * (n as f64 * beta).cos();
+                s += term * (n as f64 * beta).sin();
+                if term < 1e-18 {
+                    break;
+                }
+            }
+
+            // And the source's relation between those and the two integrals.
+            let decay = (-nu * y).exp();
+            let cosine = (q * (nu * x).sin() - (s - PI) * (nu * x).cos()) * decay;
+            let sine = (q * (nu * x).cos() + (s - PI) * (nu * x).sin()) * decay;
+
+            let closed = progressive_wave(nu, x, y);
+            assert_relative_eq!(closed.re, cosine, max_relative = 1e-11);
+            assert_relative_eq!(closed.im, sine, max_relative = 1e-11);
+        }
+    }
+
+    /// The same integral against brute-force quadrature.
+    ///
+    /// A second, blunter opinion than the expansion above: the integral as
+    /// printed, integrated numerically, with no shared algebra to share an error
+    /// with.
     ///
     /// The quadrature is deliberately crude — a fixed panel sweep out to a large
     /// wavenumber — because a crude method that agrees is stronger evidence than
-    /// a clever one that might share an error.
+    /// a clever one that might be wrong the same way.
     #[test]
     fn the_wave_integral_matches_direct_quadrature() {
         // The last three reach past `SERIES_CANCELLATION_LIMIT` and so exercise
