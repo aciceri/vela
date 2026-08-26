@@ -38,6 +38,7 @@ pub mod cummins;
 pub mod dsyhs;
 pub mod env;
 pub mod equilibrium;
+pub mod flying;
 pub mod frames;
 pub mod geometry;
 pub mod hydrostatics;

@@ -275,6 +275,84 @@ Instead:
 This keeps controls physically meaningful (vang tension reduces twist → changes
 vertical force distribution → changes heeling moment) at negligible runtime cost.
 
+#### 4.3a Status: the shape is built and checked against a measured sail
+
+`vela_core::flying` is the parametric flying shape: a planform, a section family,
+distributions of camber, draft and twist up the sail, and a trim angle. It emits a
+`vlm::Lattice` and knows nothing about wind or forces.
+
+**The section is the NACA four-digit mean line, and entry angle is not a free
+parameter.** A parabolic arc is the obvious family and is wrong for a sail: its
+draft is pinned at mid chord and a sail's sits between a third and a half. The
+four-digit mean line is two parabolas joined at the draft with matching value *and*
+matching slope — so it moves the draft, stays smooth, and degenerates exactly to
+the parabolic arc at half chord.
+
+Entry and exit angles then *follow*: `tan(entry) = 2ε/p`, `tan(exit) = -2ε/(1-p)`.
+That is a restriction and it is the right one. Draft forward means a sharper entry
+and a flatter exit, which is what moving the draft forward does; a model carrying
+an independent entry angle can express sections no cloth takes up.
+
+**Sections are horizontal and twist is a rotation about the vertical** — not about
+the luff tangent. This is the convention the flying-shape measurements report twist
+in, so it is the convention that makes comparing against them mean anything.
+
+**Placement is not shape.** The luff runs up the `z` axis from the origin. Mast
+rake, mast bend, position on deck and the tack's height belong to the rig that
+carries the sail; putting them here would mean every consumer had to know which had
+already been applied.
+
+#### Verified against a full-scale wind-tunnel campaign
+
+[[Zhang et al. 2025]](#bib-windsurf) measured the flying shape *and* the forces of
+an 8 m², λ = 3.36 Olympic windsurf sail at the same time. Three of its findings are
+reproduced:
+
+| finding | here |
+|---|---|
+| twist reduces lift at fixed root incidence | 20° of twist costs 37 % of `C_L` |
+| twist lowers the centre of effort | and 13 % of the arm it acts on |
+| twist leaves the head at positive incidence | incidence is `α - twist`, exactly |
+
+The second is why twist is a *depowering* control rather than merely a lift-losing
+one, and it is the thing a coefficient model cannot produce at all: with lift and
+centre of effort as separate lookups, nothing makes them move together.
+
+Closed-form checks alongside:
+
+| what | result |
+|---|---|
+| zero-lift angle of the arc section | `-2ε`, to 0.7 % at ε = 0.04 |
+| induced drag | 3–9 % **above** `C_L²/πλ`, its elliptical floor |
+| lift slope | 0.81 of `2πλ/(λ+2)`, below it as a triangular planform must be |
+| surface vs planform area | the section's arc length, exact untapered |
+
+The zero-lift angle is the strongest of these. It is aspect-ratio independent in
+lifting-line theory for an untwisted wing of uniform section, so there is no
+planform excuse — the number has to come out, and it does to within a deficit
+growing quadratically in camber. That is the **same second-order term §4.1a
+measured on camber lift**, reached by a completely different route: there by
+extrapolating a lattice in panel count against `4πε`, here by hunting a
+three-dimensional sail's zero crossing. Two independent measurements of one
+discarded term.
+
+#### One finding deliberately *not* reproduced
+
+Zhang et al. measured **more camber giving less lift**, which is backwards for a
+section, and their own shape data explains it: the high-camber setting also twisted
+more, and the twist won. This module holds camber and twist apart, so camber alone
+increases lift here.
+
+Their result therefore belongs to the control mapping, not the geometry — and the
+test that camber increases lift is the evidence the coupling has to live there. If
+the geometry already lost lift with camber, a coupling on top would double-count it
+and nothing would reveal the error.
+
+Nothing asserts *how much* twist an eased outhaul brings. A camber-and-twist pair
+chosen to reproduce their ordering would be asserting a coupling strength no
+published measurement pins down, so it is not smuggled in as a test either. That
+calibration is the open item of §4.3, and it is named rather than faked.
+
 ### 4.4 Wind model
 
 - Mean wind: speed + direction, **vertical shear** (log/power profile) and the
@@ -1215,6 +1293,7 @@ Sail aerodynamics:
 - <a id="bib-spi"></a>Lasher & Richards, "The aerodynamics of symmetric spinnakers", JWEIA 93, 2005 (parametric wind-tunnel series). https://www.sciencedirect.com/science/article/abs/pii/S0167610505000243
 - <a id="bib-tunnels"></a>Campbell, I., "A comparison of downwind sail coefficients from tests in different wind tunnels", Ocean Engineering 2014. https://www.sciencedirect.com/science/article/abs/pii/S0029801814002492
 - <a id="bib-deparday"></a>Deparday et al., "Dynamic measurement of pressures, sail shape and forces on a full-scale spinnaker", 2014. https://www.researchgate.net/publication/266477724
+- <a id="bib-windsurf"></a>Zhang, Bertrand, Rabaud, Augier & Fermigier, "Flying shape and aerodynamics of a full-scale flexible Olympic windsurf sail", Ocean Engineering 2025 (simultaneous photogrammetric flying shape and force-balance measurements; the validation fixture of §4.3a). https://arxiv.org/abs/2501.13254
 - <a id="bib-hazen"></a>Hazen, G., "A model of sail aerodynamics for diverse rig types", New England Sailing Yacht Symposium 1980 (basis of IMS/ORC aero model).
 - <a id="bib-orc"></a>ORC VPP Documentation (published annually; open description of a production VPP force model). https://orc.org/organization/vpp-documentation
 
