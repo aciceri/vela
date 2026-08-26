@@ -63,6 +63,17 @@ pub fn leeward_sign(apparent_wind_angle: f64) -> f64 {
     }
 }
 
+/// The water flow past a body-fixed point, as a foil there would feel it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalFlow {
+    /// Speed of the water past the point, m/s.
+    pub speed: f64,
+    /// Angle of the flow to the centreline, radians, **positive when it
+    /// produces side force towards `+y`** — the same sense as
+    /// [`StepCtx::leeway`], of which this is the generalisation to a point off
+    /// the origin.
+    pub angle: f64,
+}
 /// Everything a force module may read, for one step.
 pub struct StepCtx<'a> {
     /// Pose and velocities.
@@ -134,6 +145,36 @@ impl StepCtx<'_> {
             return 0.0;
         }
         (-sway).atan2(surge)
+    }
+
+    /// The water flow past a body-fixed point.
+    ///
+    /// [`StepCtx::leeway`] is this at the body origin. A foil is not at the
+    /// origin, and the difference is not a refinement: a keel a metre and a
+    /// third below the origin, on a boat rolling at half a radian per second,
+    /// sees two thirds of a metre per second of athwartships flow it would not
+    /// otherwise see. Against four metres per second of boat speed that is nine
+    /// degrees of angle of attack — and the lift it produces is a moment
+    /// opposing the roll.
+    ///
+    /// That moment is **the dominant damping of a keelboat's roll**, and it
+    /// comes out of the already-transcribed lift model for free, as a
+    /// consequence of asking the foil what flow it is actually in. Taking it
+    /// from the origin instead leaves roll undamped, which is not a small error
+    /// in a simulation meant to be sailed.
+    #[must_use]
+    pub fn local_flow_at(&self, body_point: Vector3<f64>) -> LocalFlow {
+        let velocity = self.state.point_velocity(body_point);
+        let surge = velocity.x;
+        let sway = velocity.y;
+        LocalFlow {
+            speed: (surge * surge + sway * sway).sqrt(),
+            angle: if surge == 0.0 && sway == 0.0 {
+                0.0
+            } else {
+                (-sway).atan2(surge)
+            },
+        }
     }
 
     /// The apparent wind at a body-fixed point, in the plane of the heeled sail

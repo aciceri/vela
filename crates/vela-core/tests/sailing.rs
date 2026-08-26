@@ -392,3 +392,84 @@ fn upwind_performance_matches_the_published_polar() {
     // And it is genuinely beating, not reaching with the sails eased.
     assert!(solution.heel.abs().to_degrees() < 35.0);
 }
+
+/// The classical roll-decay experiment, run in the time domain.
+///
+/// This is the payoff of giving the foils their own local inflow, and it is the
+/// first thing in this project that could not be done at all before: perturb a
+/// sailing boat's roll and the oscillation dies away, because a rolling keel
+/// sweeps sideways through the water, makes lift, and that lift is a moment
+/// opposing the roll.
+///
+/// Heave is restrained along with trim and yaw. That is not tidying: heave has
+/// no damping until the radiation model exists, so an undamped heave ring would
+/// sit on top of the roll signal this test is reading. Roll itself is free, and
+/// what damps it is entirely the hydrodynamics.
+///
+/// The decay is unambiguously physical rather than numerical. The integrator's
+/// own dissipation was measured at parts in a hundred million over a minute;
+/// what this test demands is a halving in a few seconds.
+///
+/// # Two things worth knowing about the signal
+///
+/// It is read as the peak deviation over a window rather than as successive
+/// peaks, and that is deliberate: roll is strongly coupled to sway, which is
+/// free here, so the envelope beats instead of decaying cleanly. Measured
+/// extremes ran 1.21°, 1.42°, 0.70°, 1.21° — a comparison of consecutive peaks
+/// would report a *growing* oscillation and be wrong.
+///
+/// The roll period comes out near 1.7 s, which is short: a twelve-metre yacht
+/// rolls in something closer to four. The missing piece is roll added mass,
+/// which is phase 4's business — the water a rolling hull drags with it is of
+/// the same order as the hull's own inertia, and none of it is modelled yet.
+/// So this test proves the damping exists and settles the boat; it does not
+/// claim the period is right.
+#[test]
+fn roll_decays_because_the_keel_is_in_the_flow() {
+    use vela_core::sim::Captive;
+
+    let mut sim = sailing(MODERATE_WIND, 40.0, 1.0, 1.0);
+    let equilibrium = solve(&mut sim).expect("must converge");
+
+    let mut sim = sim.with_captive(Captive {
+        heave: true,
+        pitch: true,
+        yaw: true,
+        ..Captive::free()
+    });
+
+    // Knock it over, hard: half a radian per second of roll rate.
+    let mut disturbed = sim.state().clone();
+    disturbed.angular_velocity.x = 0.5;
+    sim.set_state(disturbed);
+
+    let dt = 1.0 / 240.0;
+    let window = (4.0 / dt) as usize;
+    let mut early_peak: f64 = 0.0;
+    let mut late_peak: f64 = 0.0;
+
+    for step in 0..(window * 3) {
+        sim.step(dt);
+        let deviation = (sim.state().euler_angles().0 - equilibrium.heel).abs();
+        if step < window {
+            early_peak = early_peak.max(deviation);
+        } else if step >= window * 2 {
+            late_peak = late_peak.max(deviation);
+        }
+    }
+
+    assert!(
+        early_peak > 0.05,
+        "the disturbance must actually roll the boat, got {early_peak} rad"
+    );
+    assert!(
+        late_peak < 0.5 * early_peak,
+        "roll must decay: {late_peak} rad remaining against {early_peak} rad initially"
+    );
+    // And it settles back to the heel it was sailing at, not to upright.
+    assert_relative_eq!(
+        sim.state().euler_angles().0,
+        equilibrium.heel,
+        epsilon = 0.05
+    );
+}

@@ -64,10 +64,37 @@
 //!   blades, not on the extended planforms this model uses, and neither the
 //!   wetted surfaces nor a reference length are inputs to this module. It is
 //!   absent rather than estimated.
-//! * **No stall.** Fig 6.13's lift is linear in angle of attack with no
-//!   limiting term, so a rudder held hard over keeps gaining side force. In a
-//!   time-domain simulation, which can reach angles a velocity prediction
-//!   program never visits, this overstates what a stalled rudder can do.
+//! * **No stall, and it is now reachable.** Fig 6.13's lift is linear in angle
+//!   of attack with no limiting term. That was harmless while the foils were
+//!   given the boat's leeway, which is always a few degrees; it stopped being
+//!   harmless when they were given their own local inflow, because a rolling
+//!   boat at low speed presents them with a large one. Measured on the YD-41
+//!   keel at 0.4 rad/s of roll:
+//!
+//!   | boat speed | local inflow | incidence | damping moment |
+//!   |---|---|---|---|
+//!   | 4.0 m/s | 4.03 m/s | 7.4° | −13.4 kN·m |
+//!   | 2.0 m/s | 2.07 m/s | 14.6° | −7.0 kN·m |
+//!   | 1.0 m/s | 1.13 m/s | 27.5° | −4.0 kN·m |
+//!   | 0.0 m/s | 0.52 m/s | 90° | −2.8 kN·m |
+//!
+//!   At sailing speeds the incidence is a few degrees and the model is inside
+//!   its range. Below roughly 2 m/s it is not: a foil at 27° or more is stalled,
+//!   makes mostly drag, and its lift is far below the linear extrapolation. At
+//!   rest the model overstates the damping by something like eight times, taking
+//!   a flat-plate `C_D` of 1.2 as the comparison.
+//!
+//!   Note the shape of the error: the moment *falls* towards low speed, because
+//!   dynamic pressure drops faster than the linear `C_L` climbs. So this is a
+//!   fidelity limit and not a numerical hazard — nothing runs away — and the
+//!   direction is always damping, never driving.
+//!
+//!   No clamp is applied, because a limiting angle would have to be invented.
+//!   The source does give one — Fig 6.31 tabulates the angle of maximum lift
+//!   per section family and thickness, noting it is roughly doubled for a keel
+//!   of normal aspect ratio — but it is a figure, and reading numbers off it is
+//!   what closing this needs. Meanwhile `lateral.inflow.angle` is published
+//!   every step so the condition is visible rather than silent.
 //! * **Resistance passes through the body origin.** The figures give
 //!   magnitudes only, and the constructor's application points are documented
 //!   as centres of effort for the *side* force; the keel's residuary resistance
@@ -81,7 +108,7 @@
 use crate::appendages::{
     appendage_forces, AppendageForces, FlowState, FoilPlanform, HullScalars, Keel,
 };
-use crate::sim::{ForceModule, StepCtx};
+use crate::sim::{ForceModule, LocalFlow, StepCtx};
 use crate::telemetry::Telemetry;
 use crate::wrench::Wrench;
 use nalgebra::Vector3;
@@ -102,6 +129,11 @@ pub struct LateralSystem {
     /// and publishing zeros would be indistinguishable from a boat that really
     /// is generating no side force.
     last: Option<AppendageForces>,
+    /// The inflow the foils were given, kept so that its angle can be
+    /// published. That angle is what says whether the linear lift model was
+    /// being used inside its validity or outside it, and it is not recoverable
+    /// from the forces alone.
+    last_inflow: Option<LocalFlow>,
 }
 
 impl LateralSystem {
@@ -134,6 +166,7 @@ impl LateralSystem {
             rudder,
             rudder_at,
             last: None,
+            last_inflow: None,
         }
     }
 
@@ -165,10 +198,32 @@ impl ForceModule for LateralSystem {
     }
 
     fn step(&mut self, ctx: &StepCtx<'_>) -> Wrench {
-        let speed = ctx.speed_through_water();
+        // The flow the KEEL is in, not the flow the body origin is in.
+        //
+        // This is what makes roll damped. A rolling keel sweeps sideways
+        // through the water, and the angle of attack that produces is lift, and
+        // that lift is a moment opposing the roll — the dominant damping of a
+        // keelboat's roll, obtained from the transcribed lift model without a
+        // single new coefficient. Reading the flow at the origin instead leaves
+        // roll with no damping at all, while the sails have theirs, because the
+        // aerodynamic side samples the wind at its own centre of effort.
+        //
+        // **Approximation, stated:** the rudder is given the keel's inflow,
+        // because [`appendage_forces`] takes one flow state and owns the
+        // keel-then-rudder ordering that must not be duplicated. The two foils
+        // differ only in depth — here about 0.95 m against 1.3 m — so the
+        // rudder's roll-induced inflow is overstated by roughly a third of a
+        // term that is itself a tenth of the side force. The exact form needs a
+        // per-foil inflow through that function's signature, which is a change
+        // to a validated module for a few per cent of a damping moment.
+        let inflow = ctx.local_flow_at(self.keel_at);
         let flow = FlowState {
-            speed,
-            leeway: ctx.leeway(),
+            // Local speed rather than boat speed also reaches the keel's
+            // residuary resistance, which wants boat speed. The two differ by
+            // the square of a small angle — a per cent at a violent roll rate,
+            // on a term worth tens of newtons.
+            speed: inflow.speed,
+            leeway: inflow.angle,
             heel: ctx.heel(),
             rudder_angle: ctx.controls.rudder_angle,
         };
@@ -185,6 +240,7 @@ impl ForceModule for LateralSystem {
             ctx.env.gravity(),
         );
         self.last = Some(forces);
+        self.last_inflow = Some(inflow);
 
         // Positive leeway lifts to starboard, which is `+y`: the appendage
         // model and `StepCtx` share that convention, so the sign of the force
@@ -209,7 +265,10 @@ impl ForceModule for LateralSystem {
         // motion along the track. The sum is signed by the regressions — Fig
         // 5.23's heel term can come out negative for some hulls — so it is
         // passed through as it stands rather than clamped.
-        let drag = match Self::track_direction(ctx, speed) {
+        //
+        // The track is the BOAT's, taken at the origin: a drag force opposes
+        // where the boat is going, not where one foil's local flow points.
+        let drag = match Self::track_direction(ctx, ctx.speed_through_water()) {
             Some(track) => Wrench::new(-forces.resistance() * track, Vector3::zeros()),
             None => Wrench::zero(),
         };
@@ -221,6 +280,15 @@ impl ForceModule for LateralSystem {
         let Some(forces) = self.last else {
             return;
         };
+
+        // The inflow the foils were actually given. `lateral.inflow.angle` is
+        // the number that says whether the linear lift model was inside its
+        // validity: a few degrees is sailing, tens of degrees is a stalled foil
+        // being modelled as an unstalled one. See the module documentation.
+        if let Some(inflow) = self.last_inflow {
+            out.set("lateral.inflow.speed", inflow.speed);
+            out.set("lateral.inflow.angle", inflow.angle);
+        }
 
         out.set("lateral.keel.side_force", forces.keel_side_force);
         out.set("lateral.rudder.side_force", forces.rudder_side_force);
@@ -576,5 +644,114 @@ mod tests {
         let mut telemetry = Telemetry::new();
         module.telemetry(&mut telemetry);
         assert!(telemetry.is_empty());
+    }
+
+    /// Sailing straight, but rolling: the state that reveals roll damping.
+    fn rolling(speed: f64, roll_rate: f64) -> BodyState {
+        BodyState {
+            velocity: Vector3::new(speed, 0.0, 0.0),
+            angular_velocity: Vector3::new(roll_rate, 0.0, 0.0),
+            ..BodyState::default()
+        }
+    }
+
+    /// The reason this module reads the flow at the keel rather than at the
+    /// origin: a rolling keel makes lift, and that lift opposes the roll.
+    ///
+    /// Without it a keelboat's roll is undamped — buoyancy restores it and
+    /// nothing removes the energy — and this is the dominant term that removes
+    /// it. The assertion is on the sign for both directions of roll, because a
+    /// damping moment that only opposed one of them would be a spring.
+    #[test]
+    fn a_rolling_keel_produces_a_moment_opposing_the_roll() {
+        let (starboard, _) = run(&rolling(SPEED, 0.4), 0.0);
+        let (port, _) = run(&rolling(SPEED, -0.4), 0.0);
+
+        assert!(
+            starboard.moment.x < 0.0,
+            "rolling to starboard must be resisted, got {}",
+            starboard.moment.x
+        );
+        assert!(
+            port.moment.x > 0.0,
+            "rolling to port must be resisted, got {}",
+            port.moment.x
+        );
+        // Equal and opposite: no preferred direction.
+        assert_relative_eq!(port.moment.x, -starboard.moment.x, max_relative = 1e-9);
+    }
+
+    /// The damping is lift, so it grows with the square of the flow — which is
+    /// what distinguishes it from a viscous term and from anything the
+    /// integrator might be doing.
+    #[test]
+    fn roll_damping_grows_with_forward_speed() {
+        let (slow, _) = run(&rolling(2.0, 0.4), 0.0);
+        let (fast, _) = run(&rolling(4.0, 0.4), 0.0);
+
+        assert!(fast.moment.x.abs() > slow.moment.x.abs());
+        // Doubling the speed doubles the angle of attack's denominator and
+        // quadruples the dynamic pressure, so the moment grows by roughly two,
+        // not four. Bracketed rather than pinned: the downwash term is a square
+        // root of the lift and does not scale cleanly.
+        let ratio = fast.moment.x.abs() / slow.moment.x.abs();
+        assert!(
+            (1.5..3.0).contains(&ratio),
+            "roll damping scaled by {ratio}, which is neither lift-like nor viscous"
+        );
+    }
+
+    /// Pins the low-speed incidence limitation so it stays visible.
+    ///
+    /// A boat rolling with no way on presents its keel with pure athwartships
+    /// flow — 90° of incidence — and the linear lift model of Fig 6.13 has no
+    /// stall term to answer with. The force it returns is not to be trusted;
+    /// see the module documentation for the measured size of the error.
+    ///
+    /// This test asserts the three things that *are* true and that matter, and
+    /// deliberately does not assert a value: the incidence is published so the
+    /// condition can be recognised, the moment still opposes the roll rather
+    /// than driving it, and it does not blow up as the speed falls away. That
+    /// last one is why this is a fidelity limit and not a stability hazard.
+    #[test]
+    fn a_roll_at_rest_drives_the_foils_past_their_validity() {
+        let (at_rest, telemetry) = run(&rolling(0.0, 0.4), 0.0);
+        let (sailing, _) = run(&rolling(4.0, 0.4), 0.0);
+
+        let incidence = published(&telemetry, "lateral.inflow.angle");
+        assert_relative_eq!(incidence.to_degrees(), 90.0, max_relative = 1e-9);
+
+        assert!(
+            at_rest.moment.x < 0.0,
+            "even outside its validity the model must damp, not drive"
+        );
+        assert!(
+            at_rest.moment.x.abs() < sailing.moment.x.abs(),
+            "the artefact must stay bounded: {} N.m at rest against {} N.m sailing",
+            at_rest.moment.x,
+            sailing.moment.x
+        );
+    }
+
+    /// A yaw rate reaches the foils too, through their longitudinal offsets,
+    /// and damps yaw for the same reason.
+    ///
+    /// Not exercised by the assembled simulation, which places both foils at
+    /// `x = 0` because the boat format carries no longitudinal positions — but
+    /// the mechanism is here and works, so the day those positions arrive yaw
+    /// damping arrives with them rather than needing to be added.
+    #[test]
+    fn a_yaw_rate_is_damped_through_the_foils_lever_arms() {
+        let yawing = BodyState {
+            velocity: Vector3::new(SPEED, 0.0, 0.0),
+            angular_velocity: Vector3::new(0.0, 0.0, 0.3),
+            ..BodyState::default()
+        };
+        let (wrench, _) = run(&yawing, 0.0);
+        assert!(
+            wrench.moment.z < 0.0,
+            "a boat turning to starboard must be resisted, got {}",
+            wrench.moment.z
+        );
     }
 }
