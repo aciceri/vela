@@ -53,6 +53,7 @@ pub mod state;
 pub mod strip;
 pub mod tasai;
 pub mod telemetry;
+pub mod vlm;
 pub mod wrench;
 
 pub use boat::{BoatSpec, SpecError};

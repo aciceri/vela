@@ -136,6 +136,106 @@ sail surface (flat-plate estimate), mast and rigging parasite drag (windage),
 per Larsson & Eliasson [[L&E]](#bib-le) and the IMS/ORC aero model lineage
 [[Hazen 1980]](#bib-hazen), [[ORC VPP doc]](#bib-orc).
 
+#### 4.1a Status: the lattice is built and measured against theory
+
+`vela_core::vlm` is the kernel: a grid of corner points and an onset flow field in,
+a force on every panel out. It knows nothing about sails, wind or boats, which is
+what lets it be validated against wing theory before a sail is ever attached to it.
+
+**Vortex rings, not one row of horseshoes.** The textbook lattice puts a single
+horseshoe per panel with its bound leg at the quarter chord, which is exact for a
+flat plate. A sail is not a flat plate: camber of ten to twenty per cent, and the
+entire reason for computing lift from geometry is that camber and twist are what
+the controls change. That needs chordwise resolution, and chordwise resolution
+needs rings.
+
+**The wake direction belongs to the factorisation, and §4.1 was wrong to imply
+otherwise.** The influence matrix "depends only on geometry" is true of the surface
+and false of the wake: the trailing filaments leave along a direction, and the
+direction is the flow's. So the matrix survives a change of wind *speed*, of the
+onset *field* — shear, boat motion, a gust — and anything that leaves the mean
+direction alone. It does not survive a change of apparent wind angle. The
+direction is an explicit constructor argument rather than something read off the
+flow inside the solve, so the choice and its cost are the caller's and are visible.
+
+#### Verified against theory, not against itself
+
+| what | result |
+|---|---|
+| flat-plate lift slope | `2π` per radian, to 0.4 %, **at any chordwise count** |
+| camber lift | `4πε` to 2 parts in 10⁴ as `ε → 0` |
+| elliptic wing | approaches `2πα/(1+2/AR)` from below, 0.90 → 0.96 → 0.986 at AR 4, 8, 16 |
+| induced drag | `C_L²/πAR` to 2–3 % |
+| infinite filament | `Γ/2πr` to 1 part in 10¹² |
+
+The flat plate is exact *per panel* rather than in the limit, which is the
+signature of the quarter-chord vortex with a three-quarter-chord collocation point:
+a scheme with those two stations wrong would still converge, and would converge to
+the wrong number.
+
+The elliptic wing coming in **under** lifting-line theory at low aspect ratio is
+the correct direction — the approximation over-predicts there — so agreeing at
+aspect ratio four would have been evidence of a bug. The test pins the trend, not
+just the limit.
+
+#### The camber gap is the theory's, and that is the argument for the whole method
+
+At ten per cent camber the lattice sits four and a half per cent below
+`C_L = 2πα + 4πε`. That was chased rather than accepted, and it is not the
+lattice's error. Extrapolated in panel count the ratio to theory is 1.0002 at half
+a per cent camber and 0.9998 at one per cent, and the gap grows as `4ε²` — exactly
+the order a linearised theory drops:
+
+| camber | 0.005 | 0.01 | 0.05 | 0.10 | 0.20 |
+|---|---|---|---|---|---|
+| ratio to theory | 1.0002 | 0.9998 | 0.9888 | 0.9568 | 0.8549 |
+
+Sail camber *is* ten to twenty per cent. So this is the region where the two
+disagree most, and it is the lattice that should be believed there. That is the
+argument for computing lift from geometry instead of reading a coefficient, stated
+in numbers rather than in principle.
+
+Convergence in chordwise panels is first order, not second: flat panels approximate
+a curved surface's normal to `O(1/N)` and the boundary condition inherits it.
+Cosine chordwise spacing was tried and does not help, which locates the error in
+the geometry rather than in the loading singularity. Thirty-two panels sit three
+per cent below the converged value, a hundred and twenty-eight under one.
+
+#### The frame budget, measured, and where §7 was optimistic
+
+| panels | factorise | solve | ratio |
+|---|---|---|---|
+| 120 | 2.5 ms | 0.023 ms | 109× |
+| 320 | 14.7 ms | 0.155 ms | 95× |
+| 600 | 56 ms | 0.72 ms | 78× |
+
+The per-frame solve is 0.155 ms at 320 panels, inside §7's estimate of 0.1–0.3 ms.
+The factorisation is **14.7 ms against §7's 1–3 ms**, optimistic by five times,
+because the cost is not the LU but the `N²` ring evaluations that fill two
+matrices. That is not a problem — it is paid on a trim change — but it is the
+reason the wake direction cannot be re-aligned per frame, and it turns a design
+preference into a measured constraint.
+
+Getting the solve there took one non-obvious step. The forces need the *total*
+velocity at each bound segment, not just the onset, since that is what turns a lift
+calculation into a lift-and-induced-drag one. Evaluating it per solve is `N²`
+Biot-Savart calls — precisely the cost of building the influence matrix — so a
+per-frame solve would have cost as much as a refactorisation and the central claim
+would have been false. It is cached instead, at `3N²` floats: two megabytes at
+three hundred panels, and a solve with no transcendental functions in it at all.
+
+**A measured opportunity, not taken:** adjacent rings share a filament, so about
+half the Biot-Savart calls in the factorisation are duplicates. Removing them would
+roughly halve a load-time cost, which is not worth the bookkeeping risk today.
+
+#### What it does not do
+
+Potential flow: no viscosity, no separation, no stall. A plate at forty degrees
+comes out at `2π sin 40°` and keeps climbing, which is wrong and is §4.2's problem
+rather than this module's. The wake is flat and rigid — no roll-up, no
+unsteadiness. And nothing here is a sail yet: the parametric flying shape of §4.3
+and the blending of §4.2 are the two pieces between this and a boat.
+
 ### 4.2 Separated-flow regime (downwind) — blended semi-empirical model
 
 Potential flow dies at large effective angles of attack. Strategy:
