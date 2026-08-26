@@ -1,0 +1,386 @@
+#![enable(implicit_some)]
+// A synthetic hull FITTED to the published form coefficients of the YD-41.
+//
+// It is NOT the YD-41's lines. The book publishes a lines drawing but no table
+// of offsets, and scaling offsets off a drawing would put measurement error
+// into the very thing meant to serve as an oracle. The offsets below come from
+// a smooth parametric form whose knobs were fitted until its form coefficients
+// matched Appendix 1's half-loaded column. Fitting geometry to published
+// coefficients is a standard parametric-design operation; it is not a
+// transcription, and nothing here should be quoted as the book's.
+//
+// Fit against Appendix 1 (half-loaded), measured analytically at the design
+// waterline:
+//     Cm  0.7150  vs 0.7150   (exact by construction)
+//     Cp  0.5608  vs 0.5600   (0.14 %)
+//     Cwp 0.7064  vs 0.7069   (-0.07 %)
+//     LCB -4.19 %  vs -4.20 %
+//     LCF -7.30 %  vs -7.30 %
+//     Vc  6.069 m^3 vs 6.050   (0.31 %)
+//     Aw  26.73 m^2 vs 26.75   (-0.07 %)
+//
+// Why it exists: the analytic test shapes (barge, half-cylinder) prove
+// exactness but are prismatic and trivial. This is the only boat with geometry,
+// so it is the only thing exercising loft -> clip -> hydrostatics -> flotation
+// -> sectional areas end to end on a fair hull with rocker, a fine bow, a broad
+// transom and flare. Being inside the DSYHS envelope it can also carry a
+// resistance calculation, which its predecessor at Cp 0.63 could not.
+//
+// The keel line rises to 0.360 m at the stem, deliberately kept below the
+// 0.40 m design draft: let it cross, and the canoe body emerges before the stem
+// so the waterline is shorter than the file claims. The loader rejects that
+// outright, which is how the first attempt at this hull was caught.
+//
+// Lwl 11.90 m, Bwl 3.18 m, BMAX 4.20 m, canoe body draft 0.40 m. Freeboard from
+// Appendix 1's Ff/Lwl = 0.121 and Ff/Fa = 1.23. No appendages and no rig: only
+// the hull was fitted, and inventing a keel to match would be exactly the
+// fabrication this file exists to avoid. Use boats/yd41.ron for those.
+//
+// Frame: x forward from the aft perpendicular, y half-breadth, z up from the
+// baseline. SI throughout.
+(
+    schema_version: 1,
+    name: "YD-41 form study",
+    hull: (
+        stations: [
+        (
+            x: 0.0,
+            points: [
+                (y: 0.0, z: 0.3013),
+                (y: 0.2661, z: 0.3123),
+                (y: 0.3983, z: 0.3232),
+                (y: 0.4985, z: 0.3342),
+                (y: 0.579, z: 0.3452),
+                (y: 0.6446, z: 0.3561),
+                (y: 0.6975, z: 0.3671),
+                (y: 0.7385, z: 0.3781),
+                (y: 0.7674, z: 0.389),
+                (y: 0.7811, z: 0.4),
+                (y: 0.8396, z: 0.7902),
+                (y: 0.8982, z: 1.1804),
+                (y: 0.9567, z: 1.5707),
+            ],
+        ),
+        (
+            x: 0.7438,
+            points: [
+                (y: 0.0, z: 0.2423),
+                (y: 0.3915, z: 0.2598),
+                (y: 0.586, z: 0.2773),
+                (y: 0.7334, z: 0.2949),
+                (y: 0.8518, z: 0.3124),
+                (y: 0.9482, z: 0.3299),
+                (y: 1.026, z: 0.3474),
+                (y: 1.0865, z: 0.365),
+                (y: 1.129, z: 0.3825),
+                (y: 1.1491, z: 0.4),
+                (y: 1.2535, z: 0.7958),
+                (y: 1.358, z: 1.1917),
+                (y: 1.4624, z: 1.5875),
+            ],
+        ),
+        (
+            x: 1.4875,
+            points: [
+                (y: 0.0, z: 0.1887),
+                (y: 0.4273, z: 0.2122),
+                (y: 0.6396, z: 0.2356),
+                (y: 0.8004, z: 0.2591),
+                (y: 0.9296, z: 0.2826),
+                (y: 1.0349, z: 0.3061),
+                (y: 1.1199, z: 0.3296),
+                (y: 1.1858, z: 0.353),
+                (y: 1.2323, z: 0.3765),
+                (y: 1.2542, z: 0.4),
+                (y: 1.3733, z: 0.8014),
+                (y: 1.4924, z: 1.2029),
+                (y: 1.6114, z: 1.6043),
+            ],
+        ),
+        (
+            x: 2.2313,
+            points: [
+                (y: 0.0, z: 0.1407),
+                (y: 0.4528, z: 0.1695),
+                (y: 0.6778, z: 0.1983),
+                (y: 0.8482, z: 0.2271),
+                (y: 0.9851, z: 0.256),
+                (y: 1.0967, z: 0.2848),
+                (y: 1.1867, z: 0.3136),
+                (y: 1.2566, z: 0.3424),
+                (y: 1.3058, z: 0.3712),
+                (y: 1.329, z: 0.4),
+                (y: 1.4589, z: 0.807),
+                (y: 1.5889, z: 1.2141),
+                (y: 1.7188, z: 1.6211),
+            ],
+        ),
+        (
+            x: 2.975,
+            points: [
+                (y: 0.0, z: 0.0987),
+                (y: 0.4733, z: 0.1322),
+                (y: 0.7085, z: 0.1656),
+                (y: 0.8866, z: 0.1991),
+                (y: 1.0298, z: 0.2326),
+                (y: 1.1464, z: 0.2661),
+                (y: 1.2405, z: 0.2996),
+                (y: 1.3135, z: 0.333),
+                (y: 1.365, z: 0.3665),
+                (y: 1.3892, z: 0.4),
+                (y: 1.5281, z: 0.8127),
+                (y: 1.6669, z: 1.2253),
+                (y: 1.8058, z: 1.638),
+            ],
+        ),
+        (
+            x: 3.7188,
+            points: [
+                (y: 0.0, z: 0.063),
+                (y: 0.4908, z: 0.1004),
+                (y: 0.7346, z: 0.1379),
+                (y: 0.9193, z: 0.1753),
+                (y: 1.0677, z: 0.2128),
+                (y: 1.1886, z: 0.2502),
+                (y: 1.2862, z: 0.2877),
+                (y: 1.362, z: 0.3251),
+                (y: 1.4153, z: 0.3626),
+                (y: 1.4404, z: 0.4),
+                (y: 1.587, z: 0.8183),
+                (y: 1.7336, z: 1.2365),
+                (y: 1.8802, z: 1.6548),
+            ],
+        ),
+        (
+            x: 4.4625,
+            points: [
+                (y: 0.0, z: 0.0342),
+                (y: 0.5061, z: 0.0748),
+                (y: 0.7575, z: 0.1155),
+                (y: 0.9481, z: 0.1561),
+                (y: 1.1011, z: 0.1968),
+                (y: 1.2258, z: 0.2374),
+                (y: 1.3264, z: 0.2781),
+                (y: 1.4045, z: 0.3187),
+                (y: 1.4595, z: 0.3594),
+                (y: 1.4855, z: 0.4),
+                (y: 1.639, z: 0.8239),
+                (y: 1.7925, z: 1.2477),
+                (y: 1.946, z: 1.6716),
+            ],
+        ),
+        (
+            x: 5.2062,
+            points: [
+                (y: 0.0, z: 0.013),
+                (y: 0.5199, z: 0.056),
+                (y: 0.7782, z: 0.099),
+                (y: 0.9739, z: 0.142),
+                (y: 1.1311, z: 0.185),
+                (y: 1.2592, z: 0.228),
+                (y: 1.3625, z: 0.271),
+                (y: 1.4428, z: 0.314),
+                (y: 1.4993, z: 0.357),
+                (y: 1.5259, z: 0.4),
+                (y: 1.6858, z: 0.8295),
+                (y: 1.8456, z: 1.259),
+                (y: 2.0054, z: 1.6884),
+            ],
+        ),
+        (
+            x: 5.95,
+            points: [
+                (y: 0.0, z: 0.0011),
+                (y: 0.5325, z: 0.0454),
+                (y: 0.797, z: 0.0898),
+                (y: 0.9974, z: 0.1341),
+                (y: 1.1585, z: 0.1784),
+                (y: 1.2897, z: 0.2227),
+                (y: 1.3955, z: 0.267),
+                (y: 1.4777, z: 0.3114),
+                (y: 1.5356, z: 0.3557),
+                (y: 1.5629, z: 0.4),
+                (y: 1.7285, z: 0.8351),
+                (y: 1.8942, z: 1.2702),
+                (y: 2.0599, z: 1.7053),
+            ],
+        ),
+        (
+            x: 6.6938,
+            points: [
+                (y: 0.0, z: 0.0),
+                (y: 0.5268, z: 0.0444),
+                (y: 0.7885, z: 0.0889),
+                (y: 0.9867, z: 0.1333),
+                (y: 1.146, z: 0.1778),
+                (y: 1.2758, z: 0.2222),
+                (y: 1.3805, z: 0.2667),
+                (y: 1.4618, z: 0.3111),
+                (y: 1.5191, z: 0.3556),
+                (y: 1.5461, z: 0.4),
+                (y: 1.7091, z: 0.8407),
+                (y: 1.8721, z: 1.2814),
+                (y: 2.0351, z: 1.7221),
+            ],
+        ),
+        (
+            x: 7.4375,
+            points: [
+                (y: 0.0, z: 0.0053),
+                (y: 0.4552, z: 0.0491),
+                (y: 0.6813, z: 0.093),
+                (y: 0.8526, z: 0.1369),
+                (y: 0.9903, z: 0.1807),
+                (y: 1.1024, z: 0.2246),
+                (y: 1.1929, z: 0.2684),
+                (y: 1.2631, z: 0.3123),
+                (y: 1.3126, z: 0.3561),
+                (y: 1.3359, z: 0.4),
+                (y: 1.4669, z: 0.8463),
+                (y: 1.5978, z: 1.2926),
+                (y: 1.7287, z: 1.7389),
+            ],
+        ),
+        (
+            x: 8.1813,
+            points: [
+                (y: 0.0, z: 0.0272),
+                (y: 0.3829, z: 0.0687),
+                (y: 0.5732, z: 0.1101),
+                (y: 0.7173, z: 0.1515),
+                (y: 0.8331, z: 0.1929),
+                (y: 0.9275, z: 0.2343),
+                (y: 1.0036, z: 0.2757),
+                (y: 1.0627, z: 0.3172),
+                (y: 1.1043, z: 0.3586),
+                (y: 1.1239, z: 0.4),
+                (y: 1.225, z: 0.8519),
+                (y: 1.326, z: 1.3038),
+                (y: 1.4271, z: 1.7558),
+            ],
+        ),
+        (
+            x: 8.925,
+            points: [
+                (y: 0.0, z: 0.0648),
+                (y: 0.31, z: 0.1021),
+                (y: 0.4639, z: 0.1393),
+                (y: 0.5806, z: 0.1766),
+                (y: 0.6743, z: 0.2138),
+                (y: 0.7507, z: 0.251),
+                (y: 0.8123, z: 0.2883),
+                (y: 0.8601, z: 0.3255),
+                (y: 0.8938, z: 0.3628),
+                (y: 0.9097, z: 0.4),
+                (y: 0.9833, z: 0.8575),
+                (y: 1.0569, z: 1.3151),
+                (y: 1.1304, z: 1.7726),
+            ],
+        ),
+        (
+            x: 9.6688,
+            points: [
+                (y: 0.0, z: 0.1173),
+                (y: 0.236, z: 0.1487),
+                (y: 0.3532, z: 0.1801),
+                (y: 0.442, z: 0.2115),
+                (y: 0.5134, z: 0.2429),
+                (y: 0.5715, z: 0.2744),
+                (y: 0.6185, z: 0.3058),
+                (y: 0.6549, z: 0.3372),
+                (y: 0.6805, z: 0.3686),
+                (y: 0.6926, z: 0.4),
+                (y: 0.7415, z: 0.8631),
+                (y: 0.7904, z: 1.3263),
+                (y: 0.8393, z: 1.7894),
+            ],
+        ),
+        (
+            x: 10.4125,
+            points: [
+                (y: 0.0, z: 0.1842),
+                (y: 0.1607, z: 0.2082),
+                (y: 0.2405, z: 0.2322),
+                (y: 0.301, z: 0.2561),
+                (y: 0.3496, z: 0.2801),
+                (y: 0.3892, z: 0.3041),
+                (y: 0.4211, z: 0.3281),
+                (y: 0.4459, z: 0.352),
+                (y: 0.4634, z: 0.376),
+                (y: 0.4716, z: 0.4),
+                (y: 0.4991, z: 0.8687),
+                (y: 0.5266, z: 1.3375),
+                (y: 0.554, z: 1.8062),
+            ],
+        ),
+        (
+            x: 11.1563,
+            points: [
+                (y: 0.0, z: 0.2652),
+                (y: 0.0833, z: 0.2802),
+                (y: 0.1247, z: 0.2952),
+                (y: 0.1561, z: 0.3101),
+                (y: 0.1813, z: 0.3251),
+                (y: 0.2018, z: 0.3401),
+                (y: 0.2183, z: 0.3551),
+                (y: 0.2312, z: 0.37),
+                (y: 0.2403, z: 0.385),
+                (y: 0.2445, z: 0.4),
+                (y: 0.2548, z: 0.8744),
+                (y: 0.265, z: 1.3487),
+                (y: 0.2753, z: 1.8231),
+            ],
+        ),
+        (
+            x: 11.9,
+            points: [
+                (y: 0.0, z: 0.36),
+                (y: 0.0027, z: 0.3644),
+                (y: 0.0041, z: 0.3689),
+                (y: 0.0051, z: 0.3733),
+                (y: 0.0059, z: 0.3778),
+                (y: 0.0066, z: 0.3822),
+                (y: 0.0071, z: 0.3867),
+                (y: 0.0076, z: 0.3911),
+                (y: 0.0079, z: 0.3956),
+                (y: 0.008, z: 0.4),
+                (y: 0.0081, z: 0.88),
+                (y: 0.0081, z: 1.3599),
+                (y: 0.0082, z: 1.8399),
+            ],
+        ),
+        ],
+    ),
+
+    // THIS HULL's own parameters, measured from the offsets above by
+    // `vela-cli form` at the floating waterline. They are not the YD-41's
+    // published values, and they must not be confused with them: this block
+    // says what this mesh is, so that a later edit to the offsets that is not
+    // reflected here shows up as a percentage. How close the mesh comes to the
+    // published YD-41 is a separate question, asserted in
+    // crates/vela-core/tests/yd41_form_study.rs.
+    //
+    // Cp and Cm read about 1-2 % away from the analytic fit in the header, and
+    // the reason is discretization rather than error: with 17 stations the beam
+    // and area peaks fall between stations, so the measured maxima are slightly
+    // low, and Cp = V/(Am Lwl) rises to compensate. Volume, LCB, LCF and Lwl —
+    // all integrals or ratios of integrals — agree to a fraction of a percent.
+    parameters: (
+        waterline_length: 11.9000,
+        waterline_beam: 3.1284,
+        canoe_draft: 0.4034,
+        canoe_volume: 6.0629,
+        wetted_surface: 28.3918,
+        waterplane_area: 26.5699,
+        prismatic: 0.5707,
+        midship: 0.7075,
+        lcb_percent: -4.1861,
+        lcf_percent: -7.1106,
+    ),
+
+    mass: (
+        displacement_kg: 6221.0,
+        cog: (x: 5.4509, y: 0.0, z: 0.2),
+        gyradii: (rx: 1.25, ry: 2.90, rz: 2.95),
+    ),
+)
