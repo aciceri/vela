@@ -1,0 +1,56 @@
+#![enable(implicit_some)]
+// YD-41, the design yacht developed throughout Larsson, Eliasson & Orych,
+// "Principles of Yacht Design", 5th edition (Bloomsbury, 2022).
+//
+// PROVENANCE
+//   Hull form parameters : Appendix 1, "Main particulars of the YD-41",
+//                          p. 385, LIGHT displacement column.
+//   Mass and CoG         : Appendix 2, "Weight calculation", light craft mass
+//                          summary row.
+//
+// This file carries NO hull offsets, and that is not an omission: the book
+// publishes a lines drawing but no table of offsets anywhere. The DSYHS
+// resistance regressions consume scalar form parameters and never touch
+// geometry, so a parameters-only boat is a complete input for resistance,
+// appendage and sail-force work. It cannot be used for buoyancy, stability or
+// wave loads, which need a surface — the loader will say so.
+//
+// The book quotes LCB and LCF from midship, positive forward, as percentages
+// of the waterline length; they are copied here in exactly that form.
+//
+// FRAME CONVERSION
+//   The book measures LCG from the forward end of the waterline, positive aft,
+//   and VCG from the waterline, positive up. This file's frame has x forward
+//   from the aft perpendicular and z up from the baseline, so:
+//     cog.x = Lwl - LCG      = 11.62 - 6.35 = 5.27
+//     cog.z = VCG + Tc       = -0.26 + 0.38 = 0.12
+//
+// ESTIMATED, NOT FROM THE BOOK
+//   The radii of gyration below are estimates from the usual fractions of
+//   waterline length and beam. Appendix 2 tabulates every item's mass and
+//   position, so they could be computed properly by summing m*r^2; that is a
+//   worthwhile refinement and is not done yet. Nothing in the resistance model
+//   depends on them.
+(
+    schema_version: 1,
+    name: "YD-41",
+
+    parameters: (
+        waterline_length: 11.62,
+        waterline_beam: 3.12,
+        canoe_draft: 0.38,
+        canoe_volume: 5.46,
+        wetted_surface: 26.92,
+        waterplane_area: 25.64,
+        prismatic: 0.56,
+        midship: 0.715,
+        lcb_percent: -4.5,
+        lcf_percent: -7.3,
+    ),
+
+    mass: (
+        displacement_kg: 5900.0,
+        cog: (x: 5.27, y: 0.0, z: 0.12),
+        gyradii: (rx: 1.25, ry: 2.90, rz: 2.95),
+    ),
+)

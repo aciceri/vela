@@ -29,6 +29,7 @@
 
 pub mod boat;
 pub mod clip;
+pub mod dsyhs;
 pub mod frames;
 pub mod geometry;
 pub mod hydrostatics;

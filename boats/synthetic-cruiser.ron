@@ -1,3 +1,4 @@
+#![enable(implicit_some)]
 // A synthetic parametric hull, generated for testing the hydrostatics
 // pipeline. It is NOT a real design and is NOT taken from any published
 // offset table: every number here comes from a smooth parametric form, and

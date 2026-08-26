@@ -12,6 +12,7 @@
 //! The physics mesh is lofted from these at load time by [`crate::loft`]; the
 //! visual mesh is a frontend concern and deliberately absent from this format.
 
+use crate::dsyhs::HullParameters;
 use crate::frames::file_to_body;
 use crate::mass::{MassError, MassProperties};
 use nalgebra::Vector3;
@@ -23,12 +24,72 @@ use std::fmt;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// A complete boat definition.
+///
+/// A hull may be given as **geometry** (station offsets), as **scalar form
+/// parameters**, or both. Neither alone covers every need:
+///
+/// - Buoyancy, wave loads and stability are surface integrals and demand
+///   geometry.
+/// - The DSYHS resistance regressions are statistical fits over form
+///   parameters and never touch geometry. Published hull data — including the
+///   design yacht of the series' own textbook — is routinely available as
+///   parameters with no offset table anywhere in print.
+///
+/// When both are present they describe the same hull twice, which makes them
+/// checkable against each other: a file whose declared prismatic coefficient
+/// contradicts its own offsets is wrong, and the loader can say so.
+///
+/// RON files need `#![enable(implicit_some)]` at the top to write optional
+/// blocks without spelling out `Some(...)`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BoatSpec {
     pub schema_version: u32,
     pub name: String,
-    pub hull: HullSpec,
+    #[serde(default)]
+    pub hull: Option<HullSpec>,
+    #[serde(default)]
+    pub parameters: Option<ParametersSpec>,
     pub mass: MassSpec,
+}
+
+/// Scalar hull form parameters, as published in yacht data tables.
+///
+/// Lengths in metres, areas in square metres, volumes in cubic metres. `lcb`
+/// and `lcf` are **percentages** of the waterline length measured from
+/// midship, positive forward — the convention used by the published tables, so
+/// that numbers can be copied across without a sign hunt.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct ParametersSpec {
+    pub waterline_length: f64,
+    pub waterline_beam: f64,
+    pub canoe_draft: f64,
+    pub canoe_volume: f64,
+    pub wetted_surface: f64,
+    pub waterplane_area: f64,
+    pub prismatic: f64,
+    pub midship: f64,
+    pub lcb_percent: f64,
+    pub lcf_percent: f64,
+}
+
+impl ParametersSpec {
+    /// Converts to the engine's form, turning the published percentages into
+    /// fractions.
+    #[must_use]
+    pub fn to_hull_parameters(&self) -> HullParameters {
+        HullParameters {
+            waterline_length: self.waterline_length,
+            waterline_beam: self.waterline_beam,
+            canoe_draft: self.canoe_draft,
+            canoe_volume: self.canoe_volume,
+            wetted_surface: self.wetted_surface,
+            waterplane_area: self.waterplane_area,
+            prismatic: self.prismatic,
+            midship: self.midship,
+            lcb: self.lcb_percent / 100.0,
+            lcf: self.lcf_percent / 100.0,
+        }
+    }
 }
 
 /// Hull geometry as a longitudinal sequence of transverse sections.
@@ -94,6 +155,13 @@ pub enum SpecError {
         found: u32,
         expected: u32,
     },
+    /// Neither offsets nor parameters were given.
+    NoHullDescription,
+    /// A declared hull parameter is not physically possible.
+    NonPositiveParameter {
+        name: &'static str,
+        value: f64,
+    },
     TooFewStations(usize),
     StationsNotIncreasing {
         index: usize,
@@ -128,6 +196,13 @@ impl fmt::Display for SpecError {
             Self::Syntax(message) => write!(f, "malformed boat file: {message}"),
             Self::UnsupportedSchema { found, expected } => {
                 write!(f, "schema_version {found} is not supported (expected {expected})")
+            }
+            Self::NoHullDescription => write!(
+                f,
+                "a boat needs either hull offsets or scalar hull parameters; neither was given"
+            ),
+            Self::NonPositiveParameter { name, value } => {
+                write!(f, "hull parameter {name} must be positive, got {value}")
             }
             Self::TooFewStations(n) => {
                 write!(f, "a hull needs at least 2 stations, found {n}")
@@ -204,9 +279,30 @@ impl BoatSpec {
                 expected: SCHEMA_VERSION,
             });
         }
-        self.hull.validate()?;
+        if self.hull.is_none() && self.parameters.is_none() {
+            return Err(SpecError::NoHullDescription);
+        }
+        if let Some(hull) = &self.hull {
+            hull.validate()?;
+        }
+        if let Some(parameters) = &self.parameters {
+            parameters.validate()?;
+        }
         self.mass_properties()?;
         Ok(())
+    }
+
+    /// The scalar form parameters, if the file declares them.
+    ///
+    /// Deliberately not derived from geometry here: computing a prismatic
+    /// coefficient needs a sectional area curve, which the hydrostatics module
+    /// owns. This accessor answers "what did the file say", and the cross-check
+    /// against geometry belongs where both are in hand.
+    #[must_use]
+    pub fn hull_parameters(&self) -> Option<HullParameters> {
+        self.parameters
+            .as_ref()
+            .map(ParametersSpec::to_hull_parameters)
     }
 
     /// Mass properties converted into the body frame.
@@ -234,6 +330,37 @@ impl BoatSpec {
             cog,
             gyradii,
         )?)
+    }
+}
+
+impl ParametersSpec {
+    /// Rejects parameters that describe no physical hull.
+    ///
+    /// Only positivity is checked here. Whether the hull falls inside the range
+    /// of models the DSYHS regressions were fitted to is a separate question
+    /// with a separate answer — see `dsyhs::HullParameters::check_envelope` —
+    /// because a hull can be perfectly real and still outside the series.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecError::NonPositiveParameter`] for the first offending value.
+    pub fn validate(&self) -> Result<(), SpecError> {
+        let checks = [
+            ("waterline_length", self.waterline_length),
+            ("waterline_beam", self.waterline_beam),
+            ("canoe_draft", self.canoe_draft),
+            ("canoe_volume", self.canoe_volume),
+            ("wetted_surface", self.wetted_surface),
+            ("waterplane_area", self.waterplane_area),
+            ("prismatic", self.prismatic),
+            ("midship", self.midship),
+        ];
+        for (name, value) in checks {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(SpecError::NonPositiveParameter { name, value });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -326,7 +453,7 @@ impl Station {
 mod tests {
     use super::*;
 
-    const MINIMAL: &str = r#"
+    const MINIMAL: &str = r#"#![enable(implicit_some)]
         (
             schema_version: 1,
             name: "test",
@@ -348,12 +475,16 @@ mod tests {
         BoatSpec::parse_ron(MINIMAL).expect("valid spec")
     }
 
+    fn hull(spec: &BoatSpec) -> &HullSpec {
+        spec.hull.as_ref().expect("this fixture has geometry")
+    }
+
     #[test]
     fn parses_a_minimal_hull() {
         let spec = spec();
         assert_eq!(spec.name, "test");
-        assert_eq!(spec.hull.stations.len(), 2);
-        assert!((spec.hull.length() - 2.0).abs() < 1e-12);
+        assert_eq!(hull(&spec).stations.len(), 2);
+        assert!((hull(&spec).length() - 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -422,6 +553,9 @@ mod tests {
         let json = serde_json::to_string(&from_ron).expect("serializable");
         let from_json = BoatSpec::parse_json(&json).expect("valid json");
         assert_eq!(from_ron.name, from_json.name);
-        assert_eq!(from_ron.hull.stations.len(), from_json.hull.stations.len());
+        assert_eq!(
+            hull(&from_ron).stations.len(),
+            hull(&from_json).stations.len()
+        );
     }
 }

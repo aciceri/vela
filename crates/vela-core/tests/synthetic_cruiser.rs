@@ -16,7 +16,10 @@ const SPEC: &str = include_str!("../../../boats/synthetic-cruiser.ron");
 #[test]
 fn the_shipped_boat_parses_and_floats_level() {
     let spec = BoatSpec::parse_ron(SPEC).expect("shipped boat file must be valid");
-    let mesh = loft_hull(&spec.hull, &LoftOptions::default());
+    let mesh = loft_hull(
+        spec.hull.as_ref().expect("fixture has geometry"),
+        &LoftOptions::default(),
+    );
     let body = RigidBody::new(spec.mass_properties().expect("valid mass")).expect("valid body");
     let water = Water::default();
 
@@ -62,7 +65,10 @@ fn the_shipped_boat_parses_and_floats_level() {
 #[test]
 fn the_lofted_hull_is_watertight() {
     let spec = BoatSpec::parse_ron(SPEC).expect("valid spec");
-    let mesh = loft_hull(&spec.hull, &LoftOptions::default());
+    let mesh = loft_hull(
+        spec.hull.as_ref().expect("fixture has geometry"),
+        &LoftOptions::default(),
+    );
 
     let residual: vela_core::geometry::Point = mesh.triangles().map(|t| t.area_normal()).sum();
     // Scaled against the hull's own surface area so the bound means something.
@@ -85,7 +91,7 @@ fn draft_is_stable_across_resolutions() {
 
     let draft_at = |points: usize| {
         let mesh = loft_hull(
-            &spec.hull,
+            spec.hull.as_ref().expect("fixture has geometry"),
             &LoftOptions {
                 points_per_station: points,
             },
