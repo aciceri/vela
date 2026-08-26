@@ -886,6 +886,10 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
         .map(LewisForm::beam)
         .fold(0.0_f64, f64::max);
 
+    // One solver for the whole sweep: it owns the quadrature rule, which is the
+    // expensive thing to build and the same at every frequency.
+    let solver = tasai::SectionSolver::new(tasai::TasaiOptions::default());
+
     let mut slenderness = f64::INFINITY;
     let mut frequency = 0.25;
     while frequency <= 4.001 {
@@ -894,7 +898,7 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
             frequency,
             SEA_WATER_DENSITY,
             vela_core::STANDARD_GRAVITY,
-            tasai::TasaiOptions::default(),
+            &solver,
         )
         .ok_or("the frequency sweep must stay positive over a length")?;
         slenderness = solved.slenderness;
@@ -936,7 +940,7 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
                             natural,
                             SEA_WATER_DENSITY,
                             vela_core::STANDARD_GRAVITY,
-                            tasai::TasaiOptions::default(),
+                            &solver,
                         ) else {
                             break;
                         };

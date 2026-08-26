@@ -41,7 +41,7 @@
 //! reason to pretend the question does not exist.
 
 use crate::lewis::LewisForm;
-use crate::tasai::{self, TasaiOptions};
+use crate::tasai::SectionSolver;
 
 /// A station's longitudinal position and the form fitted to it.
 ///
@@ -101,13 +101,17 @@ pub struct HeavePitch {
 /// Trapezoidal over the station positions, which need not be evenly spaced.
 /// Returns `None` for a non-positive frequency, or for fewer than two stations —
 /// strip theory needs a length to integrate over.
+///
+/// Takes the solver rather than the options because a frequency sweep over a
+/// hull is thousands of section solves and the quadrature rule is the same for
+/// every one of them. See [`SectionSolver`].
 #[must_use]
 pub fn heave_pitch_coefficients(
     strips: &[Strip],
     omega: f64,
     density: f64,
     gravity: f64,
-    options: TasaiOptions,
+    solver: &SectionSolver,
 ) -> Option<HeavePitch> {
     if strips.len() < 2 || omega <= 0.0 {
         return None;
@@ -121,7 +125,7 @@ pub fn heave_pitch_coefficients(
         match &strip.form {
             None => sectional.push((strip.x, 0.0, 0.0)),
             Some(form) => {
-                let solved = tasai::heave_coefficients(form, omega, density, gravity, options)?;
+                let solved = solver.heave(form, omega, density, gravity)?;
                 worst_energy_residual = worst_energy_residual.max(solved.energy_residual.abs());
                 widest = widest.max(form.beam());
                 sectional.push((strip.x, solved.added_mass, solved.damping));
@@ -167,6 +171,7 @@ pub fn heave_pitch_coefficients(
 mod tests {
     use super::*;
     use crate::lewis::SectionGeometry;
+    use crate::tasai::TasaiOptions;
     use approx::assert_relative_eq;
 
     const WATER: f64 = 1025.0;
@@ -193,8 +198,14 @@ mod tests {
     }
 
     fn solve(strips: &[Strip], omega: f64) -> HeavePitch {
-        heave_pitch_coefficients(strips, omega, WATER, GRAVITY, TasaiOptions::default())
-            .expect("a positive frequency over a length has a solution")
+        heave_pitch_coefficients(
+            strips,
+            omega,
+            WATER,
+            GRAVITY,
+            &SectionSolver::new(TasaiOptions::default()),
+        )
+        .expect("a positive frequency over a length has a solution")
     }
 
     /// A hull symmetric about the origin has no heave-pitch coupling.
@@ -396,12 +407,16 @@ mod tests {
             1.0,
             WATER,
             GRAVITY,
-            TasaiOptions::default()
+            &SectionSolver::new(TasaiOptions::default())
         )
         .is_none());
-        assert!(
-            heave_pitch_coefficients(&single, 0.0, WATER, GRAVITY, TasaiOptions::default())
-                .is_none()
-        );
+        assert!(heave_pitch_coefficients(
+            &single,
+            0.0,
+            WATER,
+            GRAVITY,
+            &SectionSolver::new(TasaiOptions::default())
+        )
+        .is_none());
     }
 }

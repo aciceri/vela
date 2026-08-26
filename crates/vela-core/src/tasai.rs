@@ -174,6 +174,25 @@ fn progressive_wave(nu: f64, x: f64, y: f64) -> Complex<f64> {
     -Complex::<f64>::i() * scaled_exp1(w)
 }
 
+/// The progressive wave system evaluated at one point of the section surface.
+///
+/// Four numbers that all fall out of one [`progressive_wave`] call: the stream
+/// function and the velocity potential, each in the phase with `cos(ωt)` and the
+/// phase with `sin(ωt)`. Kept together because the exponential integral behind
+/// them is the dominant cost of a solve, and computing them one at a time repeats
+/// it.
+#[derive(Debug, Clone, Copy)]
+struct ProgressiveWaves {
+    /// `ψ_B0c`.
+    stream_cos: f64,
+    /// `ψ_B0s`.
+    stream_sin: f64,
+    /// `φ_B0c`.
+    potential_cos: f64,
+    /// `φ_B0s`.
+    potential_sin: f64,
+}
+
 /// Gauss-Legendre nodes and weights on `[a, b]`.
 ///
 /// Computed rather than tabulated, by Newton's method on the Legendre
@@ -280,197 +299,284 @@ pub struct HeaveCoefficients {
     pub energy_residual: f64,
 }
 
-/// Solves the heave radiation problem for a Lewis section.
+/// A reusable solver for the section radiation problem.
 ///
-/// `omega` is the radian frequency of oscillation, `density` the water density
-/// and `gravity` the acceleration of gravity. Returns `None` for a
-/// non-positive frequency, where the radiation problem is not posed: the
-/// progressive wave system that carries the energy away does not exist, and the
-/// wave integral's argument collapses onto the origin.
-#[must_use]
-pub fn heave_coefficients(
-    form: &LewisForm,
-    omega: f64,
-    density: f64,
-    gravity: f64,
-    options: TasaiOptions,
-) -> Option<HeaveCoefficients> {
-    if omega <= 0.0 || options.multipoles == 0 {
-        return None;
-    }
+/// Holds the Gauss-Legendre rule, which depends only on
+/// [`TasaiOptions::quadrature`] and not on the section or the frequency. That
+/// sounds like a detail and is not: building the rule means Newton's method on a
+/// polynomial of the rule's own degree, and measurement puts it at roughly
+/// nine-tenths of the cost of a solve. A frequency sweep over a hull is
+/// thousands of solves, so the rule is built once here and the solves that
+/// follow are cheap.
+///
+/// This is why there is no free function taking [`TasaiOptions`]: it would have
+/// exactly the shape of the mistake.
+#[derive(Debug, Clone)]
+pub struct SectionSolver {
+    nodes: Vec<f64>,
+    weights: Vec<f64>,
+    multipoles: usize,
+}
 
-    // The mapping coefficients, indexed as the source indexes them: `a[n]` is
-    // `a_{2n-1}`, so `a[0]` is `a_-1`, which is always one.
-    let a = [1.0, form.a1, form.a3];
-    const N: usize = 2;
-    let multipoles = options.multipoles;
-
-    // σ_a is the value the half-breadth series takes at the waterline, so that
-    // `h(π/2) = 1`; `b_0` is the full beam; `ξ_b` is the squared
-    // non-dimensional frequency, `ω² b_0 / 2g`.
-    let sigma_a = 1.0 + form.a1 + form.a3;
-    let beam = 2.0 * form.scale * sigma_a;
-    let nu = omega * omega / gravity;
-    let xi_b = nu * beam / 2.0;
-    let frequency_ratio = xi_b / sigma_a;
-
-    // `h(θ) = 2 x_0 / b_0`: the half-breadth normalised so that it is one at
-    // the waterline.
-    let h = |theta: f64| form.contour(theta).0 / (form.scale * sigma_a);
-
-    // The standing-wave stream and potential functions, `ψ_A0_2m` and `φ_A0_2m`.
-    // The two differ only in sine against cosine, so they share one body.
-    let standing = |m: usize, theta: f64, sine: bool| {
-        let mut series = 0.0;
-        for (n, coefficient) in a.iter().enumerate() {
-            let order = 2.0 * n as f64 - 1.0;
-            let shifted = 2.0 * m as f64 + 2.0 * n as f64 - 1.0;
-            let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
-            let harmonic = if sine {
-                (shifted * theta).sin()
-            } else {
-                (shifted * theta).cos()
-            };
-            series += sign * (order / shifted) * coefficient * harmonic;
-        }
-        let principal = if sine {
-            (2.0 * m as f64 * theta).sin()
-        } else {
-            (2.0 * m as f64 * theta).cos()
-        };
-        principal - frequency_ratio * series
-    };
-
-    // `ψ_A0_2m(π/2)`, which the source gives in closed form. Deriving it from
-    // the general expression above reproduces this exactly, which is worth
-    // knowing: it is an independent check that the index conventions here match
-    // the source's.
-    let standing_at_waterline = |m: usize| {
-        let mut series = 0.0;
-        for (n, coefficient) in a.iter().enumerate() {
-            let order = 2.0 * n as f64 - 1.0;
-            let shifted = 2.0 * m as f64 + 2.0 * n as f64 - 1.0;
-            series += (order / shifted) * coefficient;
-        }
-        let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
-        frequency_ratio * sign * series
-    };
-
-    // The progressive-wave functions on the section surface. `stream` selects
-    // the stream function `ψ_B0` over the potential `φ_B0`, `sine` the
-    // component in phase with `sin(ωt)`.
-    let progressive = |theta: f64, stream: bool, sine: bool| {
-        let (x, y) = form.contour(theta);
-        let decay = PI * (-nu * y).exp();
-        match (stream, sine) {
-            (true, false) => decay * (nu * x).sin(),
-            (true, true) => -decay * (nu * x).cos() + progressive_wave(nu, x, y).re,
-            (false, false) => decay * (nu * x).cos(),
-            (false, true) => decay * (nu * x).sin() + progressive_wave(nu, x, y).im,
-        }
-    };
-
-    // `f_2m(θ) = -ψ_A0_2m(θ) + h(θ) ψ_A0_2m(π/2)`: the basis the boundary
-    // condition is projected onto.
-    let (nodes, weights) = gauss_legendre(options.quadrature, 0.0, PI / 2.0);
-    let basis: Vec<Vec<f64>> = nodes
-        .iter()
-        .map(|&theta| {
-            (1..=multipoles)
-                .map(|m| -standing(m, theta, true) + h(theta) * standing_at_waterline(m))
-                .collect()
-        })
-        .collect();
-
-    // Galerkin projection. The matrix is the Gram matrix of that basis and is
-    // therefore symmetric; the two right hand sides differ only in which
-    // progressive-wave function they carry, so one factorisation serves both.
-    let mut gram = DMatrix::zeros(multipoles, multipoles);
-    let mut rhs_cos = DVector::zeros(multipoles);
-    let mut rhs_sin = DVector::zeros(multipoles);
-    let waterline_cos = progressive(PI / 2.0, true, false);
-    let waterline_sin = progressive(PI / 2.0, true, true);
-
-    for (i, (&theta, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
-        let forcing_cos = progressive(theta, true, false) - h(theta) * waterline_cos;
-        let forcing_sin = progressive(theta, true, true) - h(theta) * waterline_sin;
-        for n in 0..multipoles {
-            let f_n = weight * basis[i][n];
-            rhs_cos[n] += f_n * forcing_cos;
-            rhs_sin[n] += f_n * forcing_sin;
-            for m in 0..multipoles {
-                gram[(n, m)] += f_n * basis[i][m];
-            }
+impl SectionSolver {
+    /// Builds the quadrature rule for these options.
+    #[must_use]
+    pub fn new(options: TasaiOptions) -> Self {
+        let (nodes, weights) = gauss_legendre(options.quadrature, 0.0, PI / 2.0);
+        Self {
+            nodes,
+            weights,
+            multipoles: options.multipoles,
         }
     }
 
-    let factored = gram.lu();
-    let p = factored.solve(&rhs_cos)?;
-    let q = factored.solve(&rhs_sin)?;
-
-    // `A_0` and `B_0`: the boundary condition evaluated at the waterline, which
-    // is where the free surface meets the hull and `h` is one.
-    let mut a0 = waterline_cos;
-    let mut b0 = waterline_sin;
-    for m in 1..=multipoles {
-        a0 += p[m - 1] * standing_at_waterline(m);
-        b0 += q[m - 1] * standing_at_waterline(m);
+    /// Number of multipoles this solver was built for.
+    #[must_use]
+    pub fn multipoles(&self) -> usize {
+        self.multipoles
     }
 
-    // `M_0` and `N_0`: the pressure integrated over the surface, in the two
-    // phases. The three terms are the source's, in its order: the progressive
-    // wave's own contribution, the standing waves', and a term the free surface
-    // condition contributes at the waterline.
-    let pressure = |multipole: &DVector<f64>, sine: bool| {
-        let mut integral = 0.0;
-        for (&theta, &weight) in nodes.iter().zip(weights.iter()) {
-            let mut shape = 0.0;
-            for (n, coefficient) in a.iter().enumerate() {
-                let order = 2.0 * n as f64 - 1.0;
-                let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
-                shape += sign * order * coefficient * (order * theta).cos();
-            }
-            integral += weight * progressive(theta, false, sine) * shape;
+    /// Solves the heave radiation problem for a Lewis section.
+    ///
+    /// `omega` is the radian frequency of oscillation, `density` the water density
+    /// and `gravity` the acceleration of gravity. Returns `None` for a
+    /// non-positive frequency, where the radiation problem is not posed: the
+    /// progressive wave system that carries the energy away does not exist, and the
+    /// wave integral's argument collapses onto the origin.
+    #[must_use]
+    pub fn heave(
+        &self,
+        form: &LewisForm,
+        omega: f64,
+        density: f64,
+        gravity: f64,
+    ) -> Option<HeaveCoefficients> {
+        if omega <= 0.0 || self.multipoles == 0 {
+            return None;
         }
-        let mut standing_term = 0.0;
+        let multipoles = self.multipoles;
+        // The mapping coefficients, indexed as the source indexes them: `a[n]` is
+        // `a_{2n-1}`, so `a[0]` is `a_-1`, which is always one.
+        let a = [1.0, form.a1, form.a3];
+        const N: usize = 2;
+
+        // σ_a is the value the half-breadth series takes at the waterline, so that
+        // `h(π/2) = 1`; `b_0` is the full beam; `ξ_b` is the squared
+        // non-dimensional frequency, `ω² b_0 / 2g`.
+        let sigma_a = 1.0 + form.a1 + form.a3;
+        let beam = 2.0 * form.scale * sigma_a;
+        let nu = omega * omega / gravity;
+        let xi_b = nu * beam / 2.0;
+        let frequency_ratio = xi_b / sigma_a;
+
+        // `h(θ) = 2 x_0 / b_0`: the half-breadth normalised so that it is one at
+        // the waterline.
+        let h = |theta: f64| form.contour(theta).0 / (form.scale * sigma_a);
+
+        // The standing-wave stream function `ψ_A0_2m`, decomposed once into the
+        // harmonics it is made of.
+        //
+        // `ψ_A0_2m(θ) = sin(2mθ) - (ξ_b/σ_a) Σ_n (-1)ⁿ (2n-1)/(2m+2n-1) a_{2n-1}
+        // sin((2m+2n-1)θ)`, so for each `m` it is a fixed short list of
+        // `(harmonic index, weight)` pairs, independent of `θ`. Building that list
+        // here means the basis assembly below is multiply-adds over a table of sines
+        // rather than three transcendental calls per multipole per node — which was
+        // the dominant cost of a solve, ahead even of the exponential integral.
+        let mut harmonics: Vec<[(usize, f64); N + 2]> = Vec::with_capacity(multipoles);
+        let mut highest = 0;
         for m in 1..=multipoles {
-            let mut inner = 0.0;
+            let mut terms = [(0_usize, 0.0_f64); N + 2];
+            terms[0] = (2 * m, 1.0);
+            for (n, &coefficient) in a.iter().enumerate() {
+                let order = 2.0 * n as f64 - 1.0;
+                let shifted = 2 * m + 2 * n - 1;
+                let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+                terms[n + 1] = (
+                    shifted,
+                    -frequency_ratio * sign * (order / shifted as f64) * coefficient,
+                );
+            }
+            highest = highest.max(terms.iter().map(|&(index, _)| index).max().unwrap_or(0));
+            harmonics.push(terms);
+        }
+
+        // `sin(kθ)` for every `k` the harmonics ask for, by the Chebyshev
+        // recurrence `sin((k+1)θ) = 2 cos θ sin(kθ) - sin((k-1)θ)`. Two
+        // transcendental calls per node instead of one per harmonic.
+        let sines_at = |theta: f64| {
+            let (sine, cosine) = theta.sin_cos();
+            let mut table = vec![0.0; highest + 1];
+            if highest >= 1 {
+                table[1] = sine;
+            }
+            for k in 2..=highest {
+                table[k] = 2.0 * cosine * table[k - 1] - table[k - 2];
+            }
+            table
+        };
+
+        // `ψ_A0_2m(π/2)`, which the source gives in closed form. Deriving it from
+        // the general expression above reproduces this exactly, which is worth
+        // knowing: it is an independent check that the index conventions here match
+        // the source's.
+        let standing_at_waterline = |m: usize| {
+            let mut series = 0.0;
             for (n, coefficient) in a.iter().enumerate() {
                 let order = 2.0 * n as f64 - 1.0;
-                let even = 2.0 * m as f64;
-                inner += (order * order / (even * even - order * order)) * coefficient;
+                let shifted = 2.0 * m as f64 + 2.0 * n as f64 - 1.0;
+                series += (order / shifted) * coefficient;
             }
             let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
-            standing_term += sign * multipole[m - 1] * inner;
-        }
-        // The waterline term reaches only as far as the mapping has
-        // coefficients to pair up: `a_{2m+2n-1}` must exist, so `m + n ≤ N`.
-        let mut waterline_term = multipole[0];
-        for m in 1..=N.min(multipoles) {
-            let mut inner = 0.0;
-            for n in 0..=(N - m) {
-                let order = 2.0 * n as f64 - 1.0;
-                inner += order * a[n] * a[m + n];
+            frequency_ratio * sign * series
+        };
+
+        // The four progressive-wave functions at one point of the surface. They
+        // share a single exponential integral, which is the expensive part: an
+        // earlier arrangement asked for them one at a time and paid for the same
+        // integral four times at every quadrature node.
+        let progressive = |theta: f64| {
+            let (x, y) = form.contour(theta);
+            let decay = PI * (-nu * y).exp();
+            let (sine, cosine) = (nu * x).sin_cos();
+            let wave = progressive_wave(nu, x, y);
+            ProgressiveWaves {
+                stream_cos: decay * sine,
+                stream_sin: -decay * cosine + wave.re,
+                potential_cos: decay * cosine,
+                potential_sin: decay * sine + wave.im,
             }
-            let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
-            waterline_term += sign * multipole[m - 1] * inner;
+        };
+
+        // Everything that depends on the quadrature node but not on the multipole
+        // index, tabulated once.
+        let sampled: Vec<(f64, f64, ProgressiveWaves, f64)> = self
+            .nodes
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(&theta, &weight)| {
+                // The half-breadth slope the pressure integral weights by: the same
+                // series as `h`, differentiated and unnormalised.
+                let mut shape = 0.0;
+                for (n, coefficient) in a.iter().enumerate() {
+                    let order = 2.0 * n as f64 - 1.0;
+                    let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+                    shape += sign * order * coefficient * (order * theta).cos();
+                }
+                (weight, h(theta), progressive(theta), shape)
+            })
+            .collect();
+
+        // `f_2m(θ) = -ψ_A0_2m(θ) + h(θ) ψ_A0_2m(π/2)`: the basis the boundary
+        // condition is projected onto.
+        let waterline_standing: Vec<f64> = (1..=multipoles).map(standing_at_waterline).collect();
+        let basis: Vec<Vec<f64>> = self
+            .nodes
+            .iter()
+            .zip(sampled.iter())
+            .map(|(&theta, (_, h_here, _, _))| {
+                let sines = sines_at(theta);
+                harmonics
+                    .iter()
+                    .zip(waterline_standing.iter())
+                    .map(|(terms, &at_waterline)| {
+                        let standing: f64 = terms
+                            .iter()
+                            .map(|&(index, weight)| weight * sines[index])
+                            .sum();
+                        h_here * at_waterline - standing
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Galerkin projection. The matrix is the Gram matrix of that basis and is
+        // therefore symmetric; the two right hand sides differ only in which
+        // progressive-wave function they carry, so one factorisation serves both.
+        let mut gram = DMatrix::zeros(multipoles, multipoles);
+        let mut rhs_cos = DVector::zeros(multipoles);
+        let mut rhs_sin = DVector::zeros(multipoles);
+        let waterline = progressive(PI / 2.0);
+
+        for (i, (weight, h_here, waves, _)) in sampled.iter().enumerate() {
+            let forcing_cos = waves.stream_cos - h_here * waterline.stream_cos;
+            let forcing_sin = waves.stream_sin - h_here * waterline.stream_sin;
+            for n in 0..multipoles {
+                let f_n = weight * basis[i][n];
+                rhs_cos[n] += f_n * forcing_cos;
+                rhs_sin[n] += f_n * forcing_sin;
+                for m in 0..multipoles {
+                    gram[(n, m)] += f_n * basis[i][m];
+                }
+            }
         }
-        -integral / sigma_a - standing_term / sigma_a
-            + PI * xi_b / (4.0 * sigma_a * sigma_a) * waterline_term
-    };
 
-    let m0 = pressure(&q, true);
-    let n0 = pressure(&p, false);
+        let factored = gram.lu();
+        let p = factored.solve(&rhs_cos)?;
+        let q = factored.solve(&rhs_sin)?;
 
-    let denominator = a0 * a0 + b0 * b0;
-    let energy = m0 * a0 - n0 * b0;
+        // `A_0` and `B_0`: the boundary condition evaluated at the waterline, which
+        // is where the free surface meets the hull and `h` is one.
+        let mut a0 = waterline.stream_cos;
+        let mut b0 = waterline.stream_sin;
+        for (m, &at_waterline) in waterline_standing.iter().enumerate() {
+            a0 += p[m] * at_waterline;
+            b0 += q[m] * at_waterline;
+        }
 
-    Some(HeaveCoefficients {
-        added_mass: density * beam * beam / 2.0 * (m0 * b0 + n0 * a0) / denominator,
-        damping: density * beam * beam / 2.0 * energy / denominator * omega,
-        wave_amplitude_ratio: PI * xi_b / denominator.sqrt(),
-        energy_residual: energy / (PI * PI / 2.0) - 1.0,
-    })
+        // `M_0` and `N_0`: the pressure integrated over the surface, in the two
+        // phases. The three terms are the source's, in its order: the progressive
+        // wave's own contribution, the standing waves', and a term the free surface
+        // condition contributes at the waterline.
+        let pressure = |multipole: &DVector<f64>, sine: bool| {
+            let mut integral = 0.0;
+            for (weight, _, waves, shape) in &sampled {
+                let potential = if sine {
+                    waves.potential_sin
+                } else {
+                    waves.potential_cos
+                };
+                integral += weight * potential * shape;
+            }
+            let mut standing_term = 0.0;
+            for m in 1..=multipoles {
+                let mut inner = 0.0;
+                for (n, coefficient) in a.iter().enumerate() {
+                    let order = 2.0 * n as f64 - 1.0;
+                    let even = 2.0 * m as f64;
+                    inner += (order * order / (even * even - order * order)) * coefficient;
+                }
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                standing_term += sign * multipole[m - 1] * inner;
+            }
+            // The waterline term reaches only as far as the mapping has
+            // coefficients to pair up: `a_{2m+2n-1}` must exist, so `m + n ≤ N`.
+            let mut waterline_term = multipole[0];
+            for m in 1..=N.min(multipoles) {
+                let mut inner = 0.0;
+                for n in 0..=(N - m) {
+                    let order = 2.0 * n as f64 - 1.0;
+                    inner += order * a[n] * a[m + n];
+                }
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                waterline_term += sign * multipole[m - 1] * inner;
+            }
+            -integral / sigma_a - standing_term / sigma_a
+                + PI * xi_b / (4.0 * sigma_a * sigma_a) * waterline_term
+        };
+
+        let m0 = pressure(&q, true);
+        let n0 = pressure(&p, false);
+
+        let denominator = a0 * a0 + b0 * b0;
+        let energy = m0 * a0 - n0 * b0;
+
+        Some(HeaveCoefficients {
+            added_mass: density * beam * beam / 2.0 * (m0 * b0 + n0 * a0) / denominator,
+            damping: density * beam * beam / 2.0 * energy / denominator * omega,
+            wave_amplitude_ratio: PI * xi_b / denominator.sqrt(),
+            energy_residual: energy / (PI * PI / 2.0) - 1.0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -508,7 +614,8 @@ mod tests {
     }
 
     fn solve(form: &LewisForm, omega: f64) -> HeaveCoefficients {
-        heave_coefficients(form, omega, WATER, GRAVITY, TasaiOptions::default())
+        SectionSolver::new(TasaiOptions::default())
+            .heave(form, omega, WATER, GRAVITY)
             .expect("a positive frequency has a solution")
     }
 
@@ -715,16 +822,11 @@ mod tests {
             loose > 1e-3,
             "the high-frequency limit is real; if this got better, the note above is stale"
         );
-        let tightened = heave_coefficients(
-            &form,
-            3.5,
-            WATER,
-            GRAVITY,
-            TasaiOptions {
-                multipoles: 48,
-                quadrature: 96,
-            },
-        )
+        let tightened = SectionSolver::new(TasaiOptions {
+            multipoles: 48,
+            quadrature: 96,
+        })
+        .heave(&form, 3.5, WATER, GRAVITY)
         .expect("a positive frequency has a solution");
         assert!(
             tightened.energy_residual.abs() < 0.3 * loose,
@@ -742,7 +844,8 @@ mod tests {
                 multipoles,
                 quadrature: 192,
             };
-            let solved = heave_coefficients(&form, 2.5, WATER, GRAVITY, options)
+            let solved = SectionSolver::new(options)
+                .heave(&form, 2.5, WATER, GRAVITY)
                 .expect("a positive frequency has a solution");
             let residual = solved.energy_residual.abs();
             assert!(
@@ -836,8 +939,9 @@ mod tests {
     #[test]
     fn a_still_section_has_no_radiation_solution() {
         let form = containership_midship();
-        assert!(heave_coefficients(&form, 0.0, WATER, GRAVITY, TasaiOptions::default()).is_none());
-        assert!(heave_coefficients(&form, -1.0, WATER, GRAVITY, TasaiOptions::default()).is_none());
+        let solver = SectionSolver::new(TasaiOptions::default());
+        assert!(solver.heave(&form, 0.0, WATER, GRAVITY).is_none());
+        assert!(solver.heave(&form, -1.0, WATER, GRAVITY).is_none());
     }
 
     /// Added mass scales with the square of a section's size.
