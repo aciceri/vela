@@ -46,6 +46,7 @@ pub mod loft;
 pub mod mass;
 pub mod modules;
 pub mod rigid_body;
+pub mod seaway;
 pub mod sections;
 pub mod sim;
 pub mod state;

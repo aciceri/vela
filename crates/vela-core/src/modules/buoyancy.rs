@@ -77,8 +77,9 @@
 //!   **not** vanish at equilibrium; it cancels the weight wrench, which this
 //!   module never sees.
 
-use crate::geometry::TriMesh;
-use crate::hydrostatics::{hydrostatics, Hydrostatics, Water};
+use crate::env::Environment;
+use crate::geometry::{Point, TriMesh};
+use crate::hydrostatics::{hydrostatics_on, FreeSurface, Hydrostatics, Water};
 use crate::sim::{ForceModule, StepCtx};
 use crate::telemetry::Telemetry;
 use crate::wrench::Wrench;
@@ -161,8 +162,16 @@ impl ForceModule for Buoyancy {
         // direction of the same mistake: a pressure integral needs the attitude
         // itself, and rebuilding a rotation out of Euler angles would create a
         // second description of the pose free to disagree with the first.
+        // The surface comes from the environment, so a wave excites the hull
+        // through the same pressure integral that floats it. Still water answers
+        // both of the surface's questions with the depth, so nothing changes for
+        // a boat in a calm — which is what keeps the flat-water tests meaningful.
+        let surface = EnvironmentSurface {
+            env: ctx.env,
+            time: ctx.time,
+        };
         let snapshot = Snapshot {
-            hydrostatics: hydrostatics(&self.mesh, ctx.state, &water, gravity),
+            hydrostatics: hydrostatics_on(&self.mesh, ctx.state, &surface, &water, gravity),
             water,
             gravity,
         };
@@ -223,6 +232,27 @@ impl ForceModule for Buoyancy {
         out.set("buoyancy.hull.roll_moment", moment.x);
         out.set("buoyancy.hull.pitch_moment", moment.y);
         out.set("buoyancy.hull.yaw_moment", moment.z);
+    }
+}
+
+/// The environment's free surface, in the shape the pressure integral wants.
+///
+/// A thin adapter and nothing more, but it is the whole join between "what the
+/// world's water is doing" and "what this hull is carrying": the environment
+/// knows the surface as a function of position *and time*, the integral wants it
+/// as a function of position alone, and this pins the time.
+struct EnvironmentSurface<'a> {
+    env: &'a dyn Environment,
+    time: f64,
+}
+
+impl FreeSurface for EnvironmentSurface<'_> {
+    fn depth(&self, at: Point) -> f64 {
+        self.env.depth(at, self.time)
+    }
+
+    fn pressure_head(&self, at: Point) -> f64 {
+        self.env.pressure_head(at, self.time)
     }
 }
 

@@ -582,6 +582,73 @@ condition is wanted, the mast position has to be trimmed against the model rathe
 than against the rule. That is a capability worth adding and is not here yet.
 
 
+### 5.3h Seaway: the water moves, and the hull feels it
+
+`vela_core::seaway` is a **realisation**: a spectrum, a seed, and a stated
+synthesis convention. Not a height field. The distinction is the load-bearing
+part, because the same sea has to be evaluated twice — by the physics wherever a
+hull triangle happens to be, and by a renderer on whatever grid it likes — and
+two independent syntheses of one spectrum are two different oceans.
+
+ITTC/ISSC Pierson-Moskowitz, parameterised by significant height and peak period
+because those are what a sailor and a test both set. Its zeroth moment is
+`(H_s/4)²` exactly, which is what the discretisation is checked against: the
+components carry 97–100 % of the variance over a band from a quarter to four
+times the peak, and refining the band by a factor of twenty does not move the
+realised height.
+
+**Two questions, not one.** `elevation` says where the surface is, which decides
+what is wet. `pressure_head` says what the pressure is, which decides the force —
+and a wave's dynamic pressure decays as `e^(-kz)`, so a deep keel feels far less
+of a passing crest than its submergence suggests. Integrating `ρ g d` below a
+wavy datum, the usual shortcut, over-drives anything deep in short waves.
+`hydrostatics::FreeSurface` carries both, and the buoyancy module clips against
+one and loads against the other.
+
+The decay is taken over the depth below the **instantaneous** surface — Wheeler
+stretching — and that is not tidiness. With the decay measured from the mean
+level the head does not vanish on the surface: it misses by order `k ζ a`, two
+centimetres in a 1.5 m sea. Two centimetres breaks the one invariant the two
+functions must share, since a waterline where one says "just submerged" and the
+other says "already loaded" leaks force in proportion to wave height. Stretching
+makes the agreement exact by construction.
+
+#### Verified
+
+**A hull rides a long wave.** In a 600 m wave the vertical motion amidships
+follows the surface with a ratio of 1.0, in phase. That single number exercises
+the whole chain: synthesis, pressure head with its decay, clipping against a
+moving surface, added mass in the mass matrix, fluid memory, integrator.
+
+Two mistakes in the *test* had to be found first, and both are worth recording.
+`position.z` is the body origin, which sits at the aft perpendicular — six metres
+from midships, where a fraction of a degree of pitch swamps the heave, and
+measuring there showed a response half again too large that was entirely the arm.
+And 150 m is not a long wave for this boat: heave and pitch have natural periods
+of 2.0 s and 1.75 s, and the quasi-static limit wants to be far below both.
+
+#### Open: pitch responds about 4.6 times the wave slope
+
+Measured, not suspected. A freely floating body in a long wave should pitch by
+the wave slope — ratio 1 in units of `ka`. This hull pitches 0.62° in a 600 m
+wave whose slope amplitude is 0.135°, and 2.5° in a 150 m wave whose slope is
+0.54°: the same factor at both, which rules out resonance, and the pitch natural
+period of 1.75 s puts both waves firmly in the quasi-static regime where the
+answer should be 1.
+
+A constant factor points at a static imbalance rather than a dynamic one — the
+restoring and the excitation are the same pressure integral, so they should
+cancel exactly in the long-wave limit, and something is breaking that. It is
+**not** asserted either way in a test: writing `ratio == 1` would fail and
+writing `ratio == 4.6` would enshrine a probable bug. Heave is verified, pitch is
+recorded, and the next session starts here.
+
+One candidate found while looking: the frequency grid runs from `ω_max/N` upward,
+so with sixty samples to 30 rad/s the lowest is 0.5 rad/s and any wave longer
+than a 12.6 s period has its memory model **extrapolated** rather than fitted.
+That does not explain a quasi-static error, but it is a real limitation and a
+log-spaced grid would remove it.
+
 ### 5.4 Appendages: keel and rudder
 
 Wing-theory model per appendage:

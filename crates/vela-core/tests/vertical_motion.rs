@@ -12,7 +12,9 @@
 //! rate is the one the frequency domain predicts are the three questions here.
 
 use vela_core::assembly::{vertical_motion_sim, RadiationOptions};
-use vela_core::{BoatSpec, LoftOptions, Sim};
+use vela_core::env::Seaway2D;
+use vela_core::seaway::{SeaState, Seaway};
+use vela_core::{BoatSpec, LoftOptions, Sim, StillWater, UniformWind};
 
 /// The boat shipped with hull offsets.
 fn boat() -> BoatSpec {
@@ -40,7 +42,12 @@ fn quick() -> RadiationOptions {
 }
 
 fn assembled(options: RadiationOptions) -> Sim {
-    vertical_motion_sim(&boat(), &LoftOptions::default(), options)
+    in_water(StillWater::new(UniformWind::uniform(0.0, 0.0)), options)
+}
+
+/// The same boat in whatever water is handed to it.
+fn in_water(env: impl vela_core::env::Environment + 'static, options: RadiationOptions) -> Sim {
+    vertical_motion_sim(&boat(), Box::new(env), &LoftOptions::default(), options)
         .expect("the shipped boat admits a vertical-motion simulation")
 }
 
@@ -198,4 +205,139 @@ fn the_pipeline_is_insensitive_to_its_own_grid() {
         approx::assert_relative_eq!(rough, exact, max_relative = 0.05, epsilon = 1e-4);
         let _ = index;
     }
+}
+
+/// A boat in a long wave rides it.
+///
+/// The check that makes the whole seaway chain mean something, and the one every
+/// part of it has to survive: the wave surface, the pressure head with its decay,
+/// the clipping against a moving surface, the added mass in the mass matrix and
+/// the fluid memory.
+///
+/// In a wave much longer than the hull the pressure field is nearly uniform along
+/// the boat, so the hull is simply lifted and lowered by it — a floating body
+/// follows a long wave with unit amplitude ratio and no phase lag. Anything else
+/// means a term is wrong somewhere: too little response and the excitation is
+/// being lost, too much and it is being double-counted.
+///
+/// 150 m is thirteen times this waterline, which for a linear wave is a fourteen
+/// second period, and it is deliberately long: the interesting regime — waves of
+/// the hull's own length, where the response peaks and then dies — is where the
+/// model is *predicting* rather than obeying a limit, and a limit is what makes a
+/// test.
+#[test]
+fn a_hull_rides_a_wave_much_longer_than_itself() {
+    // A 600 m wave: thirteen times this waterline is not enough, because pitch
+    // has its own natural period of 1.75 s and heave 2.0 s, and the quasi-static
+    // limit wants to be far below both. Six hundred metres is a 19.6 s period.
+    let wavelength = 600.0_f64;
+    let period = (2.0 * std::f64::consts::PI * wavelength / 9.81).sqrt();
+    let state = SeaState {
+        significant_height: 0.638,
+        peak_period: period,
+        components: 1,
+        heading: 0.0,
+        seed: 7,
+    };
+    let sea = Seaway::new(state, 9.81);
+    // One component of variance a^2/2 gives H_s = 4a/sqrt(2).
+    let amplitude = sea.realised_height() * 2.0_f64.sqrt() / 4.0;
+
+    let mut sim = in_water(
+        Seaway2D::new(UniformWind::uniform(0.0, 0.0), state),
+        quick(),
+    );
+    let dt = 0.01;
+    for _ in 0..(60.0 / dt) as usize {
+        sim.step(dt);
+    }
+
+    // Track the vertical motion of a point AMIDSHIPS against the surface under
+    // it. Not the body origin: that sits at the aft perpendicular, six metres
+    // from midships, where a fraction of a degree of pitch swamps the heave. An
+    // earlier version of this test measured there and found a response half
+    // again too large, which was entirely the arm.
+    let mut lowest = (f64::INFINITY, 0.0);
+    let mut highest = (f64::NEG_INFINITY, 0.0);
+    for _ in 0..(1.5 * period / dt) as usize {
+        sim.step(dt);
+        let state = sim.state();
+        let mid = state.position
+            + state.attitude.to_rotation_matrix() * nalgebra::Vector3::new(5.95, 0.0, 0.0);
+        let surface = sea.elevation(mid.x, mid.y, sim.time());
+        if mid.z < lowest.0 {
+            lowest = (mid.z, surface);
+        }
+        if mid.z > highest.0 {
+            highest = (mid.z, surface);
+        }
+    }
+
+    // Body z is down and elevation is up, so the two swings are opposite in sign
+    // and equal in size: the hull rides the wave.
+    let hull_swing = highest.0 - lowest.0;
+    let wave_swing = lowest.1 - highest.1;
+    assert!(
+        wave_swing > 1.2 * amplitude,
+        "the sampling window missed the wave: only {wave_swing:.3} m of a {amplitude:.3} m amplitude"
+    );
+    let ratio = hull_swing / wave_swing;
+    assert!(
+        (0.9..1.15).contains(&ratio),
+        "in a {wavelength} m wave the hull followed the surface with ratio {ratio:.3}"
+    );
+}
+
+/// A wave excites the boat at all, and a calm does not.
+///
+/// Cheap, and it guards the thing a subtle plumbing mistake would break silently:
+/// if the environment's surface never reached the pressure integral, the boat in
+/// a seaway would sit as still as the boat in a calm and every wave test that
+/// measured a *ratio* would still pass.
+#[test]
+fn a_seaway_moves_the_boat_and_a_calm_does_not() {
+    let excited = {
+        let state = SeaState {
+            significant_height: 1.5,
+            peak_period: 6.0,
+            components: 30,
+            ..SeaState::default()
+        };
+        let mut sim = in_water(
+            Seaway2D::new(UniformWind::uniform(0.0, 0.0), state),
+            quick(),
+        );
+        let dt = 0.01;
+        for _ in 0..(40.0 / dt) as usize {
+            sim.step(dt);
+        }
+        let mut lowest = f64::INFINITY;
+        let mut highest = f64::NEG_INFINITY;
+        for _ in 0..(30.0 / dt) as usize {
+            sim.step(dt);
+            lowest = lowest.min(sim.state().position.z);
+            highest = highest.max(sim.state().position.z);
+        }
+        highest - lowest
+    };
+
+    let calm = {
+        let (mut sim, waterline) = settled(quick());
+        let dt = 0.01;
+        let mut worst = 0.0_f64;
+        for _ in 0..(30.0 / dt) as usize {
+            sim.step(dt);
+            worst = worst.max((sim.state().position.z - waterline).abs());
+        }
+        2.0 * worst
+    };
+
+    assert!(
+        excited > 0.5,
+        "a 1.5 m sea moved the hull through only {excited:.3} m"
+    );
+    assert!(
+        calm < 0.02,
+        "a calm moved the hull through {calm:.3} m, so the sea is not the cause"
+    );
 }

@@ -106,17 +106,66 @@ pub fn hydrostatics(
     water: &Water,
     gravity: f64,
 ) -> Hydrostatics {
+    hydrostatics_on(mesh, state, &FlatWater, water, gravity)
+}
+
+/// The free surface a hull is floating in, as the two questions a pressure
+/// integral asks of it.
+///
+/// Two and not one, because they are different questions and a wave answers them
+/// differently. Which triangles are wet is geometry: how far is this point below
+/// the surface. What they carry is dynamics: a wave's pressure decays with depth,
+/// so a deeply immersed keel feels less of a passing crest than its submergence
+/// suggests. Collapsing the two — integrating `ρ g d` below a wavy datum — is the
+/// usual shortcut and it over-drives anything deep in short waves.
+///
+/// Both are in world coordinates, where `z` is down.
+pub trait FreeSurface {
+    /// Signed depth below the surface, m, positive below.
+    fn depth(&self, at: Point) -> f64;
+
+    /// Pressure divided by `ρ g`, m. Defaults to the depth, which is exactly
+    /// right for still water and is why [`FlatWater`] needs no body.
+    fn pressure_head(&self, at: Point) -> f64 {
+        self.depth(at)
+    }
+}
+
+/// Still water with its surface on the world plane `z = 0`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlatWater;
+
+impl FreeSurface for FlatWater {
+    fn depth(&self, at: Point) -> f64 {
+        at.z
+    }
+}
+
+/// Integrates pressure over the wetted hull against an arbitrary free surface.
+///
+/// The general form of [`hydrostatics`]. Clipping uses
+/// [`FreeSurface::depth`] and the load uses [`FreeSurface::pressure_head`], and
+/// keeping them separate is what lets a wave excite a hull correctly rather than
+/// merely wet it.
+#[must_use]
+pub fn hydrostatics_on(
+    mesh: &TriMesh,
+    state: &BodyState,
+    surface: &dyn FreeSurface,
+    water: &Water,
+    gravity: f64,
+) -> Hydrostatics {
     let mut clipped = Clipped::default();
     let rotation = state.attitude.to_rotation_matrix();
     let origin = state.position;
 
-    // Work in world coordinates: the free surface is z = 0 there, which is what
-    // both the pressure law and the origin-on-the-plane volume trick need.
+    // Work in world coordinates: that is where the surface is defined, and where
+    // the origin-on-the-plane volume trick applies.
     let to_world = |p: Point| origin + rotation * p;
     clipped.extend_from(
         mesh.triangles()
             .map(|t| Tri::new(to_world(t.a), to_world(t.b), to_world(t.c))),
-        &|p: Point| p.z,
+        &|p: Point| surface.depth(p),
     );
 
     let mut volume = 0.0;
@@ -140,11 +189,13 @@ pub fn hydrostatics(
         wetted_area += area;
         let normal = area_normal / area;
 
-        // Hydrostatic pressure at the vertices; z is depth in the NED world.
+        // Pressure at the vertices, from the surface's own head. For still water
+        // the head is the depth and this is `ρ g z`; for a seaway it carries the
+        // wave's dynamic part with its decay already in it.
         let pressures = [
-            unit_weight * tri.a.z,
-            unit_weight * tri.b.z,
-            unit_weight * tri.c.z,
+            unit_weight * surface.pressure_head(tri.a),
+            unit_weight * surface.pressure_head(tri.b),
+            unit_weight * surface.pressure_head(tri.c),
         ];
         let pressure_sum = pressures[0] + pressures[1] + pressures[2];
 

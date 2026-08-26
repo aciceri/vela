@@ -21,6 +21,7 @@
 //! once, in [`UniformWind`].
 
 use crate::hydrostatics::Water;
+use crate::seaway::{SeaState, Seaway};
 use nalgebra::Vector3;
 
 /// Everything outside the boat.
@@ -35,6 +36,17 @@ pub trait Environment {
     /// Signed depth of a world-frame point below the free surface, m —
     /// positive below, negative above, zero on it.
     fn depth(&self, position: Vector3<f64>, time: f64) -> f64;
+
+    /// Pressure at a world-frame point divided by `ρ g`, m.
+    ///
+    /// Defaults to the depth, which is exactly right for still water — and is a
+    /// separate question from it in a seaway, where a wave's dynamic pressure
+    /// decays with depth. See [`crate::hydrostatics::FreeSurface`], whose two
+    /// methods these mirror, for why collapsing the two over-drives a deep keel
+    /// in short waves.
+    fn pressure_head(&self, position: Vector3<f64>, time: f64) -> f64 {
+        self.depth(position, time)
+    }
 
     /// Water properties: density and kinematic viscosity.
     fn water(&self) -> Water;
@@ -265,5 +277,76 @@ mod tests {
         let high = env.wind(Vector3::new(0.0, 0.0, -20.0), 0.0).norm();
         let low = env.wind(Vector3::new(0.0, 0.0, -2.0), 0.0).norm();
         assert!(high > low, "sheared wind must be stronger aloft");
+    }
+}
+
+/// A wind over an irregular sea.
+///
+/// The environment that makes the radiation work of [`crate::cummins`] mean
+/// something: until there were waves, a boat settled after being pushed and was
+/// never pushed.
+///
+/// Holds a [`Seaway`], which is a realisation and not a height field — the same
+/// seed gives the same water to the physics here and to anything else that
+/// evaluates the stated synthesis, a renderer included.
+#[derive(Debug, Clone)]
+pub struct Seaway2D {
+    wind: UniformWind,
+    sea: Seaway,
+    water: Water,
+    air_density: f64,
+    gravity: f64,
+}
+
+impl Seaway2D {
+    /// Wraps a wind and a sea state.
+    ///
+    /// Gravity is baked into the realisation through the dispersion relation, so
+    /// it is taken here rather than asked for later.
+    #[must_use]
+    pub fn new(wind: UniformWind, state: SeaState) -> Self {
+        Self {
+            wind,
+            sea: Seaway::new(state, crate::STANDARD_GRAVITY),
+            water: Water::default(),
+            air_density: crate::AIR_DENSITY,
+            gravity: crate::STANDARD_GRAVITY,
+        }
+    }
+
+    /// The realisation, for anything that has to draw or measure the same water.
+    #[must_use]
+    pub fn sea(&self) -> &Seaway {
+        &self.sea
+    }
+}
+
+impl Environment for Seaway2D {
+    fn wind(&self, position: Vector3<f64>, _time: f64) -> Vector3<f64> {
+        // Height above the *mean* surface, not above the local wave. A gust does
+        // not follow the water, and the difference is a metre in a sea whose
+        // gradient is stated over tens of metres.
+        self.wind.velocity_at(-position.z)
+    }
+
+    fn depth(&self, position: Vector3<f64>, time: f64) -> f64 {
+        self.sea.depth(position.x, position.y, position.z, time)
+    }
+
+    fn pressure_head(&self, position: Vector3<f64>, time: f64) -> f64 {
+        self.sea
+            .pressure_head(position.x, position.y, position.z, time)
+    }
+
+    fn water(&self) -> Water {
+        self.water
+    }
+
+    fn air_density(&self) -> f64 {
+        self.air_density
+    }
+
+    fn gravity(&self) -> f64 {
+        self.gravity
     }
 }

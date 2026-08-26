@@ -31,7 +31,6 @@ use crate::boat::{AppendagesSpec, BoatSpec, FoilSpec, RigSpec, SpecError};
 use crate::controls::Controls;
 use crate::cummins::{MemoryError, MemoryOptions, TransformOptions};
 use crate::env::Environment;
-use crate::env::{StillWater, UniformWind};
 use crate::lewis::{station_geometry, LewisForm};
 use crate::loft::{loft_hull, LoftOptions};
 use crate::mass::MassError;
@@ -301,6 +300,7 @@ fn rig_dimensions(rig: &RigSpec) -> RigDimensions {
 /// [`AssemblyError::Radiation`] if the hull admits no stable memory model.
 pub fn vertical_motion_sim(
     spec: &BoatSpec,
+    env: Box<dyn Environment>,
     loft: &LoftOptions,
     options: RadiationOptions,
 ) -> Result<Sim, AssemblyError> {
@@ -354,7 +354,6 @@ pub fn vertical_motion_sim(
 
     let modules: Vec<Box<dyn ForceModule>> =
         vec![Box::new(Buoyancy::new(mesh)), Box::new(radiation)];
-    let env: Box<dyn Environment> = Box::new(StillWater::new(UniformWind::uniform(0.0, 0.0)));
 
     Ok(Sim::new(
         body,
