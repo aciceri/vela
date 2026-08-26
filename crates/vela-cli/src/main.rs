@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use vela_core::aero::{EffectiveSpan, SailSet, Trim};
 use vela_core::assembly::velocity_prediction_sim;
 use vela_core::boat::HullSpec;
+use vela_core::cummins::{FluidMemory, MemoryOptions, TransformOptions};
 use vela_core::dsyhs::{hull_resistance, HullParameters};
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
 use vela_core::geometry::Point;
@@ -966,6 +967,66 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
                 }
             }
         }
+    }
+
+    // The memory model: what the time domain will actually evaluate.
+    //
+    // The grid reaches 30 rad/s because the transform integrates to infinity and
+    // a yacht's narrow sections are still radiating at 6. It is 150 points
+    // because that resolves the memory out to a few tens of seconds, which is
+    // longer than any of it lasts.
+    let grid: Vec<f64> = (1..=150).map(|i| 30.0 * f64::from(i) / 150.0).collect();
+    if let Some(spectrum) = strip::heave_spectrum(
+        &strips,
+        &grid,
+        SEA_WATER_DENSITY,
+        vela_core::STANDARD_GRAVITY,
+        &solver,
+    ) {
+        let infinite = spectrum.infinite_added_mass(TransformOptions::default());
+        out.push_str(&format!(
+            "\nFluid memory, from {} frequencies to {:.0} rad/s:\n\
+             \x20 A_inf            {:>12.0} kg   (cross-check {:.0}, differ {:.2} % over {} frequencies)\n\
+             \x20 K(0)             {:>12.0} kg/s\n",
+            grid.len(),
+            grid[grid.len() - 1],
+            infinite.value,
+            infinite.cross_check,
+            100.0 * infinite.disagreement,
+            infinite.samples,
+            spectrum.retardation(0.0),
+        ));
+        for order in [3_usize, 4, 5] {
+            match FluidMemory::fit(
+                &spectrum,
+                infinite,
+                MemoryOptions {
+                    order,
+                    ..MemoryOptions::default()
+                },
+            ) {
+                Ok(model) => out.push_str(&format!(
+                    "\x20 order {order}          worst error {:>7.3} %, slowest pole {:>8.4} 1/s \
+                     (tau {:>6.1} s), passivity {:>8.1e}\n",
+                    100.0 * model.worst_error(),
+                    model.slowest_pole(),
+                    -1.0 / model.slowest_pole(),
+                    model.passivity_violation(),
+                )),
+                Err(error) => {
+                    out.push_str(&format!(
+                        "\x20 order {order}          no model: {error:?}\n"
+                    ));
+                }
+            }
+        }
+        out.push_str(
+            "\nA_inf belongs in the mass matrix; the rest is a state-space model whose\n\
+             impulse response is the retardation function. The check above is\n\
+             two independent routes to A_inf agreeing: one integrates the memory in time,\n\
+             the other reads the asymptote of A(omega). They share the spectrum and\n\
+             nothing else.\n",
+        );
     }
 
     out.push_str(&format!(

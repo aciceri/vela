@@ -350,6 +350,58 @@ coefficients is right end to end.
 its own frequency by iteration, since the added mass sets the frequency that
 sets the added mass.
 
+#### 5.3c Status: the memory, moved into the time domain
+
+`vela_core::cummins` closes the phase. `A_∞` belongs in the mass matrix; the
+frequency-dependence becomes a low-order linear system whose impulse response is
+the retardation function, fitted from `K̂(jω) = B(ω) + jω[A(ω) - A_∞]` by
+iteratively reweighted least squares (Sanathanan-Koerner), realised in
+controllable canonical form and stepped by the exact matrix exponential rather
+than a Runge-Kutta scheme — the fitted poles span more than a decade in time
+constant, and an explicit scheme on the fastest would set the step for the whole
+simulation.
+
+On the YD-41: `A_∞` = 26.6 t, and order 4 reproduces the memory function to 2.3 %
+with its slowest pole at 5.4 s, order 5 to 0.29 %. Passivity is exact — no
+frequency at which the fitted water would drive the boat.
+
+**The verification that matters** is a forced-oscillation test: the model is
+driven at a single frequency in the time domain, its force correlated against the
+drive to recover `Re K̂` and `Im K̂`, and those compared with the damping and added
+mass the sectional solve produced in the frequency domain. Agreement is within
+0.5 % across the band, and everything is in that path — transform, `A_∞`, fit,
+realisation, stepper.
+
+A free-decay test was tried first and is a worse instrument: with a damping ratio
+near a third there are only two clean peaks before the amplitude falls into the
+fit's slow residual mode, and extracting a damping ratio from two peaks needs the
+damped period, the added mass at the frequency that period implies, and a
+linear-damping formula that is itself approximate when added mass varies this fast
+with frequency. Three approximations to test one thing. It survives as a
+sign-of-the-force check, which is what it is genuinely good for.
+
+**A diagnostic that had to be redesigned.** `A_∞` was first checked by the spread
+of its per-frequency estimates, and that number was tuned by lengthening the time
+horizon. It was the wrong number. The spread is dominated by whichever estimate
+sits at the edge of the band: it moved by a factor of three between a 30 s and a
+240 s horizon while the value moved in the fifth digit, and the two directions
+disagreed — a longer horizon improved a hull and *degraded* a section, because
+past the point where the frequency grid resolves the memory there is nothing left
+to integrate but ringing.
+
+What replaced it is a second, independent estimator. Integrating Ogilvie's
+relation by parts gives `A(ω) = A_∞ - K(0)/ω² + O(ω⁻⁴)`, and `K(0) = (2/π)∫B dω`
+needs no time grid at all. The two routes share the spectrum and nothing else —
+not the transform, not the horizon, not the trapezoid over it — and they agree to
+0.32 % on the YD-41. That is a statement about the pipeline; the spread was a
+statement about the estimator.
+
+The whole pipeline, sweep included, is 0.34 s for the YD-41 and is paid once at
+load. Per step the simulation evaluates a four-by-four matrix-vector product.
+
+What remains: sway and roll sections for the other modes, and the viscous roll
+damping below, which is the larger gap for how a boat feels.
+
 ### 5.4 Appendages: keel and rudder
 
 Wing-theory model per appendage:

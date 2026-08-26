@@ -40,6 +40,7 @@
 //! advice, which is a reason to prefer the simpler model and say so, not a
 //! reason to pretend the question does not exist.
 
+use crate::cummins::Spectrum;
 use crate::lewis::LewisForm;
 use crate::tasai::SectionSolver;
 
@@ -165,6 +166,33 @@ pub fn heave_pitch_coefficients(
         },
         worst_energy_residual,
     })
+}
+
+/// Samples the hull's heave added mass and damping across a frequency grid.
+///
+/// The grid has to reach far enough out that the damping has genuinely died,
+/// because everything downstream transforms it as though it continued to
+/// infinity. For a yacht that is further than ship experience suggests — see
+/// [`crate::cummins::Spectrum`], which is what this feeds.
+///
+/// Returns `None` if any frequency has no solution, or the grid is not a valid
+/// spectrum.
+#[must_use]
+pub fn heave_spectrum(
+    strips: &[Strip],
+    frequencies: &[f64],
+    density: f64,
+    gravity: f64,
+    solver: &SectionSolver,
+) -> Option<Spectrum> {
+    let mut added_mass = Vec::with_capacity(frequencies.len());
+    let mut damping = Vec::with_capacity(frequencies.len());
+    for &frequency in frequencies {
+        let solved = heave_pitch_coefficients(strips, frequency, density, gravity, solver)?;
+        added_mass.push(solved.added_mass_heave);
+        damping.push(solved.damping_heave);
+    }
+    Spectrum::new(frequencies.to_vec(), added_mass, damping).ok()
 }
 
 #[cfg(test)]

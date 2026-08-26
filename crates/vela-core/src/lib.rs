@@ -33,6 +33,7 @@ pub mod assembly;
 pub mod boat;
 pub mod clip;
 pub mod controls;
+pub mod cummins;
 pub mod dsyhs;
 pub mod env;
 pub mod equilibrium;
