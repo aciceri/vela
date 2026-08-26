@@ -50,6 +50,7 @@ pub mod rigid_body;
 pub mod seaway;
 pub mod sections;
 pub mod sim;
+pub mod stall;
 pub mod state;
 pub mod strip;
 pub mod tasai;

@@ -257,6 +257,94 @@ Potential flow dies at large effective angles of attack. Strategy:
 This is the honest state of the art short of RANS: every VPP in production use
 does the same. Accuracy downwind is coefficient-limited, and we document that.
 
+#### 4.2a Status: the handover exists, and is `C¹`
+
+`vela_core::stall` is the separated branch and the ramp onto it.
+
+**The branch is fitted, not universal — and the alternative was measured before
+being rejected.** Hoerner's inclined flat plate is the tempting choice: closed
+form, no fitting, exact limits. Scaled to λ = 3.36 it puts `C_L` at twenty degrees
+near 0.5 where the lattice says 1.75, so blending onto it would cost a sail
+seventy per cent of its lift at stall where a real sail loses ten or twenty. A
+*cambered* surface keeps far more lift past stall than a plate does, which is
+exactly why [[Viterna & Corrigan 1981]](#bib-viterna) fit to the surface's own
+pre-stall values, and why [[Spera 2008]](#bib-spera) states as a finding that
+post-stall behaviour must not be assumed to be a plate's.
+
+So the branch is Viterna-Corrigan:
+
+```text
+C_L = A₁ sin 2α + A₂ cos²α / sin α
+C_D = B₁ sin²α + B₂ cos α
+```
+
+with the four constants chosen so it passes **exactly** through the attached
+model's `(C_L, C_D)` at the stall angle and **exactly** through `(0, C_Dmax)` at
+ninety degrees. Both ends are right by construction: the handover is continuous,
+and the dead-run limit is bluff-body drag on projected area — which is §4.2's own
+claim about what dominates on a run, now produced by the model rather than
+asserted alongside it. `C_Dmax = 1.11 + 0.018·λ` is Viterna's aspect-ratio fit and
+is not tunable; for a sail it lands near 1.18, a flat plate broadside.
+
+**The ramp is a smoothstep, and that is not decoration.** The branch matches the
+attached model's value at stall but not its slope, so a hard switch leaves a kink —
+a discontinuity in the derivative the boat's dynamics integrate against, which
+shows up as a rig that chatters when a gust walks the trim across the handover.
+With `w = t²(3-2t)` the weight and its derivative both vanish at each end, so the
+blended curve leaves the attached branch tangentially and joins the separated one
+the same way. Tested against the attached branch's own slope, not against itself.
+
+Below the onset the attached coefficients are returned **bit for bit**. Upwind is
+where the lattice is the whole argument for computing forces from geometry, and an
+empirical branch leaking a per cent into the close-hauled answer would be spending
+the accuracy that justifies the method.
+
+#### Where the blend is applied, and the sectional model that is *not* here
+
+At the sail, on its area-weighted mean incidence — `flying::Shape::mean_incidence`,
+which is exact rather than quadrature because sections are horizontal and
+incidence is therefore linear in height.
+
+Per *section* would be better physics and is deliberately absent. The attraction is
+real: a twisted sail's head is at lower incidence, so it should stall later, and
+blending strip by strip would produce that for free. The obstacle is that it needs
+a sectional stall criterion, and the sectional lift coefficient a lattice can
+supply is `2Γ/cV`, which on a sail's tapered head has a chord going to zero
+underneath it. Measured on the reference sail it climbs to **2.45 at the head
+against 1.86 at mid span** — an artefact of the normalisation, not a section about
+to stall. Calibrating a criterion against that would be calibrating against a
+division by a small number.
+
+Blending on the mean keeps the part of the twist story that *is* supportable: twist
+lowers the mean, so a twisted sail reaches any given onset at a higher wind angle
+and stall is delayed. That is the published observation — Zhang et al. measured
+stall moving from about 17° on a twist-free rigid model to 20° on a twisting
+full-scale sail — and here it is a consequence of the geometry rather than a fitted
+parameter. Eight degrees of twist buys two to three degrees of delay. **Sign and
+order only**: the two measured sails are different sails and the twist at stall is
+not reported, so a test asserting three degrees would be asserting a coincidence.
+
+#### What is a parameter, and what a parameter is worth
+
+The **stall angle** is a property of a sail — camber, Reynolds number,
+leading-edge geometry, cloth — and no closed form covers it. It is a required
+argument rather than a defaulted one, so a boat file has to state it. The two
+anchors above (17° rigid, 20° twisting) are what the literature offers.
+
+The **transition width** is a parameter and is *not* a measurement. It is the
+smoothing scale and is named as such: nothing in the data resolves how fast a
+sail's lift collapses past stall. Cross-tunnel comparison puts downwind coefficient
+uncertainty at 10–15 % before this model's own error is counted, so a width in the
+five-to-ten-degree range is inside the noise it smooths.
+
+#### Verified end to end
+
+Geometry through the lattice through the handover, on the reference sail: the
+lattice's lift climbs monotonically through 45° — that is what potential flow does,
+and there is no mechanism in it to stop — while the blended curve peaks at the
+stall, holds a plateau across the handover, and falls sample after sample
+thereafter. Drag goes the other way, past half the bluff-body limit by 45°.
+
 ### 4.3 Flying shape — parametric, not FSI
 
 Sail controls (halyard, cunningham, vang, sheet, traveler, backstay) do not act
@@ -1221,7 +1309,7 @@ What the phase also produced, recorded because they are properties of the
 | Phase | Deliverable | New physics |
 |---|---|---|
 | 1 | Boat sails on flat water, playable | DSYHS hull + EKM appendages + tabular sail coefficients (Hazen/ORC-style), 6-DOF, wind shear |
-| 2 | Physical sail trim | VLM + parametric flying shape + downwind blending |
+| 2 | Physical sail trim | VLM (§4.1a) + parametric flying shape (§4.3a) + downwind blending (§4.2a) — **all three built and validated**; what remains is the control→shape mapping and wiring the chain behind `aero`'s interface |
 | 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle |
 | 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation — **done for five of six modes**; surge and viscous roll damping stated as absent in §5.3j |
 
@@ -1294,6 +1382,8 @@ Sail aerodynamics:
 - <a id="bib-tunnels"></a>Campbell, I., "A comparison of downwind sail coefficients from tests in different wind tunnels", Ocean Engineering 2014. https://www.sciencedirect.com/science/article/abs/pii/S0029801814002492
 - <a id="bib-deparday"></a>Deparday et al., "Dynamic measurement of pressures, sail shape and forces on a full-scale spinnaker", 2014. https://www.researchgate.net/publication/266477724
 - <a id="bib-windsurf"></a>Zhang, Bertrand, Rabaud, Augier & Fermigier, "Flying shape and aerodynamics of a full-scale flexible Olympic windsurf sail", Ocean Engineering 2025 (simultaneous photogrammetric flying shape and force-balance measurements; the validation fixture of §4.3a). https://arxiv.org/abs/2501.13254
+- <a id="bib-viterna"></a>Viterna, L.A. & Corrigan, R.D., "Fixed-pitch rotor performance of large horizontal-axis wind turbines", DOE/NASA workshop 1981 — the post-stall form of §4.2a and the `C_Dmax = 1.11 + 0.018·AR` fit. https://ntrs.nasa.gov/citations/19830010962
+- <a id="bib-spera"></a>Spera, D.A., "Models of Lift and Drag Coefficients of Stalled and Unstalled Airfoils in Wind Turbines and Wind Tunnels", NASA/CR-2008-215434 — AERODAS, and the finding that post-stall behaviour must not be assumed to be a flat plate's. https://ntrs.nasa.gov/citations/20090001311
 - <a id="bib-hazen"></a>Hazen, G., "A model of sail aerodynamics for diverse rig types", New England Sailing Yacht Symposium 1980 (basis of IMS/ORC aero model).
 - <a id="bib-orc"></a>ORC VPP Documentation (published annually; open description of a production VPP force model). https://orc.org/organization/vpp-documentation
 

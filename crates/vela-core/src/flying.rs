@@ -286,6 +286,25 @@ impl Planform {
     pub fn aspect_ratio(&self) -> f64 {
         self.luff * self.luff / self.area()
     }
+
+    /// Area-weighted mean height fraction: the height the planform's area balances
+    /// at.
+    ///
+    /// Closed form, from the first moment of the chord distribution. The taper
+    /// contributes `foot/6 + head/3` and the leech round contributes `1/π` of its
+    /// peak, since that is `∫u sin πu` over a half period.
+    ///
+    /// It exists because it is the weight any sail-wide average of a quantity that
+    /// varies with height has to use. A triangular sail carries two thirds of its
+    /// cloth in its bottom half, so averaging twist over *height* would put the
+    /// mean where very little sail is.
+    #[must_use]
+    pub fn mean_height(&self) -> f64 {
+        let pi = std::f64::consts::PI;
+        let moment = self.foot / 6.0 + self.head / 3.0 + self.roach * self.foot / pi;
+        let area = 0.5 * (self.foot + self.head) + self.roach * self.foot * 2.0 / pi;
+        moment / area
+    }
 }
 
 /// A sail's flying shape.
@@ -418,6 +437,24 @@ impl Shape {
         // Both run downstream - the chord from luff to leech, the flow onto the
         // luff and away - so they are nearly parallel and compare directly.
         (chord.y * along.x - chord.x * along.y).atan2(chord.dot(&along))
+    }
+
+    /// Area-weighted mean geometric incidence against a flow, radians.
+    ///
+    /// The single number a sail-wide stall criterion can be read against, and where
+    /// twist earns its keep: twist lowers the mean, so a twisted sail reaches any
+    /// given onset at a higher wind angle.
+    ///
+    /// Exact rather than quadrature. Sections are horizontal and the flow is
+    /// projected onto the horizontal, so incidence is linear in height fraction —
+    /// it is `α - twist(up)` and nothing else — and the area weighting therefore
+    /// collapses to the planform's own mean height. Interpolating between the two
+    /// ends keeps the sign conventions in [`Shape::incidence`] alone, rather than
+    /// repeating them here where they could drift.
+    #[must_use]
+    pub fn mean_incidence(&self, flow: Vector3<f64>) -> f64 {
+        let (foot, head) = (self.incidence(0.0, flow), self.incidence(1.0, flow));
+        foot + (head - foot) * self.planform.mean_height()
     }
 }
 
@@ -617,6 +654,84 @@ mod tests {
             planform.area() - straight.area(),
             5.0 * 0.15 * 2.0 * 2.0 / PI,
             max_relative = 1e-14
+        );
+    }
+
+    /// The area-weighted mean height is the planform's centroid, and it is a
+    /// triangle's third and a rectangle's half exactly.
+    ///
+    /// Two closed forms that need no source: the centroid of a triangle is a third
+    /// of the way up, and a rectangle's is half. If a mean chord had been used as
+    /// the weight by mistake, or the height integrated unweighted, the rectangle
+    /// would still come out at a half and only the triangle would give it away.
+    #[test]
+    fn the_mean_height_is_the_planforms_centroid() {
+        let triangle = Planform::new(5.0, 2.0, 0.0, 0.0).expect("a triangle");
+        assert_relative_eq!(triangle.mean_height(), 1.0 / 3.0, max_relative = 1e-14);
+
+        let rectangle = Planform::new(5.0, 2.0, 2.0, 0.0).expect("a rectangle");
+        assert_relative_eq!(rectangle.mean_height(), 0.5, max_relative = 1e-14);
+
+        // And against the integral it stands for, on a planform with every term.
+        let planform = windsurf();
+        let steps = 200_000;
+        let (mut moment, mut area) = (0.0, 0.0);
+        for step in 0..steps {
+            let up = (step as f64 + 0.5) / steps as f64;
+            let chord = planform.chord(up);
+            moment += chord * up;
+            area += chord;
+        }
+        assert_relative_eq!(planform.mean_height(), moment / area, max_relative = 1e-9);
+
+        // A sail carries its cloth low, so the balance point is below mid height.
+        assert!(planform.mean_height() < 0.45);
+    }
+
+    /// Mean incidence is the area-weighted average of the sections' own, and twist
+    /// is what moves it.
+    ///
+    /// Checked against the quadrature it replaces, because the closed form takes a
+    /// shortcut that is only valid while incidence is linear in height — which it is
+    /// here, and which a later shape family with a curved luff would break silently.
+    #[test]
+    fn mean_incidence_is_the_area_weighted_average() {
+        let flow = Vector3::new(-1.0, 0.0, 0.0);
+        for twist in [0.0_f64, 8.0, 20.0] {
+            let shape = sail(0.12, 0.40, twist);
+            let steps = 100_000;
+            let (mut moment, mut area) = (0.0, 0.0);
+            for step in 0..steps {
+                let up = (step as f64 + 0.5) / steps as f64;
+                let chord = shape.planform().chord(up);
+                moment += chord * shape.incidence(up, flow);
+                area += chord;
+            }
+            assert_relative_eq!(
+                shape.mean_incidence(flow),
+                moment / area,
+                max_relative = 1e-8,
+                epsilon = 1e-12
+            );
+        }
+
+        // Untwisted, every section is at the wind angle and so is the mean.
+        let beta = 14.0_f64.to_radians();
+        let angled = Vector3::new(-beta.cos(), beta.sin(), 0.0);
+        assert_relative_eq!(
+            sail(0.12, 0.40, 0.0).mean_incidence(angled),
+            beta,
+            max_relative = 1e-12
+        );
+        // Twisted, it falls - by less than the head does, because the head is where
+        // the sail has least area.
+        let twisted = sail(0.12, 0.40, 12.0);
+        let mean = twisted.mean_incidence(angled);
+        assert!(mean < beta);
+        assert!(mean > twisted.incidence(1.0, angled));
+        assert!(
+            beta - mean < 0.5 * 12.0_f64.to_radians(),
+            "the mean lost more than half the head's twist"
         );
     }
 
