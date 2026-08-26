@@ -39,6 +39,7 @@ pub mod equilibrium;
 pub mod frames;
 pub mod geometry;
 pub mod hydrostatics;
+pub mod lewis;
 pub mod loft;
 pub mod mass;
 pub mod modules;

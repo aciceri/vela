@@ -18,6 +18,7 @@ use vela_core::dsyhs::{hull_resistance, HullParameters};
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
 use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
+use vela_core::lewis::{area_coefficient_bounds, station_geometry, LewisForm};
 use vela_core::sections::{hull_form, FormOptions};
 use vela_core::{
     loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, Sim, StillWater, TriMesh, UniformWind,
@@ -47,6 +48,7 @@ USAGE:
     vela-cli resistance-curve <boat.ron> [--heel DEG]
     vela-cli sail             <boat.ron> [--tws M/S] [--twa DEG] [--downwind]
     vela-cli polar            <boat.ron> [--tws M/S] [--points N]
+    vela-cli lewis            <boat.ron> [--waterline M]
 
 COMMANDS:
     mesh              Report the lofted physics mesh without solving anything
@@ -56,6 +58,7 @@ COMMANDS:
     resistance-curve  Canoe body resistance across the Froude range
     sail              Solve one sailing condition and show its force balance
     polar             Solve the whole polar, optimising sails and trim
+    lewis             Fit Lewis forms to the stations and check the envelope
 
 OPTIONS:
     --points N      Contour points per station (default 16)
@@ -67,6 +70,7 @@ OPTIONS:
     --downwind      Carry main and spinnaker on an eased aspect ratio
     --flat F        Flattening factor, 1.0 full (depowers lift, keeps the arm)
     --reef R        Reef factor, 1.0 full sail (depowers area and lowers the arm)
+    --waterline M   Waterline height above the baseline (default: design draft)
 
 Commands needing geometry require a boat file with hull offsets; commands
 needing form parameters require the parameters block. Most boats have one or
@@ -87,6 +91,8 @@ struct Options {
     flat: f64,
     /// Reef factor `R`: 1.0 is full sail, less is reefed.
     reef: f64,
+    /// Waterline height above the baseline, m, overriding the design waterline.
+    waterline: Option<f64>,
 }
 
 fn main() -> ExitCode {
@@ -123,6 +129,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         "resistance-curve" => report_resistance_curve(&spec, &options),
         "polar" => report_polar(&spec, &options),
         "sail" => report_sail(&spec, &options),
+        "lewis" => report_lewis(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
@@ -138,6 +145,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         downwind: false,
         flat: 1.0,
         reef: 1.0,
+        waterline: None,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
@@ -156,6 +164,7 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             "--downwind" => options.downwind = true,
             "--flat" => options.flat = number(rest.next(), "--flat")?,
             "--reef" => options.reef = number(rest.next(), "--reef")?,
+            "--waterline" => options.waterline = Some(number(rest.next(), "--waterline")?),
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }
@@ -720,6 +729,89 @@ fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
     out.push_str("force breakdown\n");
     for (key, value) in sim.telemetry().iter() {
         out.push_str(&format!("  {key:<38} {value:>12.3}\n"));
+    }
+    Ok(out)
+}
+
+/// Lewis conformal-mapping fit of every station, with the validity envelope.
+///
+/// The report exists to answer one question before the expensive part of strip
+/// theory is written: **is this hull mappable at all?** A station outside the
+/// envelope has to be clamped, and a clamped fit no longer reproduces the
+/// section's area, so whatever added mass is computed from it inherits that
+/// error. Knowing how many stations that happens to, and where, decides whether
+/// two-parameter Lewis forms are enough for this hull or whether it needs a
+/// close-fit mapping with more parameters.
+///
+/// The waterline is taken as the declared canoe body draft — the design
+/// waterline — rather than from a flotation solve, because this is a question
+/// about the shape of the hull rather than about how it happens to be loaded.
+fn report_lewis(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+    let hull = spec.hull.as_ref().ok_or_else(|| {
+        format!(
+            "{} has no hull offsets, so it has no sections to map",
+            spec.name
+        )
+    })?;
+    let waterline = match options.waterline {
+        Some(height) => height,
+        None => parameters(spec)?.canoe_draft,
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — Lewis conformal mapping, waterline {:.4} m above baseline\n\n",
+        spec.name, waterline
+    ));
+    out.push_str(
+        "     x     beam    draft    sigma       H0       a1       a3   status\n\
+         \x20  [m]      [m]      [m]\n",
+    );
+
+    let mut mapped = 0;
+    let mut clamped = 0;
+    let mut dry = 0;
+
+    for station in &hull.stations {
+        let Some(section) = station_geometry(station, waterline) else {
+            dry += 1;
+            out.push_str(&format!("{:6.2}        —  (nothing immersed)\n", station.x));
+            continue;
+        };
+        let form = LewisForm::fit(&section);
+        let (lower, _) = area_coefficient_bounds(section.ratio());
+        if form.clamped {
+            clamped += 1;
+        } else {
+            mapped += 1;
+        }
+
+        out.push_str(&format!(
+            "{:6.2} {:8.3} {:8.3} {:8.4} {:8.3} {:8.4} {:8.4}   {}\n",
+            station.x,
+            section.beam,
+            section.draft,
+            section.area_coefficient(),
+            section.ratio(),
+            form.a1,
+            form.a3,
+            if form.clamped {
+                format!("CLAMPED to {lower:.4}")
+            } else {
+                "ok".to_string()
+            }
+        ));
+    }
+
+    out.push_str(&format!(
+        "\n{mapped} station(s) mapped, {clamped} clamped, {dry} dry.\n"
+    ));
+    if clamped > 0 {
+        out.push_str(
+            "A clamped station's area is not reproduced by its Lewis form. Two-parameter\n\
+             mapping cannot make a section that fine; a close-fit mapping with more\n\
+             parameters can. Journee & Massie, Offshore Hydromechanics, section 7.3.\n",
+        );
     }
     Ok(out)
 }
