@@ -473,3 +473,113 @@ fn roll_decays_because_the_keel_is_in_the_flow() {
         epsilon = 0.05
     );
 }
+
+/// Solves the helm as well as the balance.
+fn solve_helm(sim: &mut Sim) -> Result<equilibrium::Helm, String> {
+    let options = EquilibriumOptions {
+        initial_sinkage: 0.40,
+        ..EquilibriumOptions::default()
+    };
+    equilibrium::solve_with_helm(sim, WATERLINE_LENGTH, &options).map_err(|e| e.to_string())
+}
+
+/// There is a yawing moment to balance in the first place.
+///
+/// The whole point of the layout block. Before it every lateral force acted on
+/// the centreline at `x = 0`, so no combination of them could yaw the boat and
+/// the yawing moment was identically zero at every rudder angle. If this ever
+/// went back to zero, every helm test below would pass while measuring nothing.
+#[test]
+fn a_boat_with_a_layout_has_a_yawing_moment_to_balance() {
+    let mut sim = sailing(MODERATE_WIND, 40.0, 0.7, 0.8);
+    solve(&mut sim).expect("a yacht must sail upwind in ten knots");
+
+    let moment = sim.applied_wrench(0.01).moment.z;
+    let weight = sim.body().mass_properties().mass() * sim.body().gravity();
+    let scaled = moment.abs() / (weight * WATERLINE_LENGTH);
+    assert!(
+        scaled > 1e-3,
+        "with no rudder the yawing moment was {scaled} of weight times length, \
+         which is indistinguishable from having no arms at all"
+    );
+}
+
+/// And the rudder balances it.
+///
+/// This is what makes the boat steerable: the helm is the angle that holds the
+/// course, and finding it is what a helmsman does continuously. The residual
+/// reported is the fifth equation's, so the assertion is on the thing that was
+/// actually solved rather than on the solver having been called.
+#[test]
+fn the_rudder_balances_the_yawing_moment() {
+    // Depowered, because that is the condition this boat actually sails in at
+    // this wind: full sail here is a forty-degree knockdown, and asking for the
+    // helm of a condition the boat would never hold measures nothing.
+    let mut sim = sailing(MODERATE_WIND, 40.0, 0.7, 0.8);
+    let helm = solve_helm(&mut sim).expect("a yacht must hold a course in ten knots");
+
+    assert!(
+        !helm.helm_saturated,
+        "a boat needing more than thirty degrees of rudder upwind is not balanced"
+    );
+    assert!(
+        helm.yaw_residual.abs() < 1e-3,
+        "yaw left over: {}",
+        helm.yaw_residual
+    );
+    // A few degrees, not a few tens of degrees.
+    assert!(
+        helm.rudder_angle.abs() < 12.0_f64.to_radians(),
+        "helm came out {:.1} deg",
+        helm.rudder_angle.to_degrees()
+    );
+}
+
+/// Weather helm grows with the wind.
+///
+/// The most familiar thing a sailor feels, and a real test of the sign
+/// conventions across three modules at once: the sails' centre of effort, the
+/// keel's, and the rudder's. More wind heels the boat further, which carries the
+/// rig's centre of effort out to leeward and forward of the hull's, which asks
+/// for more rudder. If any one of the three arms had the wrong sign this would
+/// come out flat or backwards.
+#[test]
+fn weather_helm_grows_with_heel() {
+    let mut previous = f64::NEG_INFINITY;
+    // Same trim, rising wind: the boat heels further and asks for more rudder.
+    for wind in [5.0_f64, 7.0, 9.0] {
+        let mut sim = sailing(wind, 40.0, 0.7, 0.8);
+        let helm =
+            solve_helm(&mut sim).unwrap_or_else(|error| panic!("no helm at {wind} m/s: {error}"));
+        let magnitude = helm.rudder_angle.abs();
+        assert!(
+            magnitude > previous,
+            "helm at {wind} m/s was {:.2} deg, not more than the {:.2} deg below it",
+            magnitude.to_degrees(),
+            previous.to_degrees()
+        );
+        previous = magnitude;
+    }
+}
+
+/// Balancing the helm barely moves the rest of the balance.
+///
+/// The assumption the outer iteration rests on. The rudder carries a few per
+/// cent of the lateral plane's side force, so solving for its angle must not
+/// change the boat speed much — and if it did, the four-degree-of-freedom solver
+/// would need the fifth unknown inside it rather than around it.
+#[test]
+fn the_helm_is_a_weak_coupling() {
+    let mut plain = sailing(MODERATE_WIND, 40.0, 0.7, 0.8);
+    let without = solve(&mut plain).expect("a yacht must sail upwind");
+
+    let mut helmed = sailing(MODERATE_WIND, 40.0, 0.7, 0.8);
+    let with = solve_helm(&mut helmed).expect("a yacht must hold a course");
+
+    let change = (with.equilibrium.speed - without.speed).abs() / without.speed;
+    assert!(
+        change < 0.10,
+        "balancing the helm changed boat speed by {:.1} %, which is not a weak coupling",
+        100.0 * change
+    );
+}

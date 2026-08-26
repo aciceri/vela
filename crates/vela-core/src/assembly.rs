@@ -26,6 +26,7 @@
 use crate::aero::RigDimensions;
 use crate::aero::SailSet;
 use crate::appendages::{FoilPlanform, HullScalars, Keel};
+use crate::balance::SailPlan as BalanceSailPlan;
 use crate::boat::{AppendagesSpec, BoatSpec, FoilSpec, RigSpec, SpecError};
 use crate::controls::Controls;
 use crate::cummins::{MemoryError, MemoryOptions, TransformOptions};
@@ -161,21 +162,52 @@ pub fn velocity_prediction_sim(
         canoe_volume: parameters.canoe_volume,
     };
 
+    // The layout is what makes yaw solvable. Without it every lateral force acts
+    // on the centreline at `x = 0`, so no combination of them yaws the boat, and
+    // restraining yaw is the honest thing to do rather than integrating a moment
+    // that is identically zero. With it, the sails and the two foils get their
+    // arms and the rudder becomes a control that means something.
+    let layout = spec.layout;
+    let keel_at = layout.map_or(0.0, |it| it.keel_at);
+    let rudder_at = layout.map_or(0.0, |it| it.rudder_at);
+    let sails_at = layout.map_or(0.0, |it| {
+        let plan = sail_plan_of(&rig);
+        it.mast_at + plan.centre_of_effort_from_mast().0
+    });
+
     let modules: Vec<Box<dyn ForceModule>> = vec![
         Box::new(Buoyancy::new(mesh)),
         Box::new(CanoeBody::new(parameters)),
         Box::new(LateralSystem::new(
             scalars,
             keel,
-            lateral_centre(parameters.canoe_draft, &keel.planform),
+            lateral_centre(keel_at, parameters.canoe_draft, &keel.planform),
             rudder,
-            lateral_centre(parameters.canoe_draft, &rudder),
+            lateral_centre(rudder_at, parameters.canoe_draft, &rudder),
         )),
-        Box::new(Sails::new(rig_dimensions(&rig))),
+        Box::new(Sails::new(rig_dimensions(&rig)).at(sails_at)),
     ];
 
-    Ok(Sim::new(body, BodyState::default(), env, modules, controls)
-        .with_captive(Captive::velocity_prediction()))
+    let captive = if layout.is_some() {
+        Captive {
+            pitch: true,
+            ..Captive::free()
+        }
+    } else {
+        Captive::velocity_prediction()
+    };
+    Ok(Sim::new(body, BodyState::default(), env, modules, controls).with_captive(captive))
+}
+
+/// The sail plan geometry of a rig, for [`crate::balance`].
+fn sail_plan_of(rig: &RigSpec) -> BalanceSailPlan {
+    BalanceSailPlan {
+        foretriangle_height: rig.foretriangle_height,
+        foretriangle_base: rig.foretriangle_base,
+        main_hoist: rig.main_hoist,
+        main_foot: rig.main_foot,
+        boom_above_sheer: rig.boom_above_sheer,
+    }
 }
 
 /// The body-frame point a foil's side force is applied at.
@@ -187,11 +219,23 @@ pub fn velocity_prediction_sim(
 /// residuary resistance; the appendage model documents the distinction and why
 /// the two differ sharply for a bulb keel.
 ///
-/// The longitudinal coordinate is zero, which is not a position but the absence
-/// of one: see the module documentation for why yaw is restrained rather than
-/// integrated against a fabricated arm.
-fn lateral_centre(canoe_draft: f64, foil: &FoilPlanform) -> Vector3<f64> {
-    Vector3::new(0.0, 0.0, canoe_draft + foil.planform_centroid_below_root())
+/// `quarter_chord_at_waterline` is the boat file's number, taken where the
+/// extended foil meets the waterline. The force does not act there: it acts at
+/// the lift centroid, which is deeper, and a swept foil's quarter chord moves
+/// **aft** with depth. Carrying the sweep down to the acting depth is not a
+/// refinement — for this keel it is 0.14 m, which is more than half the whole
+/// lead the rig is placed by.
+fn lateral_centre(
+    quarter_chord_at_waterline: f64,
+    canoe_draft: f64,
+    foil: &FoilPlanform,
+) -> Vector3<f64> {
+    let depth = canoe_draft + foil.planform_centroid_below_root();
+    Vector3::new(
+        quarter_chord_at_waterline - depth * foil.sweep.tan(),
+        0.0,
+        depth,
+    )
 }
 
 fn planform_of(foil: &FoilSpec) -> FoilPlanform {

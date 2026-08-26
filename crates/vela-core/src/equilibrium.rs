@@ -394,3 +394,128 @@ fn limited(step: Vector4<f64>) -> Vector4<f64> {
     }
     step * fraction
 }
+
+/// Largest helm the solver will ask for, radians.
+///
+/// Thirty degrees. Past there a real rudder has stalled and this engine's
+/// appendage model has not — its lift is linear in angle with no limiting term —
+/// so a solution beyond the bound would be a number the model is not entitled
+/// to. Reaching it is reported rather than clamped silently: a boat that needs
+/// more than thirty degrees of rudder to hold its course is telling you
+/// something about its balance, not about its helm.
+const MAX_HELM: f64 = 0.52;
+
+/// Rudder angle the secant is opened with, radians.
+///
+/// Two degrees: enough that the yawing moment moves measurably, small enough to
+/// stay in the linear part of the rudder's lift.
+const HELM_PROBE: f64 = 0.035;
+
+/// A sailing condition with the helm balanced as well as the rest.
+#[derive(Debug, Clone)]
+pub struct Helm {
+    /// The four-degree-of-freedom balance at the solved rudder angle.
+    pub equilibrium: Equilibrium,
+    /// Rudder angle that holds the course, radians, in the sign convention of
+    /// [`crate::appendages`].
+    pub rudder_angle: f64,
+    /// Yawing moment left over, non-dimensional on weight times length.
+    ///
+    /// The honest measure of whether the helm was found: the outer iteration
+    /// drives this to zero, and reporting it means a caller need not trust that
+    /// it did.
+    pub yaw_residual: f64,
+    /// Whether [`MAX_HELM`] was reached, in which case the condition is *not*
+    /// balanced and the rudder angle is the bound rather than a solution.
+    pub helm_saturated: bool,
+}
+
+/// Solves the steady sailing condition *and* the rudder angle that holds it.
+///
+/// Adds yaw balance to what [`solve`] does. It is an outer iteration around that
+/// solver rather than a fifth unknown inside it, and the reason is that the
+/// four-degree-of-freedom Newton is validated against the source's published
+/// polar: widening it would put that validation at risk for a coupling that is
+/// weak in the first place. The rudder carries a few per cent of the lateral
+/// plane's side force, so changing its angle barely moves the balance the inner
+/// solver found, and a secant on the yawing moment converges in a handful of
+/// steps.
+///
+/// The claim that the coupling is weak is not assumed:
+/// [`Helm::yaw_residual`] is the residual of the *fifth* equation at the
+/// solution, so if the alternation had failed to converge it would say so.
+///
+/// A boat whose file declares no layout has no longitudinal arms, so its yawing
+/// moment is identically zero at every rudder angle. That is not an error — the
+/// moment is already balanced — and this returns immediately with a rudder angle
+/// of zero.
+///
+/// # Errors
+///
+/// [`EquilibriumError`] if the inner solve fails at any trial angle.
+pub fn solve_with_helm(
+    sim: &mut Sim,
+    reference_length: f64,
+    options: &EquilibriumOptions,
+) -> Result<Helm, EquilibriumError> {
+    let weight = sim.body().mass_properties().mass() * sim.body().gravity();
+    let yaw_scale = weight * reference_length;
+    let base = *sim.controls();
+
+    // One evaluation to find out whether there is anything to balance.
+    let attempt = |sim: &mut Sim, angle: f64| -> Result<(Equilibrium, f64), EquilibriumError> {
+        sim.set_controls(base.with_rudder(angle));
+        let solved = solve(sim, reference_length, options)?;
+        let moment = sim.applied_wrench(EVALUATION_STEP).moment.z / yaw_scale;
+        Ok((solved, moment))
+    };
+
+    let (mut equilibrium, mut moment) = attempt(sim, 0.0)?;
+    if moment.abs() < options.tolerance {
+        return Ok(Helm {
+            equilibrium,
+            rudder_angle: 0.0,
+            yaw_residual: moment,
+            helm_saturated: false,
+        });
+    }
+
+    // Secant on the yawing moment. Two points to start, then the usual update,
+    // with the step limited so that a nearly flat secant cannot throw the angle
+    // past the bound in one jump.
+    let mut previous_angle = 0.0;
+    let mut previous_moment = moment;
+    let mut angle = HELM_PROBE;
+    let mut saturated = false;
+
+    for _ in 0..options.max_iterations {
+        let (solved, current) = attempt(sim, angle)?;
+        equilibrium = solved;
+        moment = current;
+        if moment.abs() < options.tolerance {
+            break;
+        }
+        let slope = (moment - previous_moment) / (angle - previous_angle);
+        if !slope.is_finite() || slope == 0.0 {
+            break;
+        }
+        let step = (-moment / slope).clamp(-0.2, 0.2);
+        previous_angle = angle;
+        previous_moment = moment;
+        angle = (angle + step).clamp(-MAX_HELM, MAX_HELM);
+        if angle.abs() >= MAX_HELM {
+            saturated = true;
+            let (solved, current) = attempt(sim, angle)?;
+            equilibrium = solved;
+            moment = current;
+            break;
+        }
+    }
+
+    Ok(Helm {
+        equilibrium,
+        rudder_angle: angle,
+        yaw_residual: moment,
+        helm_saturated: saturated,
+    })
+}

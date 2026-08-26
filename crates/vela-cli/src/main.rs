@@ -711,8 +711,19 @@ fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
         initial_sinkage: hull.canoe_draft,
         ..EquilibriumOptions::default()
     };
-    let solution = equilibrium::solve(&mut sim, hull.waterline_length, &start)
-        .map_err(|error| format!("{}: {error}", spec.name))?;
+    // With a layout the boat has yaw arms, so the helm is part of the answer:
+    // the rudder angle that holds the course, and what is left of the yawing
+    // moment once it does.
+    let helm = if spec.layout.is_some() {
+        equilibrium::solve_with_helm(&mut sim, hull.waterline_length, &start).ok()
+    } else {
+        None
+    };
+    let solution = match &helm {
+        Some(found) => found.equilibrium.clone(),
+        None => equilibrium::solve(&mut sim, hull.waterline_length, &start)
+            .map_err(|error| format!("{}: {error}", spec.name))?,
+    };
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -743,6 +754,18 @@ fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
         "residual            {:>10.2e}   ({} iterations)\n\n",
         solution.residual, solution.iterations
     ));
+    if let Some(found) = &helm {
+        out.push_str(&format!(
+            "helm                {:>10.2} deg   (yaw residual {:.1e}{})\n\n",
+            found.rudder_angle.to_degrees(),
+            found.yaw_residual,
+            if found.helm_saturated {
+                ", SATURATED"
+            } else {
+                ""
+            }
+        ));
+    }
 
     out.push_str("force breakdown\n");
     for (key, value) in sim.telemetry().iter() {

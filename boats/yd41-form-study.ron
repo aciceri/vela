@@ -415,6 +415,12 @@
         max_beam: 4.20,
     ),
 
+    // Longitudinal layout, derived rather than measured: see boats/yd41.ron.
+    layout: (
+        keel_at: 5.95,
+        rudder_at: 0.85,
+        mast_at: 6.301,
+    ),
     mass: (
         displacement_kg: 6221.0,
         cog: (x: 5.4509, y: 0.0, z: 0.2),

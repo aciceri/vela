@@ -53,7 +53,33 @@ pub struct BoatSpec {
     pub appendages: Option<AppendagesSpec>,
     #[serde(default)]
     pub rig: Option<RigSpec>,
+    #[serde(default)]
+    pub layout: Option<LayoutSpec>,
     pub mass: MassSpec,
+}
+
+/// Where the rig and the appendages sit along the hull.
+///
+/// Absent from every published particulars table, and therefore absent from this
+/// format until now, which is why yaw was restrained: a force with no
+/// longitudinal arm makes no yawing moment, so a boat without this block cannot
+/// be steered — and the engine says so rather than fabricating positions.
+///
+/// All three are measured **forward from the aft perpendicular**, in metres, the
+/// same convention as a station's `x`.
+///
+/// Filling it in is a design exercise, not a measurement, and [`crate::balance`]
+/// is the tool for it: the keel's position is a decision, and the mast's follows
+/// from it through the lead the source recommends for the rig type.
+/// `vela-cli balance` prints both.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct LayoutSpec {
+    /// Keel quarter chord where it meets the waterline, m.
+    pub keel_at: f64,
+    /// Rudder quarter chord where it meets the waterline, m.
+    pub rudder_at: f64,
+    /// Mast, at the sheer, m.
+    pub mast_at: f64,
 }
 
 /// Scalar hull form parameters, as published in yacht data tables.

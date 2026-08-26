@@ -71,6 +71,12 @@ use nalgebra::Vector3;
 #[derive(Debug)]
 pub struct Sails {
     rig: RigDimensions,
+    /// Longitudinal position of the centre of effort, m, body frame.
+    ///
+    /// Zero unless the boat file declares a layout. A rig with no arm makes no
+    /// yawing moment, which is a visible absence rather than a silent one: the
+    /// telemetry publishes the moment and it is exactly zero.
+    centre_of_effort_at: f64,
     /// The sail set [`Sails::plan`] was built for: the cache key.
     set: SailSet,
     /// The plan for `set`, or the reason that set cannot be sailed on this rig.
@@ -110,10 +116,21 @@ impl Sails {
         let plan = SailPlan::new(&rig, set);
         Self {
             rig,
+            centre_of_effort_at: 0.0,
             set,
             plan,
             last: None,
         }
+    }
+
+    /// Places the centre of effort along the hull.
+    ///
+    /// Consumed by the assembly from the boat file's layout block. Without it
+    /// the rig drives the boat but cannot turn it.
+    #[must_use]
+    pub fn at(mut self, centre_of_effort_at: f64) -> Self {
+        self.centre_of_effort_at = centre_of_effort_at;
+        self
     }
 
     /// The sail plan currently in force, or `None` if the current set cannot be
@@ -212,9 +229,11 @@ impl ForceModule for Sails {
             .forces(probe, trim, air_density)
             .centre_of_effort_height;
 
-        // Above the water is *up*, and body `z` is down. `x` is zero: the model
-        // gives no longitudinal position — see the module documentation.
-        let centre_of_effort = Vector3::new(0.0, 0.0, -height);
+        // Above the water is *up*, and body `z` is down. The longitudinal
+        // position comes from the boat file's layout block by way of the
+        // assembly; a boat that declares none gets zero, which makes no yawing
+        // moment and is exactly why such a boat has yaw restrained.
+        let centre_of_effort = Vector3::new(self.centre_of_effort_at, 0.0, -height);
 
         // At the centre of effort, not at the origin: the rotational part of
         // that point's velocity is what makes the apparent wind fall as the rig

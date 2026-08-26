@@ -528,9 +528,59 @@ two directions — place the mast for a lead, measure the lead of a placed mast 
 are tested as inverses, because one fills a boat file in and the other checks it,
 and if they disagreed a file could pass its own check and still be wrong.
 
-Freeing yaw is the next step and needs the solver to gain a degree of freedom,
-with rudder angle as the control that balances the yaw moment. That is what turns
-this from a design calculation into helm feel.
+Freeing yaw is what turns this from a design calculation into helm feel, and the
+next section is that step.
+
+#### 5.3g Status: yaw is free, and the boat carries a helm
+
+The boat file gained a `layout` block — keel, rudder and mast, forward from the
+aft perpendicular — and with it every lateral force gained an arm. Yaw is no
+longer restrained for a boat that declares one; one that does not keeps the old
+behaviour, because a force with no arm makes no yawing moment and restraining a
+degree of freedom whose moment is identically zero is the honest thing to do.
+
+`equilibrium::solve_with_helm` adds yaw balance as a secant on rudder angle
+around the existing four-degree-of-freedom Newton rather than as a fifth unknown
+inside it. That Newton is validated against the source's published polar and
+widening it would put the validation at risk; the price is an assumption about
+coupling strength, and `Helm::yaw_residual` is the residual of the *fifth*
+equation at the solution, so the assumption is measured rather than trusted.
+
+On the YD-41 at 7 m/s and a working trim: **12.3° of heel, 5.9° of helm, yaw
+residual 6e-10**. The helm grows with heel, which is the most familiar thing a
+sailor feels and a real test of the sign conventions across three modules at
+once — the sails' arm, the keel's and the rudder's. If any one of them had the
+wrong sign it would come out flat or backwards.
+
+**Two things measurement changed.**
+
+A bug first: the layout gives the quarter chord where the foil meets the
+*waterline*, but the side force acts at the lift centroid, which is deeper — and
+a swept foil's quarter chord moves aft with depth. For this keel that is 0.14 m,
+which is more than half the entire lead the rig is placed by, so carrying the
+sweep down to the acting depth is not a refinement.
+
+Then the conceptual one, which took a failing test to see. Placing the rig by
+Chapter 9's lead and asking this model for the helm gave 46° at 7 m/s with full
+sail. That is not a solver failure: full sail at 7 m/s is a 40° knockdown, a
+condition the polar solver depowers out of and never sails. At working trim the
+same boat wants 6–10° of helm over 12–16° of heel, which is where a yacht's
+belongs.
+
+But the episode makes a point worth keeping: **the lead is a design rule, not a
+force arm.** Chapter 9's centre of effort and centre of lateral resistance are
+geometric constructions, and the recommended lead is an empirical number tuned so
+that a boat built to it comes out with the right helm *using those
+constructions*. The model's own force centres are not the same points — the
+sails' centre of side force depends on the coefficient model, the appendages' on
+the lift distribution — so the lead cannot be read as the physical arm between
+them. It is the right way to *place* a rig and the wrong way to *predict* a helm.
+
+What follows from that: the layout in `boats/yd41.ron` is derived from the lead
+and declared as derived, and if a helm of a particular size at a particular
+condition is wanted, the mast position has to be trimmed against the model rather
+than against the rule. That is a capability worth adding and is not here yet.
+
 
 ### 5.4 Appendages: keel and rudder
 

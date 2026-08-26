@@ -100,6 +100,16 @@
         max_beam: 4.20,
     ),
 
+    // Longitudinal layout. Absent from the book's particulars, so derived rather
+    // than measured: the keel quarter chord is placed at midships, and the mast
+    // follows from the lead the book publishes for this boat - 2.2 % of the
+    // waterline - through the construction of ch. 9. Run: vela-cli balance
+    // The rudder sits just forward of the aft waterline ending.
+    layout: (
+        keel_at: 5.95,
+        rudder_at: 0.85,
+        mast_at: 6.301,
+    ),
     mass: (
         displacement_kg: 5900.0,
         cog: (x: 5.27, y: 0.0, z: 0.12),
