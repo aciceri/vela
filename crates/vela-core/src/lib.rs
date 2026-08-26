@@ -27,6 +27,8 @@
 //!
 //! The world frame is NED (north, east, down), so gravity is `+z`.
 
+pub mod aero;
+pub mod appendages;
 pub mod boat;
 pub mod clip;
 pub mod dsyhs;
@@ -36,6 +38,7 @@ pub mod hydrostatics;
 pub mod loft;
 pub mod mass;
 pub mod rigid_body;
+pub mod sections;
 pub mod state;
 pub mod wrench;
 

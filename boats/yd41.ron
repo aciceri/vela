@@ -48,6 +48,58 @@
         lcf_percent: -7.3,
     ),
 
+    // Keel and rudder planforms: Appendix 1, light displacement column.
+    // Keel volume 0.275 m^3 is stated in the worked example of Fig 5.19.
+    //
+    // keel_cb_height is the height of the keel's centre of BUOYANCY — the
+    // centroid of its displaced volume — above the bottom of the hull, as
+    // Fig 5.19 defines it. It is NOT published, and it is NOT the planform
+    // centroid: 1.40 m is 74% of the way down a 1.90 m keel, whereas a
+    // trapezoid's area centroid can only fall between 47% and 53% of span.
+    //
+    // That is exactly what a bulb keel looks like. The YD-41 has a torpedo
+    // bulb carrying 2300 kg of lead at the tip of a high-aspect fin, so most of
+    // the keel's volume sits at the bottom and the volume centroid is dragged
+    // far below the fin's own mid-span.
+    //
+    // The value was obtained by inverting the worked example of Fig 5.19.
+    // Consequence, stated plainly: that example can no longer *validate* the
+    // keel residuary formula for this boat, because one free parameter was
+    // fitted to one published number. What still validates the shared
+    // transcription is Fig 5.23, which reproduces to 0.07% from these same
+    // particulars without any fitted input.
+    appendages: (
+        keel:   (root_chord: 1.00, tip_chord: 0.78, span: 1.90, sweep_deg: 5.5),
+        rudder: (root_chord: 0.48, tip_chord: 0.22, span: 1.15, sweep_deg: 10.0),
+        keel_volume: 0.275,
+        keel_cb_height: 1.4013,
+    ),
+
+    // I, J, P, E, LPG and the spinnaker luff are read off Fig 12.15, "The YD-41
+    // rig" (p. 259), which annotates them directly. BMAX is Appendix 1.
+    //
+    // ESTIMATED, NOT PUBLISHED — flagged so nobody mistakes them for book values:
+    //   boom_above_sheer   1.70 m from the gooseneck dimension on Fig 12.15.
+    //   mast_above_sheer   derived as P + BAD plus a little masthead, since the
+    //                      mast panel dimensions on the drawing do not resolve
+    //                      cleanly into above- and below-deck portions.
+    //   mast_diameter      not given anywhere; typical for a 12 m fractional rig.
+    //   average_freeboard  derived from Appendix 1: Ff/Lwl = 0.121 gives
+    //                      Ff = 1.41 m, and Ff/Fa = 1.23 gives Fa = 1.15 m.
+    rig: (
+        foretriangle_height: 16.20,
+        foretriangle_base: 5.10,
+        main_hoist: 16.70,
+        main_foot: 5.60,
+        jib_perpendicular: 5.40,
+        spinnaker_leech: 16.25,
+        boom_above_sheer: 1.70,
+        mast_above_sheer: 18.60,
+        mast_diameter: 0.16,
+        average_freeboard: 1.28,
+        max_beam: 4.20,
+    ),
+
     mass: (
         displacement_kg: 5900.0,
         cog: (x: 5.27, y: 0.0, z: 0.12),

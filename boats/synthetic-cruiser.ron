@@ -285,6 +285,32 @@
         ),
         ],
     ),
+
+    // MEASURED FROM THE OFFSETS ABOVE, not published — this hull is synthetic,
+    // so there is nothing to publish. Produced by `vela-cli form` at the
+    // floating waterline for the mass below, and kept here so that the
+    // geometry and the declared parameters must stay consistent: `vela-cli
+    // form` compares them, and a change to the offsets that is not reflected
+    // here will show up as a percentage.
+    //
+    // Note Cp = 0.627, which is OUTSIDE the DSYHS envelope (0.52..0.60). That
+    // is not a mistake in the file, it is the hull: the parametric form that
+    // generated it is fuller than a real sailing yacht, as its own header says.
+    // `vela-cli resistance` will report the hull as outside the series and
+    // give the number anyway, with the caveat attached — which is the intended
+    // behaviour for a real hull the regressions were never fitted to.
+    parameters: (
+        waterline_length: 10.8000,
+        waterline_beam: 3.4006,
+        canoe_draft: 0.6178,
+        canoe_volume: 11.0147,
+        wetted_surface: 32.2884,
+        waterplane_area: 28.1691,
+        prismatic: 0.6266,
+        midship: 0.7748,
+        lcb_percent: -6.6753,
+        lcf_percent: -4.6156,
+    ),
     mass: (
         displacement_kg: 11300.0,
         cog: (x: 4.6792, y: 0.0, z: 0.45),

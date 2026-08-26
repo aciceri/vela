@@ -49,6 +49,10 @@ pub struct BoatSpec {
     pub hull: Option<HullSpec>,
     #[serde(default)]
     pub parameters: Option<ParametersSpec>,
+    #[serde(default)]
+    pub appendages: Option<AppendagesSpec>,
+    #[serde(default)]
+    pub rig: Option<RigSpec>,
     pub mass: MassSpec,
 }
 
@@ -134,6 +138,72 @@ pub struct Point3Spec {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+}
+
+/// A lifting surface: keel, rudder, centreboard.
+///
+/// Planform only. Area and aspect ratio are *derived*, never declared, because
+/// a declared area that disagrees with the chords and span is a silent
+/// inconsistency with no right answer.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct FoilSpec {
+    /// Chord at the root, where the foil meets the hull, m.
+    pub root_chord: f64,
+    /// Chord at the tip, m.
+    pub tip_chord: f64,
+    /// Span from root to tip, m.
+    pub span: f64,
+    /// Sweep of the quarter-chord line, degrees. Positive aft.
+    pub sweep_deg: f64,
+}
+
+/// Keel and rudder.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct AppendagesSpec {
+    pub keel: FoilSpec,
+    pub rudder: FoilSpec,
+    /// Displaced volume of the keel, m³. Enters the keel residuary resistance
+    /// directly, which is why it is asked for rather than guessed from the
+    /// planform and an assumed thickness.
+    pub keel_volume: f64,
+    /// Height of the keel's centre of buoyancy above the bottom of the hull, m.
+    pub keel_cb_height: f64,
+}
+
+/// Rig dimensions, in the IOR notation the aerodynamic model is written in.
+///
+/// Kept in the published notation on purpose: these numbers are copied off sail
+/// plans and rating certificates, and renaming them to something more
+/// descriptive would make transcription error-prone for the sake of readability
+/// nobody wants here. The doc comments carry the meaning.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct RigSpec {
+    /// `I` — height of the foretriangle above the sheer, m.
+    pub foretriangle_height: f64,
+    /// `J` — base of the foretriangle, m.
+    pub foretriangle_base: f64,
+    /// `P` — mainsail hoist, m.
+    pub main_hoist: f64,
+    /// `E` — foot of the mainsail, m.
+    pub main_foot: f64,
+    /// `LPG` — perpendicular of the longest jib, m.
+    pub jib_perpendicular: f64,
+    /// `SL` — spinnaker leech length, m.
+    pub spinnaker_leech: f64,
+    /// `BAD` — height of the main boom above the sheer, m.
+    pub boom_above_sheer: f64,
+    /// `EHM` — mast height above the sheer, m.
+    pub mast_above_sheer: f64,
+    /// `EMDC` — average mast diameter, m.
+    pub mast_diameter: f64,
+    /// `FA` — average freeboard, m.
+    ///
+    /// A hull dimension rather than a rig one, but the windage model is its
+    /// only consumer, so it lives where it is used.
+    pub average_freeboard: f64,
+    /// `BMAX` — maximum beam of the hull, m. Here for the same reason as
+    /// [`Self::average_freeboard`].
+    pub max_beam: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]

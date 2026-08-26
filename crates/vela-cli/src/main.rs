@@ -15,6 +15,7 @@ use vela_core::boat::HullSpec;
 use vela_core::dsyhs::{hull_resistance, HullParameters};
 use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
+use vela_core::sections::{hull_form, FormOptions};
 use vela_core::{loft_hull, BoatSpec, LoftOptions, RigidBody, TriMesh, Water, SEA_WATER_DENSITY};
 
 const USAGE: &str = "\
@@ -23,8 +24,8 @@ vela — sailing yacht physics engine
 USAGE:
     vela-cli mesh          <boat.ron> [--points N]
     vela-cli hydrostatics  <boat.ron> [--points N]
+    vela-cli form          <boat.ron> [--points N]
     vela-cli resistance    <boat.ron> [--speed M/S | --froude F] [--heel DEG]
-    vela-cli polar         <boat.ron> [--heel DEG]
 
 COMMANDS:
     mesh            Report the lofted physics mesh without solving anything
@@ -79,6 +80,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
     match command.as_str() {
         "mesh" => Ok(report_mesh(&spec, &lofted(&spec, &options)?)),
         "hydrostatics" => report_hydrostatics(&spec, &lofted(&spec, &options)?),
+        "form" => report_form(&spec, &lofted(&spec, &options)?),
         "resistance" => report_resistance(&spec, &options),
         "polar" => report_polar(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
@@ -272,6 +274,116 @@ fn report_resistance(spec: &BoatSpec, options: &Options) -> Result<String, Strin
         resistance.total()
     ));
     out.push_str("\nAppendages are not included: keel and rudder resistance belong to the\nappendage model, which the series also treats separately.\n");
+    Ok(out)
+}
+
+/// Measures the hull's form parameters from its geometry, and — when the file
+/// also declares them — checks the two against each other.
+///
+/// This is the point of supporting both descriptions. A boat file that declares
+/// a prismatic coefficient contradicting its own offsets is wrong, and until
+/// something compares them nobody finds out.
+fn report_form(spec: &BoatSpec, mesh: &TriMesh) -> Result<String, String> {
+    let properties = spec
+        .mass_properties()
+        .map_err(|error| format!("mass properties: {error}"))?;
+    let body = RigidBody::new(properties).map_err(|error| format!("rigid body: {error}"))?;
+    let water = Water::default();
+
+    // Measure at the floating waterline rather than an arbitrary draft: form
+    // parameters are only comparable with published ones at the design
+    // displacement.
+    let flotation = solve_flotation(mesh, &body, &water, &FlotationOptions::default())
+        .map_err(|error| error.to_string())?;
+    let options = FormOptions::at_draft(mesh, flotation.draft)
+        .ok_or("hull has no immersed volume at the floating waterline")?;
+    let derived = hull_form(mesh, &options).map_err(|error| error.to_string())?;
+
+    let mut out = String::new();
+    out.push_str(&format!("boat                {}\n", spec.name));
+    out.push_str(&format!(
+        "draft               {:>10.4} m\n\n",
+        flotation.draft
+    ));
+    out.push_str("                        derived");
+    if spec.parameters.is_some() {
+        out.push_str("    declared      diff");
+    }
+    out.push('\n');
+
+    let declared = spec.hull_parameters();
+    let rows: [(&str, f64, Option<f64>); 10] = [
+        (
+            "waterline length  m",
+            derived.waterline_length,
+            declared.map(|d| d.waterline_length),
+        ),
+        (
+            "waterline beam    m",
+            derived.waterline_beam,
+            declared.map(|d| d.waterline_beam),
+        ),
+        (
+            "canoe draft       m",
+            derived.canoe_draft,
+            declared.map(|d| d.canoe_draft),
+        ),
+        (
+            "volume          m^3",
+            derived.canoe_volume,
+            declared.map(|d| d.canoe_volume),
+        ),
+        (
+            "wetted surface  m^2",
+            derived.wetted_surface,
+            declared.map(|d| d.wetted_surface),
+        ),
+        (
+            "waterplane area m^2",
+            derived.waterplane_area,
+            declared.map(|d| d.waterplane_area),
+        ),
+        ("midship area    m^2", derived.midship_area, None),
+        (
+            "prismatic Cp       ",
+            derived.prismatic,
+            declared.map(|d| d.prismatic),
+        ),
+        (
+            "midship Cm         ",
+            derived.midship,
+            declared.map(|d| d.midship),
+        ),
+        (
+            "LCF               %",
+            derived.lcf * 100.0,
+            declared.map(|d| d.lcf * 100.0),
+        ),
+    ];
+
+    for (label, derived_value, declared_value) in rows {
+        out.push_str(&format!("{label} {derived_value:>12.4}"));
+        if let Some(declared_value) = declared_value {
+            let scale = derived_value.abs().max(declared_value.abs()).max(1e-12);
+            out.push_str(&format!(
+                " {:>11.4} {:>8.1}%",
+                declared_value,
+                100.0 * (derived_value - declared_value) / scale
+            ));
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "LCB               % {:>12.4}\n",
+        derived.lcb * 100.0
+    ));
+
+    if declared.is_none() {
+        out.push_str(
+            "\nThis file declares no parameters block, so there is nothing to check the\n\
+             geometry against. Add one to have the two compared.\n",
+        );
+    }
     Ok(out)
 }
 
