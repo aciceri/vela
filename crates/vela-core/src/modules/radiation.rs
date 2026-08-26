@@ -11,31 +11,36 @@
 //! convolution over velocity history, and [`crate::cummins::FluidMemory`]
 //! replaces that with a few states.
 //!
-//! # Heave and pitch, and why both
+//! # Any set of coupled modes, and why not one hard-wired pair
 //!
-//! Strip theory gives three independent coefficients for the vertical modes:
-//! `33` for heave, `55` for pitch and `35 = 53` coupling. On the YD-41 the
-//! coupling is not a correction — `A_35 / A_33` is 4.9 m, which is the
-//! longitudinal centroid of the sectional added mass and about 40 % of the
+//! Strip theory gives a symmetric matrix of coefficients over whichever modes
+//! share a symmetry. Two such sets exist for a hull symmetric about its
+//! centreline, and they do not couple to each other: the *vertical* pair, heave
+//! and pitch, and the *lateral* triple, sway, roll and yaw. That is the whole
+//! reason this module is written over a list of modes rather than around the
+//! vertical pair it started as — the lateral triple is nine convolutions from
+//! six fitted models, and hand-writing that after hand-writing the vertical four
+//! would have been the same code twice.
+//!
+//! The memory is therefore the matrix convolution
+//!
+//! ```text
+//! μ_i = Σ_j K_ij * ν_j
+//! ```
+//!
+//! over the chosen modes, which needs `n²` state vectors from `n(n+1)/2` fitted
+//! models: `K_ij` and `K_ji` are the same transfer function, but they are driven
+//! by different velocities and therefore cannot share their states.
+//!
+//! # Why the coupling terms are not optional
+//!
+//! On the YD-41 the vertical coupling is not a correction — `A₃₅ / A₃₃` is 4.9 m,
+//! the longitudinal centroid of the sectional added mass, about 40 % of the
 //! waterline aft of the origin. Including heave and dropping the coupling would
 //! be a worse model than including neither, because it would say that heaving a
 //! hull whose added mass is distributed asymmetrically about the origin produces
-//! no pitching moment.
-//!
-//! So the memory here is the two-by-two convolution
-//!
-//! ```text
-//! μ₃ = K₃₃ * ν₃ + K₃₅ * ν₅
-//! μ₅ = K₅₃ * ν₃ + K₅₅ * ν₅
-//! ```
-//!
-//! which needs *four* state vectors from three fitted models: `K₃₅` and `K₅₃`
-//! are the same transfer function, but they are driven by different velocities
-//! and therefore cannot share their states.
-//!
-//! Sway, roll and yaw are absent because the sections for them are not written.
-//! They are absent rather than approximated: a zero is a visible gap, and a
-//! plausible guess is not.
+//! no pitching moment. The lateral set is worse still: its roll-sway coupling
+//! carries the whole lever arm between the waterline and the roll axis.
 
 use crate::cummins::{FluidMemory, InfiniteAddedMass, MemoryError, MemoryOptions, Spectrum};
 use crate::sim::{ForceModule, StepCtx};
@@ -43,130 +48,275 @@ use crate::telemetry::Telemetry;
 use crate::wrench::Wrench;
 use nalgebra::{Matrix6, Vector3};
 
-/// The three memory functions of the vertical modes, and their states.
-#[derive(Debug, Clone)]
-pub struct Radiation {
-    /// `K₃₃`, driven by heave velocity, felt as heave force.
-    heave: FluidMemory,
-    /// `K₃₅`, driven by pitch rate, felt as heave force.
-    heave_from_pitch: FluidMemory,
-    /// `K₅₃`, driven by heave velocity, felt as pitch moment. Same transfer
-    /// function as `heave_from_pitch`, different states.
-    pitch_from_heave: FluidMemory,
-    /// `K₅₅`, driven by pitch rate, felt as pitch moment.
-    pitch: FluidMemory,
-    /// What the last step produced, for [`ForceModule::telemetry`].
-    last: Option<(f64, f64)>,
+/// Body-frame index of the sway mode.
+pub const SWAY: usize = 1;
+/// Body-frame index of the heave mode.
+pub const HEAVE: usize = 2;
+/// Body-frame index of the roll mode.
+pub const ROLL: usize = 3;
+/// Body-frame index of the pitch mode.
+pub const PITCH: usize = 4;
+/// Body-frame index of the yaw mode.
+pub const YAW: usize = 5;
+
+/// Number of entries in the upper triangle of an `n × n` symmetric matrix.
+const fn triangle(n: usize) -> usize {
+    n * (n + 1) / 2
 }
 
-/// The spectra strip theory produces for the vertical modes.
+/// Index into the row-major upper triangle of an `n × n` symmetric matrix.
+const fn triangle_index(n: usize, row: usize, column: usize) -> usize {
+    let (i, j) = if row <= column {
+        (row, column)
+    } else {
+        (column, row)
+    };
+    // Rows above `i` contribute `n - k` entries each, for `k` in `0..i`.
+    i * n - triangle(i) + i + (j - i)
+}
+
+/// A symmetric set of radiation spectra over a chosen set of body-frame modes.
 ///
-/// Three separate [`Spectrum`] values rather than one matrix-valued object,
-/// because each is fitted independently and each carries its own
-/// [`InfiniteAddedMass`] — and the caller should see all three disagreements
-/// rather than an average of them.
+/// `modes[i]` is the generalised coordinate that row and column `i` refer to:
+/// 0, 1, 2 are surge, sway and heave, and 3, 4, 5 are roll, pitch and yaw. The
+/// spectra are the upper triangle, row-major, so for modes `[a, b, c]` the order
+/// is `aa, ab, ac, bb, bc, cc`.
+///
+/// Separate [`Spectrum`] values rather than one matrix-valued object, because
+/// each is fitted independently and each carries its own [`InfiniteAddedMass`] —
+/// and the caller should see every disagreement rather than an average of them.
 #[derive(Debug, Clone)]
-pub struct VerticalSpectra {
-    /// Heave, `A₃₃` and `B₃₃`.
-    pub heave: Spectrum,
-    /// Coupling, `A₃₅` and `B₃₅`.
-    pub coupling: Spectrum,
-    /// Pitch, `A₅₅` and `B₅₅`.
-    pub pitch: Spectrum,
+pub struct RadiationSpectra {
+    modes: Vec<usize>,
+    entries: Vec<Spectrum>,
 }
 
-impl Radiation {
-    /// Fits the memory of all three vertical coefficients.
+impl RadiationSpectra {
+    /// Builds a set from its modes and the upper triangle of its spectra.
     ///
     /// # Errors
     ///
-    /// Passes through whatever [`FluidMemory::fit`] refuses, which is an
-    /// unstable fit or a spectrum too short to fit at the requested order.
+    /// [`MemoryError::Singular`] if the number of spectra is not the size of the
+    /// upper triangle, or if a mode is out of range or repeated. These are
+    /// caller mistakes rather than physics, but they are the kind that otherwise
+    /// surface as a coefficient silently landing in the wrong matrix entry.
+    pub fn new(modes: Vec<usize>, entries: Vec<Spectrum>) -> Result<Self, MemoryError> {
+        let count = modes.len();
+        let sorted_and_distinct = modes.windows(2).all(|pair| pair[0] < pair[1]);
+        if count == 0
+            || entries.len() != triangle(count)
+            || !sorted_and_distinct
+            || modes.iter().any(|&mode| mode >= 6)
+        {
+            return Err(MemoryError::Singular);
+        }
+        Ok(Self { modes, entries })
+    }
+
+    /// The vertical pair: heave, the heave-pitch coupling, and pitch.
+    ///
+    /// # Errors
+    ///
+    /// As [`RadiationSpectra::new`], which cannot fail for this shape.
+    pub fn vertical(
+        heave: Spectrum,
+        coupling: Spectrum,
+        pitch: Spectrum,
+    ) -> Result<Self, MemoryError> {
+        Self::new(vec![HEAVE, PITCH], vec![heave, coupling, pitch])
+    }
+
+    /// The lateral triple, in the order [`crate::strip::lateral_spectra`] returns:
+    /// `22, 24, 26, 44, 46, 66`.
+    ///
+    /// # Errors
+    ///
+    /// As [`RadiationSpectra::new`], which cannot fail for this shape.
+    pub fn lateral(entries: [Spectrum; 6]) -> Result<Self, MemoryError> {
+        Self::new(vec![SWAY, ROLL, YAW], entries.to_vec())
+    }
+
+    /// The modes this set covers.
+    #[must_use]
+    pub fn modes(&self) -> &[usize] {
+        &self.modes
+    }
+
+    /// The spectrum coupling two modes, or `None` if either is not in this set.
+    ///
+    /// Addressed by body-frame mode rather than by row, so that a caller asks for
+    /// `entry(HEAVE, PITCH)` and does not have to know this set's layout.
+    /// Symmetric: the order of the arguments does not matter.
+    #[must_use]
+    pub fn entry(&self, one: usize, other: usize) -> Option<&Spectrum> {
+        let row = self.modes.iter().position(|&mode| mode == one)?;
+        let column = self.modes.iter().position(|&mode| mode == other)?;
+        self.entries
+            .get(triangle_index(self.modes.len(), row, column))
+    }
+
+    /// The infinite-frequency added mass of every entry.
+    #[must_use]
+    pub fn infinite(&self, options: crate::cummins::TransformOptions) -> RadiationInfinite {
+        RadiationInfinite {
+            modes: self.modes.clone(),
+            entries: self
+                .entries
+                .iter()
+                .map(|spectrum| spectrum.infinite_added_mass(options))
+                .collect(),
+        }
+    }
+}
+
+/// The infinite-frequency added mass of a [`RadiationSpectra`], same layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadiationInfinite {
+    modes: Vec<usize>,
+    entries: Vec<InfiniteAddedMass>,
+}
+
+impl RadiationInfinite {
+    /// The added mass as a generalized six-by-six matrix.
+    ///
+    /// Fills only the rows and columns of this set's modes and leaves the rest
+    /// zero — ready for [`crate::rigid_body::RigidBody::add_added_mass`], and
+    /// additive with another set's contribution.
+    ///
+    /// Symmetric by construction: each off-diagonal pair is written from one
+    /// number, so they cannot drift apart.
+    #[must_use]
+    pub fn matrix(&self) -> Matrix6<f64> {
+        let count = self.modes.len();
+        let mut matrix = Matrix6::zeros();
+        for (row, &i) in self.modes.iter().enumerate() {
+            for (column, &j) in self.modes.iter().enumerate() {
+                matrix[(i, j)] = self.entries[triangle_index(count, row, column)].value;
+            }
+        }
+        matrix
+    }
+
+    /// The added mass coupling two modes, or `None` if either is not in this set.
+    ///
+    /// Addressed by body-frame mode, as [`RadiationSpectra::entry`] is, and
+    /// symmetric in its arguments for the same reason.
+    #[must_use]
+    pub fn entry(&self, one: usize, other: usize) -> Option<InfiniteAddedMass> {
+        let row = self.modes.iter().position(|&mode| mode == one)?;
+        let column = self.modes.iter().position(|&mode| mode == other)?;
+        self.entries
+            .get(triangle_index(self.modes.len(), row, column))
+            .copied()
+    }
+
+    /// Worst disagreement between the two estimators, over every entry.
+    ///
+    /// The one number to look at before trusting any of this: it is the agreement
+    /// between two independent routes to a constant that does not depend on
+    /// frequency. See [`InfiniteAddedMass::disagreement`].
+    #[must_use]
+    pub fn worst_disagreement(&self) -> f64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.disagreement)
+            .fold(0.0, f64::max)
+    }
+}
+
+/// The memory functions of one set of coupled modes, and their states.
+#[derive(Debug, Clone)]
+pub struct Radiation {
+    modes: Vec<usize>,
+    /// The full `n × n` matrix of memories, row-major: entry `(i, j)` is driven by
+    /// mode `j`'s rate and felt in mode `i`'s component of the wrench.
+    ///
+    /// Full rather than triangular, because the states are not symmetric even
+    /// though the transfer functions are. `K_ij` and `K_ji` are fitted once and
+    /// cloned into both slots, which shares the model and separates the history.
+    memory: Vec<FluidMemory>,
+    /// What the last step produced, for [`ForceModule::telemetry`].
+    last: Option<Wrench>,
+}
+
+impl Radiation {
+    /// Fits the memory of every coefficient in the set.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError::Singular`] if the spectra and the infinite added mass do not
+    /// describe the same modes, and otherwise whatever [`FluidMemory::fit`]
+    /// refuses: an unstable fit, or a spectrum too short to fit at the requested
+    /// order.
     pub fn fit(
-        spectra: &VerticalSpectra,
-        infinite: &VerticalInfinite,
+        spectra: &RadiationSpectra,
+        infinite: &RadiationInfinite,
         options: MemoryOptions,
     ) -> Result<Self, MemoryError> {
-        let coupling = FluidMemory::fit(&spectra.coupling, infinite.coupling, options)?;
+        if spectra.modes != infinite.modes {
+            return Err(MemoryError::Singular);
+        }
+        let count = spectra.modes.len();
+        // Fit the triangle once, then place each model in both of its slots.
+        let fitted: Vec<FluidMemory> = spectra
+            .entries
+            .iter()
+            .zip(infinite.entries.iter())
+            .map(|(spectrum, constant)| FluidMemory::fit(spectrum, *constant, options))
+            .collect::<Result<_, _>>()?;
+        let mut memory = Vec::with_capacity(count * count);
+        for row in 0..count {
+            for column in 0..count {
+                memory.push(fitted[triangle_index(count, row, column)].clone());
+            }
+        }
         Ok(Self {
-            heave: FluidMemory::fit(&spectra.heave, infinite.heave, options)?,
-            heave_from_pitch: coupling.clone(),
-            pitch_from_heave: coupling,
-            pitch: FluidMemory::fit(&spectra.pitch, infinite.pitch, options)?,
+            modes: spectra.modes.clone(),
+            memory,
             last: None,
         })
     }
 
-    /// The infinite-frequency added mass as a generalized matrix.
-    ///
-    /// Heave is index 2 and pitch is index 4 in the body-frame ordering, so this
-    /// fills `(2,2)`, `(2,4)`, `(4,2)` and `(4,4)` and leaves the rest alone —
-    /// ready for [`crate::rigid_body::RigidBody::add_added_mass`].
-    ///
-    /// Symmetric by construction: the coupling is written into both off-diagonal
-    /// entries from one number, so they cannot drift apart.
-    #[must_use]
-    pub fn added_mass_matrix(infinite: &VerticalInfinite) -> Matrix6<f64> {
-        let mut matrix = Matrix6::zeros();
-        matrix[(2, 2)] = infinite.heave.value;
-        matrix[(2, 4)] = infinite.coupling.value;
-        matrix[(4, 2)] = infinite.coupling.value;
-        matrix[(4, 4)] = infinite.pitch.value;
-        matrix
-    }
-
-    /// Worst relative fit error over the three models.
+    /// Worst relative fit error over every model in the set.
     #[must_use]
     pub fn worst_error(&self) -> f64 {
-        self.heave
-            .worst_error()
-            .max(self.pitch_from_heave.worst_error())
-            .max(self.pitch.worst_error())
+        self.memory
+            .iter()
+            .map(FluidMemory::worst_error)
+            .fold(0.0, f64::max)
     }
 
-    /// Real part of the least-damped pole over the three models, 1/s.
+    /// Real part of the least-damped pole over every model, 1/s.
     #[must_use]
     pub fn slowest_pole(&self) -> f64 {
-        self.heave
-            .slowest_pole()
-            .max(self.pitch_from_heave.slowest_pole())
-            .max(self.pitch.slowest_pole())
+        self.memory
+            .iter()
+            .map(FluidMemory::slowest_pole)
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 
     /// Forgets the history, as if the boat had always been still.
     pub fn reset(&mut self) {
-        self.heave.reset();
-        self.heave_from_pitch.reset();
-        self.pitch_from_heave.reset();
-        self.pitch.reset();
+        for memory in &mut self.memory {
+            memory.reset();
+        }
         self.last = None;
     }
 }
 
-/// The infinite-frequency added mass of the three vertical coefficients.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VerticalInfinite {
-    /// `A₃₃`, kg.
-    pub heave: InfiniteAddedMass,
-    /// `A₃₅ = A₅₃`, kg·m.
-    pub coupling: InfiniteAddedMass,
-    /// `A₅₅`, kg·m².
-    pub pitch: InfiniteAddedMass,
+/// The rate of one generalised coordinate, from a body state.
+fn rate(state: &crate::state::BodyState, mode: usize) -> f64 {
+    match mode {
+        0..=2 => state.velocity[mode],
+        _ => state.angular_velocity[mode - 3],
+    }
 }
 
-impl VerticalInfinite {
-    /// Worst disagreement between the two estimators, over the three
-    /// coefficients.
-    ///
-    /// The one number to look at before trusting any of this: it is the
-    /// agreement between two independent routes to a constant that does not
-    /// depend on frequency. See [`InfiniteAddedMass::disagreement`].
-    #[must_use]
-    pub fn worst_disagreement(&self) -> f64 {
-        self.heave
-            .disagreement
-            .max(self.coupling.disagreement)
-            .max(self.pitch.disagreement)
+/// Adds a generalised component into the force or moment half of a wrench.
+fn accumulate(wrench: &mut Wrench, mode: usize, value: f64) {
+    match mode {
+        0..=2 => wrench.force[mode] += value,
+        _ => wrench.moment[mode - 3] += value,
     }
 }
 
@@ -176,31 +326,48 @@ impl ForceModule for Radiation {
     }
 
     fn step(&mut self, ctx: &StepCtx<'_>) -> Wrench {
-        // Heave is `z` in a `z`-down body frame and pitch is rotation about `y`,
-        // so these are the two components the vertical modes live in.
-        let heave_rate = ctx.state.velocity.z;
-        let pitch_rate = ctx.state.angular_velocity.y;
-        let dt = ctx.dt;
-
-        let force =
-            self.heave.advance(heave_rate, dt) + self.heave_from_pitch.advance(pitch_rate, dt);
-        let moment =
-            self.pitch_from_heave.advance(heave_rate, dt) + self.pitch.advance(pitch_rate, dt);
-
-        self.last = Some((force, moment));
-        // The convolution sits on the left of the equation of motion, so it
-        // opposes: it is subtracted from the applied load, which as a wrench
-        // means the negative.
-        Wrench {
-            force: Vector3::new(0.0, 0.0, -force),
-            moment: Vector3::new(0.0, -moment, 0.0),
+        let count = self.modes.len();
+        let rates: Vec<f64> = self
+            .modes
+            .iter()
+            .map(|&mode| rate(ctx.state, mode))
+            .collect();
+        let mut wrench = Wrench {
+            force: Vector3::zeros(),
+            moment: Vector3::zeros(),
+        };
+        for (row, &felt) in self.modes.iter().enumerate() {
+            let mut total = 0.0;
+            for (column, &driving) in rates.iter().enumerate() {
+                total += self.memory[row * count + column].advance(driving, ctx.dt);
+            }
+            // The convolution sits on the left of the equation of motion, so it
+            // opposes: it is subtracted from the applied load, which as a wrench
+            // means the negative.
+            accumulate(&mut wrench, felt, -total);
         }
+        self.last = Some(wrench);
+        wrench
     }
 
     fn telemetry(&self, out: &mut Telemetry) {
-        let (force, moment) = self.last.unwrap_or((0.0, 0.0));
-        out.set("radiation.heave.memory_force", force);
-        out.set("radiation.pitch.memory_moment", moment);
+        let last = self.last.unwrap_or(Wrench {
+            force: Vector3::zeros(),
+            moment: Vector3::zeros(),
+        });
+        for &mode in &self.modes {
+            let (key, value) = match mode {
+                SWAY => ("radiation.sway.memory_force", last.force.y),
+                HEAVE => ("radiation.heave.memory_force", last.force.z),
+                ROLL => ("radiation.roll.memory_moment", last.moment.x),
+                PITCH => ("radiation.pitch.memory_moment", last.moment.y),
+                YAW => ("radiation.yaw.memory_moment", last.moment.z),
+                _ => ("radiation.surge.memory_force", last.force.x),
+            };
+            // Published as the load the module applied, which is the negative of
+            // the convolution — the sign a dynamometer would read.
+            out.set(key, value);
+        }
         out.set("radiation.worst_fit_error", self.worst_error());
         out.set("radiation.slowest_pole", self.slowest_pole());
     }
@@ -243,24 +410,16 @@ mod tests {
             .collect()
     }
 
-    fn built() -> (Radiation, VerticalInfinite, VerticalSpectra) {
+    fn built() -> (Radiation, RadiationInfinite, RadiationSpectra) {
         let strips = hull();
         let solver = SectionSolver::new(TasaiOptions::default());
         let grid: Vec<f64> = (1..=120).map(|i| 30.0 * f64::from(i) / 120.0).collect();
         let (heave, coupling, pitch) =
             strip::vertical_spectra(&strips, &grid, WATER, GRAVITY, &solver)
                 .expect("a hull over a grid has spectra");
-        let spectra = VerticalSpectra {
-            heave,
-            coupling,
-            pitch,
-        };
-        let transform = TransformOptions::default();
-        let infinite = VerticalInfinite {
-            heave: spectra.heave.infinite_added_mass(transform),
-            coupling: spectra.coupling.infinite_added_mass(transform),
-            pitch: spectra.pitch.infinite_added_mass(transform),
-        };
+        let spectra = RadiationSpectra::vertical(heave, coupling, pitch)
+            .expect("three spectra make a vertical pair");
+        let infinite = spectra.infinite(TransformOptions::default());
         let model = Radiation::fit(
             &spectra,
             &infinite,
@@ -284,7 +443,7 @@ mod tests {
     #[test]
     fn the_vertical_added_mass_makes_a_possible_mass_matrix() {
         let (_, infinite, _) = built();
-        let matrix = Radiation::added_mass_matrix(&infinite);
+        let matrix = infinite.matrix();
 
         assert_relative_eq!(matrix[(2, 4)], matrix[(4, 2)], max_relative = 1e-15);
         assert!(matrix[(2, 2)] > 0.0, "heave added mass must be positive");
@@ -330,16 +489,25 @@ mod tests {
         let env = StillWater::new(UniformWind::uniform(0.0, 0.0));
         let controls = Controls::close_hauled(crate::aero::SailSet::upwind());
 
+        let heave = spectra.entry(HEAVE, HEAVE).expect("heave is in the pair");
+        let coupling = spectra.entry(HEAVE, PITCH).expect("the coupling is too");
+        let pitch = spectra.entry(PITCH, PITCH).expect("and pitch");
+        let at_infinity = |one, other| {
+            infinite
+                .entry(one, other)
+                .expect("the same modes the spectra have")
+                .value
+        };
+
         for &target in &[1.0_f64, 2.5] {
             for heaving in [true, false] {
-                let index = spectra
-                    .heave
+                let index = heave
                     .frequencies()
                     .iter()
                     .enumerate()
                     .min_by(|a, b| (a.1 - target).abs().total_cmp(&(b.1 - target).abs()))
                     .map_or(0, |(i, _)| i);
-                let omega = spectra.heave.frequencies()[index];
+                let omega = heave.frequencies()[index];
 
                 let wanted = |spectrum: &crate::cummins::Spectrum, constant: f64| {
                     Complex::new(
@@ -349,13 +517,13 @@ mod tests {
                 };
                 let (force_wanted, moment_wanted) = if heaving {
                     (
-                        wanted(&spectra.heave, infinite.heave.value),
-                        wanted(&spectra.coupling, infinite.coupling.value),
+                        wanted(heave, at_infinity(HEAVE, HEAVE)),
+                        wanted(coupling, at_infinity(HEAVE, PITCH)),
                     )
                 } else {
                     (
-                        wanted(&spectra.coupling, infinite.coupling.value),
-                        wanted(&spectra.pitch, infinite.pitch.value),
+                        wanted(coupling, at_infinity(HEAVE, PITCH)),
+                        wanted(pitch, at_infinity(PITCH, PITCH)),
                     )
                 };
 
@@ -445,6 +613,171 @@ mod tests {
             wrench.force.z < 0.0,
             "heaving down must be resisted upward, got {}",
             wrench.force.z
+        );
+    }
+
+    fn built_lateral() -> (Radiation, RadiationInfinite, RadiationSpectra) {
+        let strips = hull();
+        let solver = SectionSolver::new(TasaiOptions::default());
+        let grid: Vec<f64> = (1..=120).map(|i| 30.0 * f64::from(i) / 120.0).collect();
+        // The waterline the sections were cut at, which is what the roll and
+        // coupling coefficients are levered about.
+        let waterline = 0.45;
+        let entries = strip::lateral_spectra(&strips, waterline, &grid, WATER, GRAVITY, &solver)
+            .expect("a hull over a grid has lateral spectra");
+        let spectra =
+            RadiationSpectra::lateral(entries).expect("six spectra make a lateral triple");
+        let infinite = spectra.infinite(TransformOptions::default());
+        let model = Radiation::fit(&spectra, &infinite, MemoryOptions::default())
+            .expect("a yacht hull admits a lateral memory model");
+        (model, infinite, spectra)
+    }
+
+    /// The assembled lateral module reproduces all nine of its entries.
+    ///
+    /// The three-by-three twin of `the_module_reproduces_every_vertical_coefficient`,
+    /// and the sharp check on the lateral chain. Driving one mode at a time and
+    /// reading all three components of the wrench separates the nine convolutions,
+    /// which is the only test that catches a coefficient wired into the wrong
+    /// component, transposed, or with the wrong sign — and with three modes there
+    /// are a great many more ways to get that wrong than with two.
+    ///
+    /// This is where the accuracy claim for the lateral chain lives, rather than in
+    /// an integration test. A free-decay experiment cannot be this sharp: the
+    /// memory's poles are no faster than the roll period, so the rolling mode is a
+    /// genuinely coupled rigid-body-plus-memory mode rather than a mass-spring-damper
+    /// with coefficients substituted at one frequency. Here the frequency is imposed,
+    /// and the answer is exact.
+    #[test]
+    fn the_module_reproduces_every_lateral_coefficient() {
+        let (mut model, infinite, spectra) = built_lateral();
+        let env = StillWater::new(UniformWind::uniform(0.0, 0.0));
+        let controls = Controls::close_hauled(crate::aero::SailSet::upwind());
+        let modes = [SWAY, ROLL, YAW];
+
+        for &target in &[1.0_f64, 2.5] {
+            // Every entry shares the grid, so one index serves all nine.
+            let reference = spectra.entry(SWAY, SWAY).expect("sway is in the triple");
+            let index = reference
+                .frequencies()
+                .iter()
+                .enumerate()
+                .min_by(|a, b| (a.1 - target).abs().total_cmp(&(b.1 - target).abs()))
+                .map_or(0, |(i, _)| i);
+            let omega = reference.frequencies()[index];
+
+            for &driven in &modes {
+                model.reset();
+                let dt = 0.002;
+                let period = std::f64::consts::TAU / omega;
+                let settle = (12.0 * period / dt) as usize;
+                let cycles = (6.0 * period / dt) as usize;
+                // Projections of each felt component onto cos(ωt) and sin(ωt).
+                let mut projected = [(0.0_f64, 0.0_f64); 3];
+
+                for step in 0..(settle + cycles) {
+                    let time = step as f64 * dt;
+                    let rate = omega * (omega * time).cos();
+                    let mut state = BodyState::default();
+                    match driven {
+                        SWAY => state.velocity.y = rate,
+                        ROLL => state.angular_velocity.x = rate,
+                        _ => state.angular_velocity.z = rate,
+                    }
+                    let ctx = StepCtx {
+                        state: &state,
+                        controls: &controls,
+                        env: &env,
+                        time,
+                        dt,
+                    };
+                    let wrench = model.step(&ctx);
+                    if step >= settle {
+                        // The wrench opposes, so undo that sign before comparing.
+                        let felt = [-wrench.force.y, -wrench.moment.x, -wrench.moment.z];
+                        let (cosine, sine) = (omega * time).sin_cos();
+                        for (slot, value) in projected.iter_mut().zip(felt) {
+                            slot.0 += value * sine * dt;
+                            slot.1 += value * cosine * dt;
+                        }
+                    }
+                }
+
+                let scale = 2.0 / (omega * cycles as f64 * dt);
+                let wanted: Vec<Complex<f64>> = modes
+                    .iter()
+                    .map(|&felt| {
+                        let spectrum = spectra.entry(driven, felt).expect("in the triple");
+                        let constant = infinite.entry(driven, felt).expect("in the triple").value;
+                        Complex::new(
+                            spectrum.damping()[index],
+                            omega * (spectrum.added_mass()[index] - constant),
+                        )
+                    })
+                    .collect();
+
+                // Judged against the largest entry this driven mode produces, not
+                // against each entry's own size. One row spans two orders of
+                // magnitude — driving sway at 1 rad/s asks for a yaw moment of a
+                // hundred alongside a sway force of ten thousand — and demanding
+                // relative precision on the smallest would be demanding precision
+                // on a number that does nothing. What matters is that no entry is
+                // wrong by enough to matter beside the ones that do, which is what
+                // catches a transposed, misplaced or sign-flipped coefficient. Three
+                // per cent, matching the tolerance the vertical twin above already
+                // keeps; what is left at that level is the rational fit at the low
+                // end of the grid, where it is least constrained.
+                let row_scale = wanted
+                    .iter()
+                    .map(|value| value.norm())
+                    .fold(0.0_f64, f64::max);
+                for (row, want) in wanted.iter().enumerate() {
+                    let got = Complex::new(projected[row].0 * scale, -projected[row].1 * scale);
+                    let error = (got - want).norm();
+                    assert!(
+                        error < 0.03 * row_scale,
+                        "driving mode {driven} at {omega:.2} rad/s, the mode {} \
+                         response was {got:.1} where {want:.1} was wanted — off by \
+                         {error:.1}, against a row scale of {row_scale:.1}",
+                        modes[row]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The lateral added mass makes a mass matrix a Cholesky can survive.
+    ///
+    /// The three-by-three block has to be positive definite on its own, because it
+    /// is added to the rigid body's and the factorisation has to succeed. Checked
+    /// on the leading minors, and separately that the coupling is not negligible —
+    /// without that last assertion a diagonal-only bug would pass.
+    #[test]
+    fn the_lateral_added_mass_makes_a_possible_mass_matrix() {
+        let (_, infinite, _) = built_lateral();
+        let matrix = infinite.matrix();
+        let block =
+            nalgebra::Matrix3::from_fn(|i, j| matrix[([SWAY, ROLL, YAW][i], [SWAY, ROLL, YAW][j])]);
+
+        for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+            assert_relative_eq!(block[(i, j)], block[(j, i)], max_relative = 1e-15);
+        }
+        assert!(block[(0, 0)] > 0.0, "sway added mass must be positive");
+        assert!(block[(1, 1)] > 0.0, "roll added inertia must be positive");
+        assert!(block[(2, 2)] > 0.0, "yaw added inertia must be positive");
+        let two_by_two = block[(0, 0)] * block[(1, 1)] - block[(0, 1)] * block[(1, 0)];
+        assert!(
+            two_by_two > 0.0,
+            "the sway-roll block is indefinite: {two_by_two}"
+        );
+        assert!(
+            block.determinant() > 0.0,
+            "the lateral block is indefinite: {}",
+            block.determinant()
+        );
+        assert!(
+            block[(0, 1)].abs() > 0.1 * block[(0, 0)],
+            "this hull should couple sway to roll"
         );
     }
 }

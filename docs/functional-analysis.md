@@ -304,9 +304,9 @@ Two things the doing of it taught, neither of which was in the plan:
   continued fraction — the usual choice for large arguments — stops converging.
   The obvious `|w|` cutoff routes the worst points to the worse method.
 
-What remains for phase 4: sway and roll sections (§4.1.2, §4.1.3 of the same
-source), the frequency sweep to `A(ω)`, `B(ω)` for the whole hull, the
-state-space fit below, and the viscous roll damping noted next.
+The antisymmetric sections (§4.1.2 and §4.1.3 of the same source) are built too,
+and §5.3i records them. What remains of phase 4 is the viscous roll damping noted
+next, and it remains for a reason rather than for lack of work.
 
 #### 5.3b Status: the hull-level coefficients, and what they say about a yacht
 
@@ -409,9 +409,10 @@ Ikeda decomposes the viscous coefficient into five components. Taken one at a
 time, for a sailing yacht:
 
 - **Bilge keels** (`B44K`): a yacht has none. Not applicable.
-- **Forward-speed correction on potential roll damping** (`B44S`): multiplies a
-  potential roll damping this engine does not yet compute — the roll sections are
-  not written. Nothing to correct.
+- **Forward-speed correction on potential roll damping** (`B44S`): multiplies the
+  potential roll damping, which §5.3i now computes — but the correction is a
+  forward-speed term and this strip integration is at zero speed, so there is
+  still nothing for it to correct.
 - **Friction** (`B44F`): computed for the YD-41 rather than assumed. Kato's
   formulation gives `S_f = L(1.7 D + C_B B) = 23.2 m²`, which agrees with the
   22.3 m² the mesh integration reports — a good sign the transcription is right.
@@ -466,9 +467,9 @@ the limiting behaviour rather than an invented stall angle.
 sweep, transform, fit, `A_∞` into the mass matrix via
 `RigidBody::add_added_mass`, and the memory as a force module. Heave and pitch
 free, everything else restrained and no sails — a deliberately narrow rig,
-because the vertical modes are the only ones whose radiation this engine can
-compute, and a general assembly would be quietly missing terms in four degrees
-of freedom.
+because the vertical modes are the ones a heave decrement should be measured in
+isolation from everything else, and the lateral rig is `seakeeping_sim` (§5.3j)
+rather than a widening of this one.
 
 **A pushed hull now settles.** Six seconds after a 0.1 m displacement the YD-41
 is within 2 cm of its waterline, and the logarithmic decrement over the first
@@ -482,7 +483,7 @@ against the origin measures sinkage, which made a 0.1 m push look like 0.4 m of
 leftover motion — and this mode is damped hard enough that only one clean peak
 follows the release, so the release point itself has to serve as the first.
 
-What remains for the phase: sway and roll sections for the other modes.
+The lateral modes followed, and §5.3i is their record.
 
 ### 5.3f Balance: closing the data gap that restrains yaw
 
@@ -680,14 +681,170 @@ The heave deviation itself scales as `kL` — 11.6 % at `kL = 0.5`, 0.8 % at
 `kL = 0.004` — which is the finite-length physics the long-wave limit drops rather
 than an error in it.
 
-#### Still worth fixing
+#### Fixed: the grid reaches the long waves
 
-The frequency grid runs from `ω_max/N` upward, so sixty samples to 30 rad/s put
-the floor at 0.5 rad/s and any wave longer than a 12.6 s period has its memory
-model **extrapolated** rather than fitted. It played no part in the above — the
-quasi-static limit does not care about added mass — but it is a real limitation,
-and a log-spaced grid removes it.
+The grid used to run from `ω_max/N` upward, so sixty samples to 30 rad/s put the
+floor at 0.5 rad/s and any wave longer than a 12.6 s period had its memory model
+**extrapolated** rather than fitted.
 
+It now carries a geometric tail below the uniform grid's first step, reaching
+0.02 rad/s — a 286 s period — for six extra samples. Six, against roughly a
+hundred and ten if the uniform grid had simply been extended down, which is the
+reason for the shape.
+
+A pure log grid would have been the wrong fix, and stating why matters more than
+the fix: `K(t) = (2/π)∫B(ω)cos(ωt)dω` takes its accuracy from the *high* end,
+where log spacing is coarsest. So the uniform part is left exactly as it was and
+the tail is hung underneath it.
+
+
+### 5.3i Sway, roll and yaw: the antisymmetric half, and the phase closed
+
+`SectionSolver::lateral` solves §4.1.2 and §4.1.3 in one pass. Sway and roll share
+the standing-wave basis, the progressive-wave system and therefore the Gram
+matrix; they differ only in the shape that forces the free surface — sway by
+`g(θ) = 2y₀/b₀`, roll by `μ(θ) - 1`. Both vanish at the waterline, and that is
+load-bearing rather than decorative: the hull boundary condition fixes the stream
+function only up to a function of time, and evaluating it where the forcing shape
+is zero is what removes the constant. The symmetric problem cannot do this, since
+heave's own `f(π/2)` is one, which is why the heave solve carries `h(θ)` through
+its basis and this one does not.
+
+Two findings worth keeping from building it.
+
+**Porter's series is the exponential integral already in the module.** The source
+reaches the progressive-wave system through a power expansion it recommends over
+numerical integration. It is unnecessary:
+
+```text
+Q + iS = iπ - E₁(-w),   w = -ν(y + ix)
+```
+
+so `Q = -Re E₁` and `S - π = -Im E₁`, and the whole Porter term collapses onto the
+imaginary part of `e^w E₁(w)` with the `e^{νy}` cancelling exactly. Checked twice
+by different routes — once through that algebra, once by noticing that the
+existing `progressive_wave` returns the two integrals Porter approximates as the
+real and imaginary parts of one call. Closed form, no truncation, and no overflow.
+
+**The vertical datum is derived, not read.** The sectional coefficients are about
+the section origin on the waterline; the engine's body origin is at the baseline.
+The shift enters as the source's `OG`, whose sign the source states only
+indirectly, so it was derived: with `r_O - r_P = (0, 0, -h)` and `F = (0, f_y, 0)`,
+the transfer `M_P = M_O + (r_O - r_P) × F` gives `(h f_y, 0, 0)`, hence a plus and
+`OG = +h` measured downward. That agrees with the practical clamp the source
+applies elsewhere, which is the corroboration.
+
+#### Verified
+
+Six oracles, none of them a stored number.
+
+| what | how it is checked |
+|---|---|
+| sway added mass | reaches `ρπr²/2` for a circle as `ω → 0`, to 1 part in 10⁴ |
+| sway damping | vanishes like `ω⁵`, the amplitude-ratio asymptote |
+| roll on a circle | **exactly** zero — rotation leaves the boundary invariant |
+| sway energy identity | `M₀P₀ - N₀Q₀ = π²/2`, to 7·10⁻⁸ at twenty multipoles |
+| roll energy identity | `Y_R P₀ - X_R Q₀ = π²/8`, to 8·10⁻⁶ |
+| reciprocity | `M'₄₂ = M'₂₄` to 4·10⁻⁵ |
+
+The last is the strongest and the reason the two modes are solved in one call.
+Potential flow makes the added-mass matrix symmetric, so the roll moment from
+swaying and the lateral force from rolling are the same number — reached from
+different solves, through different pressure integrals, with constant factors
+differing by a factor of four. Nothing in the algebra forces them together.
+
+The circle's low-frequency limit is the only genuinely *external* check: an answer
+from classical hydrodynamics owing nothing to Tasai's formulation. Everything else
+is an internal identity, which is worth stating plainly rather than counting six
+and implying six independent confirmations.
+
+#### The hull level, and a lesson about the fit
+
+`strip::lateral_coefficients` integrates to the 3×3 sway-roll-yaw matrix. Yaw
+takes `+∫ · x dx` where pitch takes `-∫ · x dx`, from `(r × F)_z = x f_y` against
+`(r × F)_y = -x f_z`. `A₄₄` comes out a parabola in the datum whose curvature is
+`A₂₂`, which is the parallel-axis theorem and is the test.
+
+Then the fit refused. Three of the six lateral coefficients came back with a pole
+in the right half plane at the order the vertical modes use. The cause was a guard
+that had never engaged: `fit_ceiling` trims the fit at ten times the damping peak,
+and a yacht's vertical damping peaks near 2.5 rad/s so ten times it lands inside a
+grid reaching 30 — but its lateral damping peaks near 5, so ten times it lands at
+50, outside, and the lateral fit saw the whole grid.
+
+```text
+ceiling      1.5     2.0     3.0     5.0    10.0
+vertical     bad      ok      ok      ok      ok
+lateral       ok      ok      ok  poorer     bad
+heave error    -  3.2e-4  4.5e-4  1.3e-3  3.6e-3
+```
+
+Three is the only value with margin at both ends, and it is *also* eight times
+more accurate on the vertical modes than ten was, because the poles it stops
+wasting on a dead tail go to work where the boat moves. A strict improvement, not
+a trade — and a reminder that a tolerance tuned on one half of a problem is
+untested on the other half rather than validated by it.
+
+A low-frequency twin of that guard was written, measured, and deleted. The grid's
+geometric tail reaches frequencies where lateral damping is ten orders below its
+peak, which looks exactly like the same disease; it changed nothing at all on any
+of the nine coefficients. The fit is undone by a run of *decaying* targets and
+unbothered by a run of near-zero ones, which is not symmetric and is worth
+knowing.
+
+#### 5.3j Status: the boat rolls, and the obvious oracle is the wrong one
+
+`assembly::seakeeping_sim` frees sway, heave, roll, pitch and yaw and mounts two
+`Radiation` modules — the vertical pair and the lateral triple — as separate sets
+because they do not couple for a hull symmetric about its centreline. Surge stays
+restrained, and that is the honest boundary of the model: the source obtains
+two-dimensional surge coefficients by defining an equivalent longitudinal section
+that sways, an empirical device this engine does not implement, so a hull free to
+surge would be carrying a zero where a force belongs.
+
+Released from ten degrees of heel, the YD-41 rolls with a period of **2.20 s** and
+a damping ratio of **0.12**, decaying 5.92°, 2.81°, 1.32°, 0.62°, 0.29°, 0.135°.
+
+The interesting part is what that number is *not*. The obvious oracle,
+`ζ = B₄₄ / 2(I₄₄ + A₄₄)ω`, says 0.144 against a measured 0.179 with sway and yaw
+held — twenty-four per cent apart, constant, and not an error in either. Three
+explanations were tested and killed:
+
+- **amplitude**, releasing from 10° and from 0.5°: 0.1785 and 0.1793. Linear, so
+  the mesh-clipped restoring is innocent.
+- **the roll axis**, since the centre of gravity is 0.2 m off the origin: worth
+  249 kg·m² against 9969, which is 2.5 per cent and not 24.
+- **the module**, driven at a fixed frequency: it returns `K̂₄₄(jω)` to half a per
+  cent in damping *and* added mass.
+
+What is left is that the substitution does not apply. `A₄₄` falls from 14 700 to
+6 800 between 1.5 and 5 rad/s — it halves across the bandwidth of a mode this
+damped — and the memory's slowest pole has a time constant of 0.75 s against a
+2.3 s roll period. The rolling mode is a genuinely coupled rigid-body-and-memory
+mode, not a mass-spring-damper with coefficients evaluated at one frequency.
+
+So the sharp check lives in the frequency domain, where the frequency is imposed
+rather than emergent: the module reproduces all nine entries of the lateral matrix
+to three per cent, driving one mode at a time so that a coefficient wired into the
+wrong component, transposed, or sign-flipped cannot hide. The free-decay test
+asserts only what free decay can honestly assert — a yacht's period, a hull's
+decrement, and no dependence on how hard the boat was pushed.
+
+#### What phase 4 does not have
+
+**Viscous roll damping.** The plan named Ikeda's semi-empirical method, and that
+method is outside its own stated envelope for this hull: its text warns that "for
+ships with a very large breadth to draft ratio the method is not always accurate
+sufficiently", and this canoe body's ratio is 7.8. The friction component was
+computed anyway and is 0.5 per cent of the wave-making moment; the eddy component
+needs a Lewis-mapping argument that lands outside `[-1, 1]` on all seventeen
+stations. It is absent rather than approximated.
+
+There is a symmetry in that which is worth stating: the same beam that puts Ikeda
+out of range is why the wave-making roll damping is large here rather than small.
+A ratio of 0.12 from potential flow alone would be high for a narrow deep hull and
+is unremarkable for one this beamy. The missing term is the smaller one, which is
+luck rather than design, and a narrower boat would expose the gap.
 
 ### 5.4 Appendages: keel and rudder
 
@@ -888,7 +1045,7 @@ What the phase also produced, recorded because they are properties of the
 | 1 | Boat sails on flat water, playable | DSYHS hull + EKM appendages + tabular sail coefficients (Hazen/ORC-style), 6-DOF, wind shear |
 | 2 | Physical sail trim | VLM + parametric flying shape + downwind blending |
 | 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle |
-| 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation |
+| 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation — **done for five of six modes**; surge and viscous roll damping stated as absent in §5.3j |
 
 Rationale: phase 1 produces a testable sailing boat in weeks; every later phase
 replaces one force component behind a stable interface and is validated against

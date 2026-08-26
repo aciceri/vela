@@ -34,15 +34,15 @@ use crate::env::Environment;
 use crate::lewis::{station_geometry, LewisForm};
 use crate::loft::{loft_hull, LoftOptions};
 use crate::mass::MassError;
-use crate::modules::radiation::{Radiation, VerticalInfinite, VerticalSpectra};
+use crate::modules::radiation::{Radiation, RadiationSpectra};
 use crate::modules::{Buoyancy, CanoeBody, LateralSystem, Sails};
 use crate::rigid_body::RigidBody;
 use crate::sim::{Captive, ForceModule, Sim};
 use crate::state::BodyState;
-use crate::strip::{vertical_spectra, Strip};
+use crate::strip::{lateral_spectra, vertical_spectra, Strip};
 use crate::tasai::{SectionSolver, TasaiOptions};
 use crate::{SEA_WATER_DENSITY, STANDARD_GRAVITY};
-use nalgebra::Vector3;
+use nalgebra::{Matrix6, Vector3};
 use std::fmt;
 
 /// Why a boat file could not be turned into a simulation.
@@ -277,33 +277,31 @@ fn rig_dimensions(rig: &RigSpec) -> RigDimensions {
     }
 }
 
-/// A simulation of the vertical modes alone, with the water's memory in it.
+/// Everything the radiation path needs out of a boat file, computed once.
 ///
-/// Heave and pitch free, everything else restrained, no wind and no sails: the
-/// rig for watching a hull settle after it has been disturbed. It is a
-/// deliberately narrow assembly rather than a general one, because the vertical
-/// modes are the only ones whose radiation this engine can compute — the sway
-/// and roll sections are not written — and a simulation that pretended otherwise
-/// would be quietly missing terms in four degrees of freedom.
-///
-/// The frequency sweep happens here, which is the load-time cost: about two
-/// hundred milliseconds for a hull of seventeen stations over a grid that
-/// reaches far enough out for the transform. Everything after that is a
-/// five-state matrix-vector product per mode per step.
-///
-/// `A_∞` goes into the mass matrix and the memory becomes a force module, which
-/// is Cummins' split. See [`crate::modules::radiation`].
-///
-/// # Errors
-///
-/// [`AssemblyError`] naming the block of the boat file that is missing, or
-/// [`AssemblyError::Radiation`] if the hull admits no stable memory model.
-pub fn vertical_motion_sim(
+/// Extracted because the frequency sweep is the load-time cost and two
+/// assemblies want it: the vertical rig below and the seakeeping one after it.
+/// Sharing the struct is also what keeps the two from disagreeing about which
+/// waterline the sections were cut at, which is the one number the lateral
+/// coefficients are sensitive to and the vertical ones are not.
+struct Seakeeping {
+    mesh: crate::geometry::TriMesh,
+    strips: Vec<Strip>,
+    solver: SectionSolver,
+    grid: Vec<f64>,
+    /// Height of the design waterline above the baseline, m.
+    ///
+    /// The body origin sits at the baseline and the sectional coefficients are
+    /// computed about the waterline, so this is the lever arm between them —
+    /// the source's `OG`. See [`crate::strip::lateral_coefficients`].
+    waterline_height: f64,
+}
+
+fn seakeeping(
     spec: &BoatSpec,
-    env: Box<dyn Environment>,
     loft: &LoftOptions,
     options: RadiationOptions,
-) -> Result<Sim, AssemblyError> {
+) -> Result<Seakeeping, AssemblyError> {
     let hull = spec
         .hull
         .as_ref()
@@ -329,31 +327,95 @@ pub fn vertical_motion_sim(
         })
         .collect();
 
-    let solver = SectionSolver::new(options.tasai);
-    let grid: Vec<f64> = (1..=options.samples)
-        .map(|i| options.top_frequency * i as f64 / options.samples as f64)
-        .collect();
-    let (heave, coupling, pitch) =
-        vertical_spectra(&strips, &grid, options.density, STANDARD_GRAVITY, &solver)
-            .ok_or(AssemblyError::Radiation(MemoryError::Singular))?;
-    let spectra = VerticalSpectra {
-        heave,
-        coupling,
-        pitch,
-    };
-    let infinite = VerticalInfinite {
-        heave: spectra.heave.infinite_added_mass(options.transform),
-        coupling: spectra.coupling.infinite_added_mass(options.transform),
-        pitch: spectra.pitch.infinite_added_mass(options.transform),
-    };
-    let radiation =
+    Ok(Seakeeping {
+        mesh,
+        strips,
+        solver: SectionSolver::new(options.tasai),
+        grid: frequency_grid(
+            options.lowest_frequency,
+            options.top_frequency,
+            options.samples,
+        ),
+        waterline_height: parameters.canoe_draft,
+    })
+}
+
+/// Fits the vertical pair, and returns it with the mass it adds.
+fn vertical_radiation(
+    setup: &Seakeeping,
+    options: RadiationOptions,
+) -> Result<(Radiation, Matrix6<f64>), AssemblyError> {
+    let (heave, coupling, pitch) = vertical_spectra(
+        &setup.strips,
+        &setup.grid,
+        options.density,
+        STANDARD_GRAVITY,
+        &setup.solver,
+    )
+    .ok_or(AssemblyError::Radiation(MemoryError::Singular))?;
+    let spectra =
+        RadiationSpectra::vertical(heave, coupling, pitch).map_err(AssemblyError::Radiation)?;
+    let infinite = spectra.infinite(options.transform);
+    let fitted =
         Radiation::fit(&spectra, &infinite, options.memory).map_err(AssemblyError::Radiation)?;
+    Ok((fitted, infinite.matrix()))
+}
+
+/// Fits the lateral triple, and returns it with the mass it adds.
+fn lateral_radiation(
+    setup: &Seakeeping,
+    options: RadiationOptions,
+) -> Result<(Radiation, Matrix6<f64>), AssemblyError> {
+    let spectra = lateral_spectra(
+        &setup.strips,
+        setup.waterline_height,
+        &setup.grid,
+        options.density,
+        STANDARD_GRAVITY,
+        &setup.solver,
+    )
+    .ok_or(AssemblyError::Radiation(MemoryError::Singular))?;
+    let spectra = RadiationSpectra::lateral(spectra).map_err(AssemblyError::Radiation)?;
+    let infinite = spectra.infinite(options.transform);
+    let fitted =
+        Radiation::fit(&spectra, &infinite, options.memory).map_err(AssemblyError::Radiation)?;
+    Ok((fitted, infinite.matrix()))
+}
+
+/// A simulation of the vertical modes alone, with the water's memory in it.
+///
+/// Heave and pitch free, everything else restrained, no wind and no sails: the
+/// rig for watching a hull settle after it has been disturbed. Narrow on purpose,
+/// and it stays narrow now that the lateral modes exist — restraining four
+/// degrees of freedom is what makes a heave decrement mean only what it says.
+/// For the boat that moves in all five, see [`seakeeping_sim`].
+///
+/// The frequency sweep happens here, which is the load-time cost: about two
+/// hundred milliseconds for a hull of seventeen stations over a grid that
+/// reaches far enough out for the transform. Everything after that is a
+/// five-state matrix-vector product per mode per step.
+///
+/// `A_∞` goes into the mass matrix and the memory becomes a force module, which
+/// is Cummins' split. See [`crate::modules::radiation`].
+///
+/// # Errors
+///
+/// [`AssemblyError`] naming the block of the boat file that is missing, or
+/// [`AssemblyError::Radiation`] if the hull admits no stable memory model.
+pub fn vertical_motion_sim(
+    spec: &BoatSpec,
+    env: Box<dyn Environment>,
+    loft: &LoftOptions,
+    options: RadiationOptions,
+) -> Result<Sim, AssemblyError> {
+    let setup = seakeeping(spec, loft, options)?;
+    let (radiation, added) = vertical_radiation(&setup, options)?;
 
     let mut body = RigidBody::new(spec.mass_properties()?)?;
-    body.add_added_mass(Radiation::added_mass_matrix(&infinite))?;
+    body.add_added_mass(added)?;
 
     let modules: Vec<Box<dyn ForceModule>> =
-        vec![Box::new(Buoyancy::new(mesh)), Box::new(radiation)];
+        vec![Box::new(Buoyancy::new(setup.mesh)), Box::new(radiation)];
 
     Ok(Sim::new(
         body,
@@ -372,6 +434,117 @@ pub fn vertical_motion_sim(
     }))
 }
 
+/// A simulation of every mode the water's memory is known for: five of six.
+///
+/// Sway, heave, roll, pitch and yaw free, with two radiation sets mounted — the
+/// vertical pair and the lateral triple. Surge stays restrained, and that is the
+/// honest boundary of this model rather than an omission: the source computes
+/// two-dimensional surge coefficients by defining an equivalent longitudinal
+/// section that sways, an empirical device this engine does not implement. A hull
+/// free to surge would be carrying a zero where a force belongs.
+///
+/// Two [`Radiation`] modules rather than one six-mode module, because the sets do
+/// not couple: for a hull symmetric about its centreline the vertical and lateral
+/// problems are separate, which is the same symmetry strip theory already assumes
+/// when it solves one half-section. Keeping them apart means each fits and reports
+/// its own memory, and a bad fit says which half it came from.
+///
+/// No wind and no sails, like the vertical rig: this is an instrument for watching
+/// a hull move in water, not a boat that goes anywhere.
+///
+/// # Errors
+///
+/// As [`vertical_motion_sim`], and additionally
+/// [`AssemblyError::Radiation`] if the lateral coefficients admit no stable
+/// memory model where the vertical ones did.
+pub fn seakeeping_sim(
+    spec: &BoatSpec,
+    env: Box<dyn Environment>,
+    loft: &LoftOptions,
+    options: RadiationOptions,
+) -> Result<Sim, AssemblyError> {
+    let setup = seakeeping(spec, loft, options)?;
+    let (vertical, vertical_mass) = vertical_radiation(&setup, options)?;
+    let (lateral, lateral_mass) = lateral_radiation(&setup, options)?;
+
+    let mut body = RigidBody::new(spec.mass_properties()?)?;
+    // Disjoint blocks, so one call with the sum is the same as two calls, and
+    // the sum is what a single Cholesky has to stay positive definite through.
+    body.add_added_mass(vertical_mass + lateral_mass)?;
+
+    let modules: Vec<Box<dyn ForceModule>> = vec![
+        Box::new(Buoyancy::new(setup.mesh)),
+        Box::new(vertical),
+        Box::new(lateral),
+    ];
+
+    Ok(Sim::new(
+        body,
+        BodyState::default(),
+        env,
+        modules,
+        Controls::close_hauled(SailSet::upwind()),
+    )
+    .with_captive(Captive {
+        surge: true,
+        sway: false,
+        heave: false,
+        roll: false,
+        pitch: false,
+        yaw: false,
+    }))
+}
+
+/// The frequencies the radiation problem is solved at: a uniform grid with a
+/// geometric tail hung below it.
+///
+/// The uniform part is `top * i / samples` for `i` in `1..=samples`, which is
+/// what this engine has always used, and it is uniform for a reason. The
+/// retardation function comes out of a cosine transform,
+/// `K(t) = (2/π)∫B(ω)cos(ωt)dω`, and the accuracy of that integral is set at
+/// the *high* end of the grid, where `cos(ωt)` oscillates fastest across one
+/// interval. A log-spaced grid — the obvious reflex when a low-frequency reach
+/// is wanted — is coarsest exactly there, so it buys the long waves by
+/// spending the transform, which is the wrong trade.
+///
+/// The trouble with the uniform grid alone is its first step,
+/// `Δ = top / samples`: 0.25 rad/s at the defaults, a 25 s period. Below that
+/// the memory model had nothing to fit and extrapolated, and a 25 s swell is
+/// not an exotic sea. So below `Δ` the grid falls off geometrically at a ratio
+/// of 1.5 until it passes `lowest`. That is cheap: from a 0.25 rad/s step down
+/// to 0.02 rad/s takes six extra samples — a seventh would already be under
+/// the floor — for a decade and a half of extra reach, against the ~110 extra
+/// uniform samples the same reach would cost at `Δ = 0.02`.
+///
+/// If `lowest` is at or above `Δ` the tail is empty and the grid is exactly the
+/// old uniform one, so the previous behaviour stays reachable. The result is
+/// strictly increasing and strictly positive either way, which is what
+/// [`crate::cummins::Spectrum::new`] insists on; its quadrature is a trapezoid
+/// over the actual spacing, so a non-uniform grid needs nothing from it.
+fn frequency_grid(lowest: f64, top: f64, samples: usize) -> Vec<f64> {
+    /// How fast the tail falls away below the first uniform step.
+    const TAIL_RATIO: f64 = 1.5;
+
+    if samples == 0 {
+        return Vec::new();
+    }
+    let step = top / samples as f64;
+
+    // Built downwards from just under `step` — never at it, or the grid would
+    // repeat a value — then reversed, because the grid has to increase.
+    let mut tail = Vec::new();
+    let mut frequency = step / TAIL_RATIO;
+    while frequency > lowest {
+        tail.push(frequency);
+        frequency /= TAIL_RATIO;
+    }
+
+    let mut grid = Vec::with_capacity(tail.len() + samples);
+    grid.extend(tail.into_iter().rev());
+    grid.extend((1..=samples).map(|i| top * i as f64 / samples as f64));
+    grid
+}
+
 /// How the radiation pipeline is run at assembly.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RadiationOptions {
@@ -383,6 +556,16 @@ pub struct RadiationOptions {
     /// further than ship experience suggests: a narrow section reaches a given
     /// reduced frequency only at a high `ω`.
     pub top_frequency: f64,
+    /// Lowest frequency sampled, rad/s.
+    ///
+    /// A 314 s period at the default 0.02, which is far below anything a yacht
+    /// meets, and that is the point: the memory model is then fitted rather
+    /// than extrapolated across the whole useful range. The uniform grid on its
+    /// own starts at `top_frequency / samples`, or 30/120 = 0.25 rad/s at the
+    /// defaults — a 25 s period, with the added mass and damping of every
+    /// longer wave extrapolated. See [`frequency_grid`] for what reaching
+    /// further down costs.
+    pub lowest_frequency: f64,
     /// Number of frequencies sampled.
     pub samples: usize,
     /// How the sectional radiation problem is solved.
@@ -398,6 +581,7 @@ impl Default for RadiationOptions {
         Self {
             density: SEA_WATER_DENSITY,
             top_frequency: 30.0,
+            lowest_frequency: 0.02,
             samples: 120,
             tasai: TasaiOptions::default(),
             transform: TransformOptions::default(),
@@ -406,5 +590,96 @@ impl Default for RadiationOptions {
                 ..MemoryOptions::default()
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grid that a spectrum would reject is worse than a coarse one, so this
+    /// is checked over a spread of settings rather than at the defaults alone —
+    /// including a `lowest` above the uniform step, where the tail vanishes.
+    #[test]
+    fn every_grid_is_positive_and_strictly_increasing() {
+        for (lowest, top, samples) in [
+            (0.02, 30.0, 120),
+            (0.02, 30.0, 60),
+            (0.5, 30.0, 60),
+            (1.0, 4.0, 8),
+            (0.001, 12.0, 200),
+            (0.02, 30.0, 1),
+        ] {
+            let grid = frequency_grid(lowest, top, samples);
+            assert!(
+                grid.len() >= samples,
+                "the uniform samples must all be there: {} of {samples}",
+                grid.len()
+            );
+            for window in grid.windows(2) {
+                assert!(
+                    window[0] > 0.0 && window[1] > window[0],
+                    "grid for ({lowest}, {top}, {samples}) is not increasing at {window:?}"
+                );
+            }
+        }
+    }
+
+    /// The tail is only worth having if it arrives: one more step of the ratio
+    /// would take the grid under the floor, so the first frequency sits within
+    /// a factor of 1.5 of it.
+    #[test]
+    fn the_tail_reaches_the_lowest_frequency_asked_for() {
+        for (lowest, top, samples) in [(0.02, 30.0, 120), (0.02, 30.0, 60), (0.005, 20.0, 40)] {
+            let first = frequency_grid(lowest, top, samples)[0];
+            assert!(
+                first <= lowest * 1.5,
+                "({lowest}, {top}, {samples}) reached only {first}"
+            );
+        }
+    }
+
+    /// The old behaviour has to stay reachable, and a `lowest` at or above the
+    /// uniform step is how it is reached.
+    #[test]
+    fn a_floor_above_the_uniform_step_leaves_the_uniform_grid_alone() {
+        let samples = 60;
+        let top = 30.0;
+        let uniform: Vec<f64> = (1..=samples)
+            .map(|i| top * i as f64 / samples as f64)
+            .collect();
+        for lowest in [top / samples as f64, 1.0, 40.0] {
+            assert_eq!(frequency_grid(lowest, top, samples), uniform);
+        }
+    }
+
+    /// The tail is an addition, not a redistribution: the cosine transform
+    /// still gets every uniform frequency it used to, `top` included.
+    #[test]
+    fn the_uniform_samples_survive_the_tail() {
+        let (top, samples) = (30.0, 120);
+        let grid = frequency_grid(0.02, top, samples);
+        for i in [1, 2, 7, 60, 119, samples] {
+            let expected = top * i as f64 / samples as f64;
+            assert!(
+                grid.contains(&expected),
+                "the uniform sample at i={i} ({expected} rad/s) is missing"
+            );
+        }
+    }
+
+    /// Geometric spacing is what makes the low-frequency reach affordable; if
+    /// the tail ever grew to the size of the uniform part, the sweep cost —
+    /// seventeen stations by every frequency — would have doubled for it.
+    #[test]
+    fn the_tail_costs_only_a_handful_of_samples() {
+        let options = RadiationOptions::default();
+        let grid = frequency_grid(
+            options.lowest_frequency,
+            options.top_frequency,
+            options.samples,
+        );
+        let extra = grid.len() - options.samples;
+        assert!(extra < 15, "the tail added {extra} samples");
     }
 }

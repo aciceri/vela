@@ -299,11 +299,31 @@ pub struct MemoryOptions {
     pub order: usize,
     /// Highest frequency the fit must match, as a multiple of the damping peak.
     ///
-    /// The transform needs the whole spectrum; the fit does not. Beyond ten times
-    /// the peak, a yacht's memory function is orders below its largest value, and
-    /// a fit told to match it there spends poles on nothing and comes back very
-    /// slightly *active* — a negative real part where the true one is almost
-    /// zero. Ten keeps the fit honest where the boat actually moves.
+    /// The transform needs the whole spectrum; the fit does not. A fit told to
+    /// match the far tail spends poles on nothing and comes back unstable, or
+    /// very slightly *active* — a negative real part where the true one is almost
+    /// zero.
+    ///
+    /// Three, and measured rather than guessed. It was ten, which was tuned on the
+    /// vertical modes alone and turned out to be inoperative for them and fatal
+    /// for the lateral ones. A yacht's vertical damping peaks near 2.5 rad/s, so
+    /// ten times it lands at 25 rad/s and inside a grid reaching 30; its lateral
+    /// damping peaks near 5 rad/s, so ten times it lands at 50 and the ceiling
+    /// never engages at all. The lateral fit then saw the whole grid, and at order
+    /// five three of its six coefficients came back with a pole in the right half
+    /// plane. The measurement over the nine coefficients of a YD-41:
+    ///
+    /// ```text
+    /// ceiling      1.5     2.0     3.0     5.0    10.0
+    /// vertical     bad      ok      ok      ok      ok
+    /// lateral       ok      ok      ok  poorer     bad
+    /// worst error    -  3.2e-4  4.5e-4  1.3e-3  3.6e-3   (heave)
+    /// ```
+    ///
+    /// So three is the only value with margin at both ends, and it is *also* eight
+    /// times more accurate on the vertical modes than ten was — because the poles
+    /// it stops wasting on a dead tail go to work where the boat moves. Tightening
+    /// this was a strict improvement, not a trade.
     pub fit_ceiling: f64,
 }
 
@@ -311,7 +331,7 @@ impl Default for MemoryOptions {
     fn default() -> Self {
         Self {
             order: 4,
-            fit_ceiling: 10.0,
+            fit_ceiling: 3.0,
         }
     }
 }
@@ -404,15 +424,21 @@ impl FluidMemory {
         let order = options.order;
         let scale = spectrum.peak_frequency();
         let ceiling = options.fit_ceiling * scale;
-
         // The target: K̂(jω) = B(ω) + jω [A(ω) - A_∞], in normalised frequency.
         //
         // Only up to the ceiling. The transform above needs the whole spectrum —
-        // it integrates to infinity — but the fit does not, and asking it to
-        // chase a tail that carries no energy spends its few poles badly. On a
-        // yacht section the damping at thirty times the peak frequency is four
-        // orders below it, and a fit told to match that comes back very slightly
-        // *active*: a negative real part where the true one is nearly zero.
+        // it integrates to infinity — but the fit does not, and asking it to chase
+        // a tail that carries no energy spends its few poles badly. See
+        // [`MemoryOptions::fit_ceiling`], where the measurement that set it is
+        // recorded: past three times the damping peak an order-five fit of a
+        // lateral coefficient comes back with a pole in the right half plane.
+        //
+        // There is deliberately no matching floor. The low end looks like it needs
+        // one — the grid's geometric tail reaches frequencies where lateral damping
+        // is ten orders below its peak — and it was tried and measured to change
+        // nothing at all, on any of the nine coefficients. The fit is unbothered by
+        // a run of near-zero targets and undone by a run of decaying ones, which is
+        // not symmetric and is worth knowing.
         let targets: Vec<(f64, Complex<f64>)> = spectrum
             .frequencies
             .iter()

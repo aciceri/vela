@@ -299,6 +299,53 @@ pub struct HeaveCoefficients {
     pub energy_residual: f64,
 }
 
+/// Two-dimensional sway and roll coefficients for one section at one frequency.
+///
+/// The antisymmetric problem, §4.1.2 and §4.1.3 of the same source, solved in one
+/// pass. Sway and roll share the standing-wave basis, the progressive-wave system
+/// and therefore the Gram matrix; they differ only in the surface shape that
+/// forces them. Solving them together costs two extra right-hand sides rather
+/// than a second factorisation — and it is what makes the reciprocity check free,
+/// which is the strongest oracle this module has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LateralCoefficients {
+    /// `M'_22`, sway added mass per unit length, kg/m.
+    pub sway_added_mass: f64,
+    /// `N'_22`, sway damping per unit length, kg/(m·s).
+    pub sway_damping: f64,
+    /// `M'_44`, roll added moment of inertia per unit length, kg·m.
+    pub roll_added_inertia: f64,
+    /// `N'_44`, roll damping per unit length, kg·m/s.
+    pub roll_damping: f64,
+    /// `M'_42`, the sway-into-roll added-mass coupling, kg.
+    ///
+    /// Taken from the sway solve, which is the better conditioned of the two
+    /// routes to it: sway's forcing shape `g(θ)` is order one over the whole
+    /// section, where roll's `μ(θ) - 1` vanishes at the waterline and so carries
+    /// less of the projection.
+    pub coupling_added_mass: f64,
+    /// `N'_42`, the sway-into-roll damping coupling, kg/s.
+    pub coupling_damping: f64,
+    /// `η_a / x_a`, radiated wave amplitude per unit sway amplitude.
+    pub sway_wave_amplitude_ratio: f64,
+    /// `η_a / β_a`, radiated wave amplitude per unit roll angle, m/rad.
+    pub roll_wave_amplitude_ratio: f64,
+    /// Relative departure from the sway energy identity, `M_0 P_0 - N_0 Q_0 = π²/2`.
+    pub sway_energy_residual: f64,
+    /// Relative departure from the roll energy identity, `Y_R P_0 - X_R Q_0 = π²/8`.
+    pub roll_energy_residual: f64,
+    /// Relative disagreement between `M'_42` and `M'_24`.
+    ///
+    /// Potential flow makes the added-mass matrix symmetric, so the sway solve's
+    /// roll moment and the roll solve's lateral force must report the same
+    /// number. They are computed from different solutions by different formulae
+    /// with different constant factors, and nothing in the arithmetic forces them
+    /// to agree — which is exactly why their agreement is worth measuring. It
+    /// tests both solves, both pressure integrals and the whole shared basis at
+    /// once, against no stored answer at all.
+    pub reciprocity_residual: f64,
+}
+
 /// A reusable solver for the section radiation problem.
 ///
 /// Holds the Gauss-Legendre rule, which depends only on
@@ -575,6 +622,373 @@ impl SectionSolver {
             damping: density * beam * beam / 2.0 * energy / denominator * omega,
             wave_amplitude_ratio: PI * xi_b / denominator.sqrt(),
             energy_residual: energy / (PI * PI / 2.0) - 1.0,
+        })
+    }
+
+    /// Solves the sway and roll radiation problems for a Lewis section.
+    ///
+    /// The antisymmetric half of §4.1, and one solve rather than two. Sway and
+    /// roll share the standing-wave basis, the progressive-wave system and
+    /// therefore the Gram matrix; only the shape that forces the free surface
+    /// differs. Sway is driven by `g(θ) = 2y_0/b_0` and roll by `μ(θ) - 1`, where
+    /// `μ` is the squared radius over the squared half beam.
+    ///
+    /// Both of those shapes vanish at the waterline, and that is not decoration:
+    /// the boundary condition on the hull determines the stream function only up
+    /// to a function of time, and it is evaluating the condition where the
+    /// forcing shape is zero that eliminates the constant. The symmetric problem
+    /// cannot do this — heave's `f(π/2)` is one — which is why the heave solve
+    /// carries `h(θ)` through its basis and this one does not.
+    ///
+    /// Returns `None` for a non-positive frequency, where the radiation problem is
+    /// not posed.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn lateral(
+        &self,
+        form: &LewisForm,
+        omega: f64,
+        density: f64,
+        gravity: f64,
+    ) -> Option<LateralCoefficients> {
+        if omega <= 0.0 || self.multipoles == 0 {
+            return None;
+        }
+        let multipoles = self.multipoles;
+        let a = [1.0, form.a1, form.a3];
+        const N: usize = 2;
+
+        let sigma_a = 1.0 + form.a1 + form.a3;
+        let half_beam = form.scale * sigma_a;
+        let beam = 2.0 * half_beam;
+        let nu = omega * omega / gravity;
+        let xi_b = nu * beam / 2.0;
+        let frequency_ratio = xi_b / sigma_a;
+
+        // `ψ_A0_2m(θ) = -cos((2m+1)θ)
+        //   + (ξ_b/σ_a) Σ_n (-1)ⁿ (2n-1)/(2m+2n) a_{2n-1} cos((2m+2n)θ)`,
+        // decomposed once into the harmonics it is made of, for the same reason
+        // the heave solve decomposes its own: the basis assembly below becomes
+        // multiply-adds over a table rather than transcendental calls per
+        // multipole per node.
+        let mut harmonics: Vec<[(usize, f64); N + 2]> = Vec::with_capacity(multipoles);
+        let mut highest = 0;
+        for m in 1..=multipoles {
+            let mut terms = [(0_usize, 0.0_f64); N + 2];
+            terms[0] = (2 * m + 1, -1.0);
+            for (n, &coefficient) in a.iter().enumerate() {
+                let order = 2.0 * n as f64 - 1.0;
+                let shifted = 2 * m + 2 * n;
+                let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+                terms[n + 1] = (
+                    shifted,
+                    frequency_ratio * sign * (order / shifted as f64) * coefficient,
+                );
+            }
+            highest = highest.max(terms.iter().map(|&(index, _)| index).max().unwrap_or(0));
+            harmonics.push(terms);
+        }
+
+        // `cos(kθ)` for every `k` asked for, by the Chebyshev recurrence. The
+        // antisymmetric basis is built of cosines where the symmetric one is built
+        // of sines — the whole difference between the two problems, in one word.
+        let cosines_at = |theta: f64| {
+            let cosine = theta.cos();
+            let mut table = vec![0.0; highest + 1];
+            table[0] = 1.0;
+            if highest >= 1 {
+                table[1] = cosine;
+            }
+            for k in 2..=highest {
+                table[k] = 2.0 * cosine * table[k - 1] - table[k - 2];
+            }
+            table
+        };
+
+        // `ψ_A0_2m(π/2)`, in the closed form the source gives: the odd harmonic
+        // vanishes there and `cos((2m+2n)π/2) = (-1)^(m+n)`.
+        let standing_at_waterline = |m: usize| {
+            let mut series = 0.0;
+            for (n, &coefficient) in a.iter().enumerate() {
+                let order = 2.0 * n as f64 - 1.0;
+                series += (order / (2 * m + 2 * n) as f64) * coefficient;
+            }
+            let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+            frequency_ratio * sign * series
+        };
+
+        // The progressive wave system, which here is a horizontal doublet at the
+        // origin where the symmetric problem has a pulsating source. The source
+        // reaches these through Porter's power series; `progressive_wave` returns
+        // the two integrals Porter approximates as the real and imaginary parts of
+        // one exponential integral, which is closed form and costs the same as the
+        // heave solve's.
+        let progressive = |theta: f64| {
+            let (x, y) = form.contour(theta);
+            let decay = PI * (-nu * y).exp();
+            let (sine, cosine) = (nu * x).sin_cos();
+            let wave = progressive_wave(nu, x, y);
+            let radius = nu * (x * x + y * y);
+            ProgressiveWaves {
+                stream_cos: decay * cosine,
+                stream_sin: decay * sine + wave.im - y / radius,
+                potential_cos: -decay * sine,
+                potential_sin: decay * cosine - wave.re + x / radius,
+            }
+        };
+
+        // Everything that depends on the quadrature node but not the multipole
+        // index, tabulated once.
+        struct Sampled {
+            weight: f64,
+            /// `g(θ)`, the shape that forces sway.
+            sway_shape: f64,
+            /// `μ(θ) - 1`, the shape that forces roll.
+            roll_shape: f64,
+            waves: ProgressiveWaves,
+            /// `Σ_n (-1)ⁿ (2n-1) a_{2n-1} sin((2n-1)θ)`, the weight the lateral
+            /// pressure integral carries. It is `-(1/M_s) dy_0/dθ`, which is the
+            /// projection of the surface normal onto the lateral direction.
+            lateral_weight: f64,
+            /// `Σ_n Σ_i (-1)^(n+i) (2i-1) a_{2n-1} a_{2i-1} sin((2n-2i)θ)`, the
+            /// weight the roll moment integral carries.
+            moment_weight: f64,
+        }
+
+        let sampled: Vec<Sampled> = self
+            .nodes
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(&theta, &weight)| {
+                let (x, y) = form.contour(theta);
+                let mut lateral_weight = 0.0;
+                for (n, &coefficient) in a.iter().enumerate() {
+                    let order = 2.0 * n as f64 - 1.0;
+                    let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+                    lateral_weight += sign * order * coefficient * (order * theta).sin();
+                }
+                let mut moment_weight = 0.0;
+                for (n, &an) in a.iter().enumerate() {
+                    for (i, &ai) in a.iter().enumerate() {
+                        let odd = 2.0 * i as f64 - 1.0;
+                        let sign = if (n + i) % 2 == 0 { 1.0 } else { -1.0 };
+                        let difference = 2.0 * n as f64 - 2.0 * i as f64;
+                        moment_weight += sign * odd * an * ai * (difference * theta).sin();
+                    }
+                }
+                Sampled {
+                    weight,
+                    sway_shape: y / half_beam,
+                    roll_shape: (x * x + y * y) / (half_beam * half_beam) - 1.0,
+                    waves: progressive(theta),
+                    lateral_weight,
+                    moment_weight,
+                }
+            })
+            .collect();
+
+        // `f_2m(θ) = -ψ_A0_2m(θ) + ψ_A0_2m(π/2)` for `m ≥ 1`, with the mode's own
+        // forcing shape taking the `m = 0` slot. That is the source's device for
+        // making `P_0` and `Q_0` fall out of the same least-squares solve as the
+        // multipole strengths, instead of being recovered separately: they are the
+        // coefficients of the forcing shape in the same expansion.
+        let unknowns = multipoles + 1;
+        let waterline_standing: Vec<f64> = (1..=multipoles).map(standing_at_waterline).collect();
+        let basis: Vec<Vec<f64>> = self
+            .nodes
+            .iter()
+            .map(|&theta| {
+                let cosines = cosines_at(theta);
+                let mut row = Vec::with_capacity(unknowns);
+                // The `m = 0` slot is the mode's own forcing shape, which is what
+                // sway and roll disagree about; the solve below supplies it. Left
+                // as a signalling value rather than zero so that reading it by
+                // mistake is loud instead of quietly wrong.
+                row.push(f64::NAN);
+                row.extend(harmonics.iter().zip(waterline_standing.iter()).map(
+                    |(terms, &at_waterline)| {
+                        let standing: f64 = terms
+                            .iter()
+                            .map(|&(index, weight)| weight * cosines[index])
+                            .sum();
+                        at_waterline - standing
+                    },
+                ));
+                row
+            })
+            .collect();
+
+        // The Gram matrix differs between the modes only in its first row and
+        // column, so it is assembled twice — but the right-hand sides, the
+        // progressive-wave forcing, are shared. Assembling both here keeps the
+        // expensive part, the exponential integrals in `sampled`, paid once.
+        let waterline = progressive(PI / 2.0);
+        let solve = |shape: fn(&Sampled) -> f64| -> Option<(DVector<f64>, DVector<f64>)> {
+            let mut gram = DMatrix::zeros(unknowns, unknowns);
+            let mut rhs_cos = DVector::zeros(unknowns);
+            let mut rhs_sin = DVector::zeros(unknowns);
+            for (sample, row) in sampled.iter().zip(basis.iter()) {
+                let forcing_cos = sample.waves.stream_cos - waterline.stream_cos;
+                let forcing_sin = sample.waves.stream_sin - waterline.stream_sin;
+                let value = |k: usize| if k == 0 { shape(sample) } else { row[k] };
+                for n in 0..unknowns {
+                    let f_n = sample.weight * value(n);
+                    rhs_cos[n] += f_n * forcing_cos;
+                    rhs_sin[n] += f_n * forcing_sin;
+                    for m in 0..unknowns {
+                        gram[(n, m)] += f_n * value(m);
+                    }
+                }
+            }
+            let factored = gram.lu();
+            Some((factored.solve(&rhs_cos)?, factored.solve(&rhs_sin)?))
+        };
+
+        let (p_sway, q_sway) = solve(|s| s.sway_shape)?;
+        let (p_roll, q_roll) = solve(|s| s.roll_shape)?;
+
+        // `M_0` and `N_0`: the lateral pressure integral of §4.1.2, three terms in
+        // the source's order — the progressive wave's own contribution, a term the
+        // free surface condition leaves at the waterline, and the standing waves'.
+        let lateral_force = |multipole: &DVector<f64>, sine: bool| {
+            let mut integral = 0.0;
+            for sample in &sampled {
+                let potential = if sine {
+                    sample.waves.potential_sin
+                } else {
+                    sample.waves.potential_cos
+                };
+                integral += sample.weight * potential * sample.lateral_weight;
+            }
+            // Reaches only as far as the mapping has coefficients to offer:
+            // `a_{2m+1}` is `a[m + 1]`, so this stops at `m = N - 1`.
+            let mut at_waterline = 0.0;
+            for m in 1..N.min(multipoles + 1) {
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                at_waterline += sign * multipole[m] * (2 * m + 1) as f64 * a[m + 1];
+            }
+            let mut standing = 0.0;
+            for m in 1..=multipoles {
+                let mut inner = 0.0;
+                for (n, &an) in a.iter().enumerate() {
+                    let order = 2.0 * n as f64 - 1.0;
+                    for (i, &ai) in a.iter().enumerate() {
+                        let odd = 2.0 * i as f64 - 1.0;
+                        let even = (2 * m + 2 * i) as f64;
+                        inner += order * odd / (even * even - order * order) * an * ai;
+                    }
+                }
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                standing += sign * multipole[m] * inner;
+            }
+            -integral / sigma_a
+                + PI / (4.0 * sigma_a) * at_waterline
+                + xi_b / (sigma_a * sigma_a) * standing
+        };
+
+        // `Y_R` and `X_R`: the roll moment integral, shared verbatim between
+        // §4.1.2 and §4.1.3 — the source says so, and it is the reason one pair of
+        // routines serves both couplings.
+        let roll_moment = |multipole: &DVector<f64>, sine: bool| {
+            let mut integral = 0.0;
+            for sample in &sampled {
+                let potential = if sine {
+                    sample.waves.potential_sin
+                } else {
+                    sample.waves.potential_cos
+                };
+                integral += sample.weight * potential * sample.moment_weight;
+            }
+            let mut standing = 0.0;
+            for m in 1..=multipoles {
+                let mut inner = 0.0;
+                let odd_squared = (2 * m + 1) as f64 * (2 * m + 1) as f64;
+                for (n, &an) in a.iter().enumerate() {
+                    for (i, &ai) in a.iter().enumerate() {
+                        let odd = 2.0 * i as f64 - 1.0;
+                        let difference = 2.0 * n as f64 - 2.0 * i as f64;
+                        inner +=
+                            odd * difference / (odd_squared - difference * difference) * an * ai;
+                    }
+                }
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                standing += sign * multipole[m] * inner;
+            }
+            // The triple-product term, whose third factor is a mapping coefficient
+            // at a shifted index: `a_{-2m+2n-2i-1}` is `a[n - i - m]`, and the
+            // summation limits are exactly the ones that keep that index inside the
+            // mapping — and, incidentally, keep `2n - 2i` away from zero.
+            let mut triple = 0.0;
+            for m in 1..=N.min(multipoles) {
+                let mut inner = 0.0;
+                for n in m..=N {
+                    for i in 0..=(n - m) {
+                        let shifted = -2.0 * m as f64 + 2.0 * n as f64 - 2.0 * i as f64 - 1.0;
+                        let odd = 2.0 * i as f64 - 1.0;
+                        let difference = 2.0 * n as f64 - 2.0 * i as f64;
+                        inner += shifted * odd / difference * a[n] * a[i] * a[n - i - m];
+                    }
+                }
+                for n in 0..=N {
+                    for i in (m + n)..=N {
+                        let shifted = -2.0 * m as f64 - 2.0 * n as f64 + 2.0 * i as f64 - 1.0;
+                        let odd = 2.0 * i as f64 - 1.0;
+                        let difference = 2.0 * n as f64 - 2.0 * i as f64;
+                        inner += shifted * odd / difference * a[n] * a[i] * a[i - n - m];
+                    }
+                }
+                let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+                triple += sign * multipole[m] * inner;
+            }
+            let two_sigma_squared = 2.0 * sigma_a * sigma_a;
+            integral / two_sigma_squared + standing / two_sigma_squared
+                - PI * xi_b / (8.0 * sigma_a * sigma_a * sigma_a) * triple
+        };
+
+        let sway_lateral = (lateral_force(&q_sway, true), lateral_force(&p_sway, false));
+        let sway_moment = (roll_moment(&q_sway, true), roll_moment(&p_sway, false));
+        let roll_lateral = (lateral_force(&q_roll, true), lateral_force(&p_roll, false));
+        let roll_moment_pair = (roll_moment(&q_roll, true), roll_moment(&p_roll, false));
+
+        let sway_denominator = p_sway[0] * p_sway[0] + q_sway[0] * q_sway[0];
+        let roll_denominator = p_roll[0] * p_roll[0] + q_roll[0] * q_roll[0];
+
+        // In phase with the displacement, and out of phase with it: added mass and
+        // damping respectively, for whichever force this pair describes.
+        let in_phase = |(m, n): (f64, f64), p: f64, q: f64| m * q + n * p;
+        let out_of_phase = |(m, n): (f64, f64), p: f64, q: f64| m * p - n * q;
+
+        let sway_energy = out_of_phase(sway_lateral, p_sway[0], q_sway[0]);
+        let roll_energy = out_of_phase(roll_moment_pair, p_roll[0], q_roll[0]);
+
+        let sway_scale = density * beam * beam / 2.0 / sway_denominator;
+        let coupling_scale = -density * beam.powi(3) / 2.0 / sway_denominator;
+        let roll_scale = density * beam.powi(4) / 8.0 / roll_denominator;
+        let reciprocity_scale = -density * beam.powi(3) / 8.0 / roll_denominator;
+
+        let coupling_added_mass = coupling_scale * in_phase(sway_moment, p_sway[0], q_sway[0]);
+        let reciprocity_added_mass =
+            reciprocity_scale * in_phase(roll_lateral, p_roll[0], q_roll[0]);
+        let average = 0.5 * (coupling_added_mass.abs() + reciprocity_added_mass.abs());
+
+        Some(LateralCoefficients {
+            sway_added_mass: sway_scale * in_phase(sway_lateral, p_sway[0], q_sway[0]),
+            sway_damping: sway_scale * sway_energy * omega,
+            roll_added_inertia: roll_scale * in_phase(roll_moment_pair, p_roll[0], q_roll[0]),
+            roll_damping: roll_scale * roll_energy * omega,
+            coupling_added_mass,
+            coupling_damping: coupling_scale
+                * out_of_phase(sway_moment, p_sway[0], q_sway[0])
+                * omega,
+            sway_wave_amplitude_ratio: PI * xi_b / sway_denominator.sqrt(),
+            roll_wave_amplitude_ratio: PI * xi_b * beam / (4.0 * roll_denominator.sqrt()),
+            sway_energy_residual: sway_energy / (PI * PI / 2.0) - 1.0,
+            roll_energy_residual: roll_energy / (PI * PI / 8.0) - 1.0,
+            reciprocity_residual: if average > 0.0 {
+                (coupling_added_mass - reciprocity_added_mass) / average
+            } else {
+                0.0
+            },
         })
     }
 }
@@ -970,5 +1384,187 @@ mod tests {
         let a = solve(&small_form, omega).added_mass;
         let b = solve(&large_form, omega / 2.0_f64.sqrt()).added_mass;
         assert_relative_eq!(b / a, 4.0, max_relative = 1e-9);
+    }
+
+    fn solve_lateral(form: &LewisForm, omega: f64) -> LateralCoefficients {
+        SectionSolver::new(TasaiOptions::default())
+            .lateral(form, omega, WATER, GRAVITY)
+            .expect("a positive frequency has a solution")
+    }
+
+    /// A half circle, whose Lewis mapping is exact: `a_1` and `a_3` are zero and
+    /// the mapping is the identity on the unit semicircle. The one section shape
+    /// with closed-form answers to compare against.
+    fn half_circle(radius: f64) -> LewisForm {
+        LewisForm::fit(&SectionGeometry {
+            beam: 2.0 * radius,
+            draft: radius,
+            area: PI * radius * radius / 2.0,
+        })
+    }
+
+    /// Sway added mass reaches its closed-form value as the frequency vanishes.
+    ///
+    /// The free-surface condition is `(ω²/g) Φ + ∂Φ/∂y = 0`, so as `ω → 0` it
+    /// degenerates into `∂Φ/∂y = 0` — a rigid wall. Reflecting the half circle in
+    /// that wall gives a whole circle in unbounded fluid, whose lateral added mass
+    /// is the mass of the fluid it displaces, and the half gets half of it:
+    /// `ρ π r² / 2`.
+    ///
+    /// This is the only genuinely external check in this module — an answer from
+    /// classical hydrodynamics, owing nothing to Tasai's formulation, the mapping
+    /// or this implementation. Everything else here is an internal identity.
+    #[test]
+    fn sway_added_mass_reaches_the_analytic_value_of_a_circle() {
+        let radius = 1.0;
+        let form = half_circle(radius);
+        let analytic = WATER * PI * radius * radius / 2.0;
+
+        // ξ_b = ω² b_0 / 2g, and the approach is first order in it, so a
+        // ten-thousandth buys four digits.
+        let mut previous = f64::INFINITY;
+        for xi in [1e-2_f64, 1e-3, 1e-4] {
+            let omega = (2.0 * GRAVITY * xi / form.beam()).sqrt();
+            let error = (solve_lateral(&form, omega).sway_added_mass / analytic - 1.0).abs();
+            assert!(
+                error < previous,
+                "the limit must be approached, not straddled: {error:.2e} after {previous:.2e}"
+            );
+            previous = error;
+        }
+        assert!(
+            previous < 3e-4,
+            "a ten-thousandth of ξ_b left {previous:.2e} of relative error"
+        );
+    }
+
+    /// A circle rolling about its own centre does not move the water.
+    ///
+    /// Rotation leaves the boundary invariant, so there is no normal velocity
+    /// anywhere on it, no disturbance, no radiated wave and no reaction: added
+    /// inertia and damping are both exactly zero. The value of the test is that
+    /// it is exactly zero rather than approximately anything — it catches a
+    /// spurious term in the roll moment integral that a non-degenerate section
+    /// would bury in a plausible-looking number.
+    ///
+    /// It also says why the circle cannot validate roll anywhere else, which is
+    /// what the containership section below is for.
+    #[test]
+    fn a_circle_radiates_nothing_when_it_rolls() {
+        let form = half_circle(1.0);
+        for omega in [0.2_f64, 0.8, 1.5, 3.0] {
+            let c = solve_lateral(&form, omega);
+            // Scaled against the roll inertia of the displaced fluid, which is what
+            // a section this size would have if it did radiate.
+            let scale = WATER * form.beam().powi(4) / 8.0;
+            assert!(
+                c.roll_added_inertia.abs() / scale < 1e-12,
+                "at {omega} rad/s a circle claimed {} kg·m of roll added inertia",
+                c.roll_added_inertia
+            );
+            assert!(
+                c.roll_damping.abs() / (scale * omega) < 1e-12,
+                "at {omega} rad/s a circle claimed {} of roll damping",
+                c.roll_damping
+            );
+        }
+    }
+
+    /// Both energy identities hold, and tighten when the series is taken further.
+    ///
+    /// The exciting force's work must equal the energy the radiated wave carries
+    /// away, which pins `M_0 P_0 - N_0 Q_0 = π²/2` for sway and
+    /// `Y_R P_0 - X_R Q_0 = π²/8` for roll — exactly, in exact arithmetic, at
+    /// every frequency. What the residual measures in practice is the multipole
+    /// truncation, which is why the test asserts the trend as well as the size: a
+    /// residual that did not fall with `M` would be a bug wearing the costume of a
+    /// convergence error.
+    ///
+    /// The trend is asserted between the ends and not step by step, deliberately.
+    /// The sway residual at low `ξ_b` is already down at a few parts in a million
+    /// with six multipoles, which is the floor the quadrature and the Gram matrix's
+    /// conditioning set rather than the truncation — and at the floor the sequence
+    /// wanders instead of descending. Demanding monotonicity there would be
+    /// testing the noise.
+    #[test]
+    fn the_lateral_energy_identities_hold_and_tighten_with_the_series() {
+        let form = containership_midship();
+        let residuals = |multipoles: usize, omega: f64| {
+            let c = SectionSolver::new(TasaiOptions {
+                multipoles,
+                quadrature: 96,
+            })
+            .lateral(&form, omega, WATER, GRAVITY)
+            .expect("a positive frequency has a solution");
+            (c.sway_energy_residual.abs(), c.roll_energy_residual.abs())
+        };
+
+        for xi in [0.3_f64, 1.0, 2.0] {
+            let omega = (2.0 * GRAVITY * xi / form.beam()).sqrt();
+            let coarse = residuals(6, omega);
+            let fine = residuals(20, omega);
+            assert!(
+                fine.0 < coarse.0 && fine.1 < coarse.1,
+                "at ξ_b {xi} twenty multipoles gave {fine:?}, no better than six at {coarse:?}"
+            );
+            assert!(
+                fine.0 < 1e-4 && fine.1 < 1e-3,
+                "at ξ_b {xi} twenty multipoles left residuals of {fine:?}"
+            );
+        }
+    }
+
+    /// The added-mass coupling agrees by two routes that share no arithmetic.
+    ///
+    /// Potential flow makes the added-mass matrix symmetric, so the roll moment
+    /// caused by swaying and the lateral force caused by rolling are the same
+    /// number. They come from different solves — different forcing shapes, so
+    /// different `P` and `Q` — through different pressure integrals with constant
+    /// factors differing by a factor of four. Nothing in the algebra forces them
+    /// together, so their agreement exercises both solves, both integrals and the
+    /// shared basis at once, against no stored value at all.
+    ///
+    /// This is the strongest check in the module, and the reason the two modes are
+    /// solved in one call rather than two.
+    #[test]
+    fn the_coupling_agrees_by_two_independent_routes() {
+        let form = containership_midship();
+        for xi in [0.1_f64, 0.3, 0.6, 1.0, 1.5, 2.0] {
+            let omega = (2.0 * GRAVITY * xi / form.beam()).sqrt();
+            let residual = solve_lateral(&form, omega).reciprocity_residual;
+            assert!(
+                residual.abs() < 2e-3,
+                "at ξ_b {xi} the two routes to the coupling disagreed by {residual:.2e}"
+            );
+        }
+    }
+
+    /// Sway damping vanishes like the fifth power of frequency.
+    ///
+    /// A section damps sway exactly to the extent that it makes waves, and the
+    /// amplitude it radiates is first order in `ξ_b`. Damping goes as `ω` times
+    /// the square of that ratio, so `B₂₂ ∝ ω · ω⁴`. Worth pinning because it is
+    /// the asymptote the whole low-frequency end of the spectrum rests on, and
+    /// because the frequency grid now reaches far enough down to sit in it.
+    #[test]
+    fn sway_damping_vanishes_like_the_fifth_power_of_frequency() {
+        let form = half_circle(1.0);
+        let at = |xi: f64| {
+            let omega = (2.0 * GRAVITY * xi / form.beam()).sqrt();
+            solve_lateral(&form, omega).sway_damping
+        };
+        // A decade in ξ_b is half a decade in ω, so five powers of ω is two and a
+        // half powers of ξ_b: a factor of 10^2.5 per decade.
+        let ratio = at(1e-3) / at(1e-4);
+        assert_relative_eq!(ratio, 10.0_f64.powf(2.5), max_relative = 0.02);
+    }
+
+    /// No frequency, no radiation problem — the same contract heave keeps.
+    #[test]
+    fn a_still_section_has_no_lateral_solution() {
+        let form = half_circle(1.0);
+        let solver = SectionSolver::new(TasaiOptions::default());
+        assert!(solver.lateral(&form, 0.0, WATER, GRAVITY).is_none());
+        assert!(solver.lateral(&form, -1.0, WATER, GRAVITY).is_none());
     }
 }
