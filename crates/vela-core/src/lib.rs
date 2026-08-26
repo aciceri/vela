@@ -30,6 +30,7 @@
 pub mod aero;
 pub mod appendages;
 pub mod assembly;
+pub mod balance;
 pub mod boat;
 pub mod clip;
 pub mod controls;

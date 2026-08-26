@@ -484,6 +484,54 @@ follows the release, so the release point itself has to serve as the first.
 
 What remains for the phase: sway and roll sections for the other modes.
 
+### 5.3f Balance: closing the data gap that restrains yaw
+
+Yaw has been restrained since the beginning, and not because the physics is
+missing. Every force this engine computes acts at a point, and for the sails and
+the appendages the *longitudinal* part of that point is not in the data: the
+source's published particulars give the sail plan's dimensions and the keel's
+planform but never where either sits along the hull. The arm is missing, not the
+force.
+
+`vela_core::balance` closes that the way the source does, because Chapter 9 is a
+design chapter and its rules are computable:
+
+- **Centre of lateral resistance**, Fig 9.2: the extended keel only — *"for most
+  fin-keel yachts the effect of the rudder and the forebody cancel each other
+  reasonably well"* — with the centre at 45 % of the draft along the
+  quarter-chord line. Since that line *is* the sweep line, the construction
+  reduces to walking down it, which also means the sweep convention here cannot
+  drift from the one the lift model uses.
+- **Centre of effort**, Fig 9.3: the area-weighted mean of the fore and main
+  triangle centroids. For the YD-41 this lands 0.194 m **aft** of the mast,
+  because the mainsail is the bigger triangle — counter-intuitive, and a sign
+  error there would move the mast by twice the offset.
+- **Lead**, from the *Lead* section: 5–9 % of waterline for masthead sloops on a
+  fin keel, 2–6 % for fractional.
+
+**The oracle is unusually good here.** The source publishes the answer for its
+own boat: *"The lead for the YD-41 is 2.2 %."* And the two statements corroborate
+each other — `I/EHM` is 0.87, so the rig classifies as fractional, and 2.2 %
+falls inside the fractional band and outside the masthead one. If the
+classification were wrong the source would appear to contradict itself, which is
+a check worth having.
+
+With that, 2.2 % of an 11.90 m waterline is 0.262 m of lead, the centre of effort
+is 0.194 m aft of the mast, and the mast therefore stands **0.456 m forward of
+the centre of lateral resistance**. Everything about the rig's longitudinal
+position follows from that plus the keel's own.
+
+**What is still required rather than derived**: the keel's longitudinal position.
+It is a design decision and no rule in the book produces it, so it is an input
+(`vela-cli balance --keel-at`) and not a default dressed up as a derivation. The
+two directions — place the mast for a lead, measure the lead of a placed mast —
+are tested as inverses, because one fills a boat file in and the other checks it,
+and if they disagreed a file could pass its own check and still be wrong.
+
+Freeing yaw is the next step and needs the solver to gain a degree of freedom,
+with rudder angle as the control that balances the yaw moment. That is what turns
+this from a design calculation into helm feel.
+
 ### 5.4 Appendages: keel and rudder
 
 Wing-theory model per appendage:

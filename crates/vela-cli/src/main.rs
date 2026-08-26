@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use vela_core::aero::{EffectiveSpan, SailSet, Trim};
 use vela_core::assembly::velocity_prediction_sim;
+use vela_core::balance::{Balance, ExtendedKeel, RigType, SailPlan};
 use vela_core::boat::HullSpec;
 use vela_core::cummins::{FluidMemory, MemoryOptions, TransformOptions};
 use vela_core::dsyhs::{hull_resistance, HullParameters};
@@ -53,6 +54,7 @@ USAGE:
     vela-cli polar            <boat.ron> [--tws M/S] [--points N]
     vela-cli lewis            <boat.ron> [--waterline M]
     vela-cli radiation        <boat.ron> [--waterline M]
+    vela-cli balance          <boat.ron> [--keel-at M] [--mast-at M]
 
 COMMANDS:
     mesh              Report the lofted physics mesh without solving anything
@@ -64,6 +66,7 @@ COMMANDS:
     polar             Solve the whole polar, optimising sails and trim
     lewis             Fit Lewis forms to the stations and check the envelope
     radiation         Heave added mass and damping across frequency
+    balance           Where the rig sits relative to the keel
 
 OPTIONS:
     --points N      Contour points per station (default 16)
@@ -98,6 +101,10 @@ struct Options {
     reef: f64,
     /// Waterline height above the baseline, m, overriding the design waterline.
     waterline: Option<f64>,
+    /// Longitudinal position of the keel quarter chord at the waterline, m.
+    keel_at: Option<f64>,
+    /// Longitudinal position of the mast, m.
+    mast_at: Option<f64>,
 }
 
 fn main() -> ExitCode {
@@ -136,6 +143,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         "sail" => report_sail(&spec, &options),
         "lewis" => report_lewis(&spec, &options),
         "radiation" => report_radiation(&spec, &options),
+        "balance" => report_balance(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
@@ -152,6 +160,8 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         flat: 1.0,
         reef: 1.0,
         waterline: None,
+        keel_at: None,
+        mast_at: None,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
@@ -171,6 +181,8 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             "--flat" => options.flat = number(rest.next(), "--flat")?,
             "--reef" => options.reef = number(rest.next(), "--reef")?,
             "--waterline" => options.waterline = Some(number(rest.next(), "--waterline")?),
+            "--keel-at" => options.keel_at = Some(number(rest.next(), "--keel-at")?),
+            "--mast-at" => options.mast_at = Some(number(rest.next(), "--mast-at")?),
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }
@@ -1036,5 +1048,115 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
          Residual is the worst departure from the energy identity over the\n\
          stations at that frequency, and measures multipole truncation only.\n"
     ));
+    Ok(out)
+}
+
+/// Where the rig has to sit relative to the keel, by Chapter 9.
+///
+/// The longitudinal positions of the sails and the appendages are the one thing
+/// the boat format does not carry, which is why yaw is restrained. This command
+/// closes that gap the way the source does: it computes the centre of lateral
+/// resistance from the keel, the centre of effort from the rig, and reports what
+/// lead a given mast position gives — or where the mast goes for a wanted lead.
+///
+/// The keel's own longitudinal position is a design decision no rule produces, so
+/// it is an input here (`--keel-at`, default midships).
+fn report_balance(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+    let parameters = parameters(spec)?;
+    let appendages = spec
+        .appendages
+        .ok_or_else(|| format!("{} has no appendages, so it has no keel", spec.name))?;
+    let rig = spec
+        .rig
+        .ok_or_else(|| format!("{} has no rig, so it has no sail plan", spec.name))?;
+
+    let keel_at = options.keel_at.unwrap_or(0.5 * parameters.waterline_length);
+    let keel = ExtendedKeel {
+        quarter_chord_at_waterline: keel_at,
+        total_draft: parameters.canoe_draft + appendages.keel.span,
+        sweep: appendages.keel.sweep_deg.to_radians(),
+    };
+    let plan = SailPlan {
+        foretriangle_height: rig.foretriangle_height,
+        foretriangle_base: rig.foretriangle_base,
+        main_hoist: rig.main_hoist,
+        main_foot: rig.main_foot,
+        boom_above_sheer: rig.boom_above_sheer,
+    };
+    let rig_type = RigType::classify(rig.foretriangle_height, rig.mast_above_sheer);
+    let band = rig_type.recommended_lead();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — longitudinal balance, Principles of Yacht Design ch. 9\n\n\
+         rig type            {rig_type:?}  (I/EHM = {:.2})\n\
+         recommended lead    {:.0} to {:.0} % of LWL\n\n",
+        spec.name,
+        rig.foretriangle_height / rig.mast_above_sheer,
+        100.0 * band.start(),
+        100.0 * band.end(),
+    ));
+
+    let (clr_at, clr_depth) = keel.centre_of_lateral_resistance();
+    let (effort_forward, effort_height) = plan.centre_of_effort_from_mast();
+    out.push_str(&format!(
+        "keel quarter chord at waterline  {keel_at:8.3} m  (input)\n\
+         centre of lateral resistance     {clr_at:8.3} m, {clr_depth:.3} m deep\n\
+         centre of effort from the mast   {effort_forward:8.3} m forward, {effort_height:.3} m up\n\
+         foretriangle / mainsail area     {:8.2} / {:.2} m2\n\n",
+        plan.foretriangle_area(),
+        plan.mainsail_area(),
+    ));
+
+    match options.mast_at {
+        Some(mast_at) => {
+            let balance = Balance::from_positions(
+                &keel,
+                &plan,
+                rig_type,
+                parameters.waterline_length,
+                mast_at,
+            );
+            out.push_str(&format!(
+                "With the mast at {mast_at:.3} m:\n\
+                 \x20 centre of effort at   {:8.3} m\n\
+                 \x20 lead                  {:8.3} m = {:.2} % of LWL   {}\n",
+                balance.centre_of_effort_at,
+                balance.centre_of_effort_at - balance.lateral_resistance_at,
+                100.0 * balance.lead,
+                if balance.lead_is_recommended {
+                    "inside the recommended band"
+                } else {
+                    "OUTSIDE the recommended band"
+                }
+            ));
+        }
+        None => {
+            out.push_str(
+                "Mast position for each end of the band, and for the YD-41's published lead:\n",
+            );
+            for lead in [*band.start(), 0.022, *band.end()] {
+                let balance =
+                    Balance::from_lead(&keel, &plan, rig_type, parameters.waterline_length, lead);
+                out.push_str(&format!(
+                    "\x20 lead {:5.2} %  ->  mast at {:7.3} m, centre of effort at {:7.3} m  {}\n",
+                    100.0 * lead,
+                    balance.mast_at,
+                    balance.centre_of_effort_at,
+                    if balance.lead_is_recommended {
+                        ""
+                    } else {
+                        "(out of band)"
+                    }
+                ));
+            }
+        }
+    }
+
+    out.push_str(
+        "\nThe centre of lateral resistance uses the extended keel only: the source\n\
+         neglects rudder and forebody because they cancel, which is also why the\n\
+         method is for fin keels alone. Positive lead puts the sails forward.\n",
+    );
     Ok(out)
 }
