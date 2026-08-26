@@ -11,18 +11,30 @@
 
 use std::process::ExitCode;
 
-use vela_core::aero::SailSet;
+use vela_core::aero::{EffectiveSpan, SailSet, Trim};
 use vela_core::assembly::velocity_prediction_sim;
 use vela_core::boat::HullSpec;
 use vela_core::dsyhs::{hull_resistance, HullParameters};
-use vela_core::equilibrium::{self, EquilibriumOptions};
+use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
 use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
 use vela_core::sections::{hull_form, FormOptions};
 use vela_core::{
-    loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, StillWater, TriMesh, UniformWind, Water,
-    SEA_WATER_DENSITY,
+    loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, Sim, StillWater, TriMesh, UniformWind,
+    Water, SEA_WATER_DENSITY,
 };
+
+/// Knots per metre per second, for reporting only. Nothing in the engine knows
+/// what a knot is.
+const KNOTS_PER_METRE_PER_SECOND: f64 = 1.943_844_492_440_605;
+
+/// Relative speed gain a trim must deliver to be preferred over a less
+/// depowered one.
+///
+/// A hundredth of a per cent: two orders below the precision the polar is
+/// printed at, so it never changes a reported speed, and it stops a plateau
+/// from being awarded to whichever candidate came last.
+const TRIM_MARGIN: f64 = 1e-4;
 
 const USAGE: &str = "\
 vela — sailing yacht physics engine
@@ -31,16 +43,19 @@ USAGE:
     vela-cli mesh          <boat.ron> [--points N]
     vela-cli hydrostatics  <boat.ron> [--points N]
     vela-cli form          <boat.ron> [--points N]
-    vela-cli resistance    <boat.ron> [--speed M/S | --froude F] [--heel DEG]
-    vela-cli polar         <boat.ron> [--heel DEG]
-    vela-cli sail          <boat.ron> [--tws M/S] [--twa DEG] [--downwind]
+    vela-cli resistance       <boat.ron> [--speed M/S | --froude F] [--heel DEG]
+    vela-cli resistance-curve <boat.ron> [--heel DEG]
+    vela-cli sail             <boat.ron> [--tws M/S] [--twa DEG] [--downwind]
+    vela-cli polar            <boat.ron> [--tws M/S] [--points N]
 
 COMMANDS:
-    mesh            Report the lofted physics mesh without solving anything
-    hydrostatics    Solve the floating equilibrium and report hull properties
-    resistance      Canoe body resistance at one speed, by component
-    polar           Resistance across the Froude range the series covers
-    sail            Solve the steady sailing condition and show its balance
+    mesh              Report the lofted physics mesh without solving anything
+    hydrostatics      Solve the floating equilibrium and report hull properties
+    form              Compare the geometry against the declared parameters
+    resistance        Canoe body resistance at one speed, by component
+    resistance-curve  Canoe body resistance across the Froude range
+    sail              Solve one sailing condition and show its force balance
+    polar             Solve the whole polar, optimising sails and trim
 
 OPTIONS:
     --points N      Contour points per station (default 16)
@@ -105,6 +120,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         "hydrostatics" => report_hydrostatics(&spec, &lofted(&spec, &options)?),
         "form" => report_form(&spec, &lofted(&spec, &options)?),
         "resistance" => report_resistance(&spec, &options),
+        "resistance-curve" => report_resistance_curve(&spec, &options),
         "polar" => report_polar(&spec, &options),
         "sail" => report_sail(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
@@ -421,7 +437,15 @@ fn report_form(spec: &BoatSpec, mesh: &TriMesh) -> Result<String, String> {
     Ok(out)
 }
 
-fn report_polar(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+/// The DSYHS resistance curve at prescribed speeds.
+///
+/// This was called `polar` and was not one: a polar is what a boat *does*, and
+/// a table of resistance at speeds nobody solved for is an input to that
+/// question rather than an answer to it. It keeps its own command because it is
+/// the only report a parameters-only boat can produce — no geometry, no
+/// appendages and no rig needed — and because comparing it against a solved
+/// polar is how the resistance side gets checked on its own.
+fn report_resistance_curve(spec: &BoatSpec, options: &Options) -> Result<String, String> {
     let hull = parameters(spec)?;
     let gravity = vela_core::STANDARD_GRAVITY;
 
@@ -449,6 +473,181 @@ fn report_polar(spec: &BoatSpec, options: &Options) -> Result<String, String> {
         ));
         froude += 0.05;
     }
+    Ok(out)
+}
+
+/// The depowering path, from full sail downwards.
+///
+/// Flattening comes before reefing, and that order is the source's rather than
+/// a guess: *Principles of Yacht Design*, 5th ed., on Hazen's trim factors —
+/// the lift is proportional to `F` while the induced drag goes as `F²`, so
+/// flattening rotates the resultant forward and *"it is thus better to flatten
+/// the sail than to reef it to reduce heeling, a fact well-known by most
+/// sailors."* Reefing also lowers the heeling arm, which is why it is what
+/// remains once flattening has run out.
+///
+/// The path is coarse on purpose. It is searched exhaustively at every point of
+/// the polar, so its length is multiplied by the number of cells; and the
+/// speed it is being searched for is flat near its own maximum, so a finer grid
+/// buys decimals of a knot for a linear cost in solves.
+fn power_path() -> impl Iterator<Item = (f64, f64)> {
+    const FLAT: [f64; 5] = [1.0, 0.9, 0.8, 0.7, 0.6];
+    const REEF: [f64; 4] = [0.9, 0.8, 0.7, 0.6];
+    FLAT.into_iter()
+        .map(|flat| (flat, 1.0))
+        .chain(REEF.into_iter().map(|reef| (0.6, reef)))
+}
+
+/// The sail sets a crew would consider, each with the aspect-ratio regime that
+/// goes with it.
+///
+/// Both are tried at every angle rather than switching at a threshold. The
+/// aerodynamic model has coefficients for a spinnaker at 27° and for a jib at
+/// 180°, and it is perfectly willing to report how badly each does there — so
+/// the crossover is something the model can be asked for instead of something
+/// this file has to assert.
+fn sail_choices() -> [(SailSet, EffectiveSpan); 2] {
+    [
+        (SailSet::upwind(), EffectiveSpan::CloseHauled),
+        (SailSet::downwind(), EffectiveSpan::Eased),
+    ]
+}
+
+/// The fastest sailing condition available at one wind angle.
+struct Fastest {
+    solution: Equilibrium,
+    sails: SailSet,
+    flat: f64,
+    reef: f64,
+}
+
+/// Searches sail set and trim for the fastest solved condition.
+///
+/// Maximising boat speed is the whole criterion, and it needs no heel limit to
+/// go with it. An overpowered yacht's only equilibrium is a knockdown, and a
+/// knockdown is *slow* — the hull is dragging its topsides through the water —
+/// so a search for speed discards it without anyone having to name the angle at
+/// which sailing stops. That is worth stating because the alternative,
+/// depowering until heel falls under a chosen limit, would put an arbitrary
+/// number in the middle of every prediction.
+/// Depowering is walked only as far as it keeps paying, and it has to pay by a
+/// margin: a trim is preferred over a less depowered one only if it is faster
+/// by [`TRIM_MARGIN`]. Without that, a plateau is won by whichever candidate
+/// happens to come last, and the report claims a crew flattened the sails for a
+/// gain in the fourth decimal — dead downwind, where the lift coefficient is
+/// 0.001 and flattening provably does nothing, the search dutifully reported
+/// `flat 0.6`.
+///
+/// Speed along the path is unimodal — power buys speed until heel and induced
+/// drag take it back — so the first step that fails to pay is where the search
+/// for that sail set stops. Stated as the heuristic it is: a pathological
+/// double-peaked response would hide behind it, and the whole path can be
+/// walked by removing one `break` if that is ever suspected.
+fn fastest_at(sim: &mut Sim, reference_length: f64, start: &EquilibriumOptions) -> Option<Fastest> {
+    let mut best: Option<Fastest> = None;
+
+    for (sails, span) in sail_choices() {
+        let mut previous: Option<f64> = None;
+
+        for (flat, reef) in power_path() {
+            let trim = Trim::full(span).with_flat(flat).with_reef(reef);
+            sim.set_controls(Controls {
+                rudder_angle: 0.0,
+                sails,
+                trim,
+            });
+
+            let Ok(solution) = equilibrium::solve(sim, reference_length, start) else {
+                // A trim with no solution says nothing about the next one: the
+                // knockdown branch can be unreachable at full sail and the
+                // depowered condition perfectly ordinary.
+                continue;
+            };
+
+            let speed = solution.speed;
+            let worth_it = |reference: f64| speed > reference * (1.0 + TRIM_MARGIN);
+
+            if best
+                .as_ref()
+                .is_none_or(|current| worth_it(current.solution.speed))
+            {
+                best = Some(Fastest {
+                    solution,
+                    sails,
+                    flat,
+                    reef,
+                });
+            }
+            if previous.is_some_and(|earlier| !worth_it(earlier)) {
+                break;
+            }
+            previous = Some(speed);
+        }
+    }
+    best
+}
+
+/// The solved polar: what the boat does at every wind angle, at one wind speed.
+fn report_polar(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+    let hull = parameters(spec)?;
+    let start = EquilibriumOptions {
+        initial_sinkage: hull.canoe_draft,
+        ..EquilibriumOptions::default()
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — solved polar, TWS {:.2} m/s ({:.1} kn)\n\n",
+        spec.name,
+        options.wind,
+        options.wind * KNOTS_PER_METRE_PER_SECOND
+    ));
+    out.push_str(
+        "  TWA     speed    speed       VMG     heel   leeway   sails            trim\n\
+         [deg]     [m/s]     [kn]      [kn]    [deg]    [deg]                 flat  reef\n",
+    );
+
+    let mut angle_deg: f64 = 30.0;
+    while angle_deg <= 180.001 {
+        let environment =
+            StillWater::new(UniformWind::uniform(options.wind, angle_deg.to_radians()));
+        // Rebuilt per angle because the environment is fixed at construction;
+        // trim and sails are then swept on this one simulation.
+        let mut sim = velocity_prediction_sim(
+            spec,
+            Box::new(environment),
+            Controls::close_hauled(SailSet::upwind()),
+            &options.loft,
+        )
+        .map_err(|error| format!("{}: {error}", spec.name))?;
+
+        match fastest_at(&mut sim, hull.waterline_length, &start) {
+            Some(best) => {
+                let knots = best.solution.speed * KNOTS_PER_METRE_PER_SECOND;
+                out.push_str(&format!(
+                    "{:5.0} {:9.3} {:8.2} {:9.2} {:8.1} {:8.2}   {:<14} {:4.1} {:5.1}\n",
+                    angle_deg,
+                    best.solution.speed,
+                    knots,
+                    knots * angle_deg.to_radians().cos(),
+                    best.solution.heel.to_degrees(),
+                    best.solution.leeway.to_degrees(),
+                    best.sails.to_string(),
+                    best.flat,
+                    best.reef
+                ));
+            }
+            // Reported rather than skipped: a hole in a polar is a result, and
+            // a blank row says where the model ran out of sailing conditions.
+            None => out.push_str(&format!("{angle_deg:5.0}         —\n")),
+        }
+        angle_deg += 10.0;
+    }
+
+    out.push_str(
+        "\nVMG is positive to windward and negative to leeward. Trim is the fastest\n\
+         depowering found, flattening before reefing; 1.0 / 1.0 is full sail.\n",
+    );
     Ok(out)
 }
 

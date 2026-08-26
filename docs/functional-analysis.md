@@ -387,6 +387,59 @@ Layered, automated, running in CI on the native build:
    future replacement for the Michell stage on unconventional hulls, consuming
    the same override slot (§9).
 
+
+### 10a. Status: phase 1 measured against the published polar
+
+Phase 1 is complete and has been compared against the one external oracle in
+hand: the YD-41 polar of Fig 17.3 and the text describing it. The comparison is
+between different things and that is stated first — the book's is the published
+YD-41 through their VPP with three sail sets, this is a hull fitted to its
+coefficients carrying 5 % more displacement, through two sail sets — so what is
+being tested is whether an independent transcription of the same force models
+lands on the same boat.
+
+| Quantity | Published | This engine | Delta |
+|---|---|---|---|
+| Max upwind speed | ~7.5 kn | 7.15 kn | −5 % |
+| Upwind VMG | 6.0 kn | 5.48 kn | −8 % |
+| Optimum beating angle | ~37° (implied by 6.0/7.5) | 40° | within one grid step |
+| Max speed, broad reach | "almost 13 kn" | 12.85 kn | ✓ |
+| Angle of maximum speed | 120–130° | **150°** | real discrepancy |
+| Sail crossover | break at 90–100° | switches at 90° | ✓ |
+
+The upwind agreement is better than the model deserves and the reaching
+magnitude matches. **The angle of maximum speed does not**, and the cause is
+visible in the solution rather than mysterious: at 120–130° the boat solves to
+40° of heel under a spinnaker, which is not a broad reach anybody sails, and the
+heel drag is what pushes the speed maximum aft to 150°. Two contributors, both
+already recorded as limitations:
+
+- The sail model has two sets where the book's VPP has three. There is no
+  reaching sail, so a spinnaker is carried at angles where a real boat has a
+  flatter headsail up, and it makes too much side force there.
+- Heel enters the aerodynamics only through the apparent wind (§4.1, Fig 8.22).
+  That is the source's own treatment and it is not a shortcut, but it corrects
+  the *inflow* and not the coefficients, and at 40° of heel on a reach the
+  difference tells.
+
+Neither is a defect to fix by tuning. The first is closed by a third sail set
+with sourced coefficients; the second by the VLM of phase 2, which computes the
+heeled sail plan instead of correcting a coefficient measured upright.
+
+What the phase also produced, recorded because they are properties of the
+*models* rather than of the code that drives them:
+
+- The keel downwash goes as `sqrt(|C_L|)`, so **its derivative with respect to
+  leeway is infinite at zero leeway**, and the appendage heel factors are
+  written in `|φ|`, so **upright is a corner**. Any solver, VPP or time-domain,
+  has to start off both.
+- Buoyancy from a clipped mesh has a derivative sized by the triangles, not by
+  floating point: a perturbation moving the waterline by microns differentiates
+  the discretization.
+- There is **no damping in heave or roll** until phase 4, so steady sailing is
+  solved rather than integrated. This is the one place where the phase order
+  costs something real, and it is a solver, not a fudge.
+
 ---
 
 ## 11. Build order (risk-ordered)
