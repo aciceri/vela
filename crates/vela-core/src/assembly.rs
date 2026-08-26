@@ -24,16 +24,24 @@
 //! change to any force model.
 
 use crate::aero::RigDimensions;
+use crate::aero::SailSet;
 use crate::appendages::{FoilPlanform, HullScalars, Keel};
 use crate::boat::{AppendagesSpec, BoatSpec, FoilSpec, RigSpec, SpecError};
 use crate::controls::Controls;
+use crate::cummins::{MemoryError, MemoryOptions, TransformOptions};
 use crate::env::Environment;
+use crate::env::{StillWater, UniformWind};
+use crate::lewis::{station_geometry, LewisForm};
 use crate::loft::{loft_hull, LoftOptions};
 use crate::mass::MassError;
+use crate::modules::radiation::{Radiation, VerticalInfinite, VerticalSpectra};
 use crate::modules::{Buoyancy, CanoeBody, LateralSystem, Sails};
 use crate::rigid_body::RigidBody;
 use crate::sim::{Captive, ForceModule, Sim};
 use crate::state::BodyState;
+use crate::strip::{vertical_spectra, Strip};
+use crate::tasai::{SectionSolver, TasaiOptions};
+use crate::{SEA_WATER_DENSITY, STANDARD_GRAVITY};
 use nalgebra::Vector3;
 use std::fmt;
 
@@ -58,6 +66,8 @@ pub enum AssemblyError {
     Mass(MassError),
     /// The file itself is invalid.
     Spec(SpecError),
+    /// The hull admits no stable fluid-memory model.
+    Radiation(MemoryError),
     /// The lofted hull produced no triangles.
     DegenerateHull,
 }
@@ -82,6 +92,11 @@ impl fmt::Display for AssemblyError {
             Self::MissingRig => write!(f, "this boat has no rig, so nothing drives it"),
             Self::Mass(error) => write!(f, "mass properties: {error}"),
             Self::Spec(error) => write!(f, "boat file: {error}"),
+            Self::Radiation(error) => write!(
+                f,
+                "this hull admits no stable fluid-memory model ({error:?}); the sections \
+                 may be outside what strip theory can represent"
+            ),
             Self::DegenerateHull => {
                 write!(f, "the hull offsets lofted to an empty mesh")
             }
@@ -216,5 +231,137 @@ fn rig_dimensions(rig: &RigSpec) -> RigDimensions {
         mast_height_above_sheer: rig.mast_above_sheer,
         mast_diameter: rig.mast_diameter,
         mizzen: None,
+    }
+}
+
+/// A simulation of the vertical modes alone, with the water's memory in it.
+///
+/// Heave and pitch free, everything else restrained, no wind and no sails: the
+/// rig for watching a hull settle after it has been disturbed. It is a
+/// deliberately narrow assembly rather than a general one, because the vertical
+/// modes are the only ones whose radiation this engine can compute — the sway
+/// and roll sections are not written — and a simulation that pretended otherwise
+/// would be quietly missing terms in four degrees of freedom.
+///
+/// The frequency sweep happens here, which is the load-time cost: about two
+/// hundred milliseconds for a hull of seventeen stations over a grid that
+/// reaches far enough out for the transform. Everything after that is a
+/// five-state matrix-vector product per mode per step.
+///
+/// `A_∞` goes into the mass matrix and the memory becomes a force module, which
+/// is Cummins' split. See [`crate::modules::radiation`].
+///
+/// # Errors
+///
+/// [`AssemblyError`] naming the block of the boat file that is missing, or
+/// [`AssemblyError::Radiation`] if the hull admits no stable memory model.
+pub fn vertical_motion_sim(
+    spec: &BoatSpec,
+    loft: &LoftOptions,
+    options: RadiationOptions,
+) -> Result<Sim, AssemblyError> {
+    let hull = spec
+        .hull
+        .as_ref()
+        .ok_or(AssemblyError::MissingHullOffsets)?;
+    let parameters = spec
+        .hull_parameters()
+        .ok_or(AssemblyError::MissingParameters)?;
+
+    let mesh = loft_hull(hull, loft);
+    if mesh.triangle_count() == 0 {
+        return Err(AssemblyError::DegenerateHull);
+    }
+
+    // Sections at the design waterline. Dry stations are kept: they carry the
+    // length over which the coefficients taper to nothing.
+    let strips: Vec<Strip> = hull
+        .stations
+        .iter()
+        .map(|station| Strip {
+            x: station.x,
+            form: station_geometry(station, parameters.canoe_draft)
+                .map(|section| LewisForm::fit(&section)),
+        })
+        .collect();
+
+    let solver = SectionSolver::new(options.tasai);
+    let grid: Vec<f64> = (1..=options.samples)
+        .map(|i| options.top_frequency * i as f64 / options.samples as f64)
+        .collect();
+    let (heave, coupling, pitch) =
+        vertical_spectra(&strips, &grid, options.density, STANDARD_GRAVITY, &solver)
+            .ok_or(AssemblyError::Radiation(MemoryError::Singular))?;
+    let spectra = VerticalSpectra {
+        heave,
+        coupling,
+        pitch,
+    };
+    let infinite = VerticalInfinite {
+        heave: spectra.heave.infinite_added_mass(options.transform),
+        coupling: spectra.coupling.infinite_added_mass(options.transform),
+        pitch: spectra.pitch.infinite_added_mass(options.transform),
+    };
+    let radiation =
+        Radiation::fit(&spectra, &infinite, options.memory).map_err(AssemblyError::Radiation)?;
+
+    let mut body = RigidBody::new(spec.mass_properties()?)?;
+    body.add_added_mass(Radiation::added_mass_matrix(&infinite))?;
+
+    let modules: Vec<Box<dyn ForceModule>> =
+        vec![Box::new(Buoyancy::new(mesh)), Box::new(radiation)];
+    let env: Box<dyn Environment> = Box::new(StillWater::new(UniformWind::uniform(0.0, 0.0)));
+
+    Ok(Sim::new(
+        body,
+        BodyState::default(),
+        env,
+        modules,
+        Controls::close_hauled(SailSet::upwind()),
+    )
+    .with_captive(Captive {
+        surge: true,
+        sway: true,
+        heave: false,
+        roll: true,
+        pitch: false,
+        yaw: true,
+    }))
+}
+
+/// How the radiation pipeline is run at assembly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadiationOptions {
+    /// Water density, kg/m³.
+    pub density: f64,
+    /// Highest frequency sampled, rad/s.
+    ///
+    /// Has to be past where the damping has died, and for a yacht that is
+    /// further than ship experience suggests: a narrow section reaches a given
+    /// reduced frequency only at a high `ω`.
+    pub top_frequency: f64,
+    /// Number of frequencies sampled.
+    pub samples: usize,
+    /// How the sectional radiation problem is solved.
+    pub tasai: TasaiOptions,
+    /// How the time integral of Ogilvie's relation is taken.
+    pub transform: TransformOptions,
+    /// How the memory is fitted.
+    pub memory: MemoryOptions,
+}
+
+impl Default for RadiationOptions {
+    fn default() -> Self {
+        Self {
+            density: SEA_WATER_DENSITY,
+            top_frequency: 30.0,
+            samples: 120,
+            tasai: TasaiOptions::default(),
+            transform: TransformOptions::default(),
+            memory: MemoryOptions {
+                order: 5,
+                ..MemoryOptions::default()
+            },
+        }
     }
 }

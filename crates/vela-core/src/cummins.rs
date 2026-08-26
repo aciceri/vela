@@ -114,19 +114,37 @@ impl Spectrum {
         &self.frequencies
     }
 
+    /// The sampled added mass, in the caller's units.
+    #[must_use]
+    pub fn added_mass(&self) -> &[f64] {
+        &self.added_mass
+    }
+
+    /// The sampled damping, in the caller's units.
+    #[must_use]
+    pub fn damping(&self) -> &[f64] {
+        &self.damping
+    }
+
     /// The frequency at which damping is greatest, rad/s.
     ///
     /// Used as the natural scale of the problem: the fit below is done in
     /// frequency normalised by this, because a sixth-degree polynomial in a
     /// variable that ranges to 30 has a condition number that ruins a least
     /// squares, and one in a variable of order 1 does not.
+    ///
+    /// Taken on the *magnitude* of the damping, because a coupling coefficient
+    /// is legitimately negative throughout — `B₃₅` for a hull whose added mass
+    /// sits aft of the origin is negative at every frequency — and the largest
+    /// signed value of such a spectrum is wherever it is closest to zero, which
+    /// is the opposite of the scale wanted.
     #[must_use]
     pub fn peak_frequency(&self) -> f64 {
         let mut best = self.frequencies[0];
         let mut largest = f64::NEG_INFINITY;
         for (&frequency, &damping) in self.frequencies.iter().zip(self.damping.iter()) {
-            if damping > largest {
-                largest = damping;
+            if damping.abs() > largest {
+                largest = damping.abs();
                 best = frequency;
             }
         }
@@ -551,6 +569,14 @@ impl FluidMemory {
 
     /// Worst negative real part of the fitted response, relative — zero for a
     /// passive model.
+    ///
+    /// Meaningful only for a **diagonal** coefficient. Damping cannot be negative
+    /// in a mode taken by itself, so a negative real part there means the fitted
+    /// water would drive the boat. A *coupling* coefficient carries no such
+    /// requirement: `B₃₅` is negative at every frequency for a hull whose added
+    /// mass sits aft of the origin, and what has to be positive semi-definite is
+    /// the damping matrix, not its entries. Reading this on a coupling fit and
+    /// concluding something is wrong would be a mistake.
     #[must_use]
     pub fn passivity_violation(&self) -> f64 {
         self.passivity_violation

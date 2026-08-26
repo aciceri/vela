@@ -168,31 +168,46 @@ pub fn heave_pitch_coefficients(
     })
 }
 
-/// Samples the hull's heave added mass and damping across a frequency grid.
+/// Samples all three vertical coefficients across a frequency grid.
+///
+/// Returns the spectra of `A₃₃/B₃₃`, `A₃₅/B₃₅` and `A₅₅/B₅₅` in that order, from
+/// one pass of section solves — the three share every solve, so computing them
+/// separately would triple the cost for nothing.
 ///
 /// The grid has to reach far enough out that the damping has genuinely died,
 /// because everything downstream transforms it as though it continued to
 /// infinity. For a yacht that is further than ship experience suggests — see
 /// [`crate::cummins::Spectrum`], which is what this feeds.
 ///
-/// Returns `None` if any frequency has no solution, or the grid is not a valid
-/// spectrum.
+/// Returns `None` if any frequency has no solution, or a grid does not make a
+/// valid spectrum.
 #[must_use]
-pub fn heave_spectrum(
+pub fn vertical_spectra(
     strips: &[Strip],
     frequencies: &[f64],
     density: f64,
     gravity: f64,
     solver: &SectionSolver,
-) -> Option<Spectrum> {
-    let mut added_mass = Vec::with_capacity(frequencies.len());
-    let mut damping = Vec::with_capacity(frequencies.len());
+) -> Option<(Spectrum, Spectrum, Spectrum)> {
+    let count = frequencies.len();
+    let mut heave = (Vec::with_capacity(count), Vec::with_capacity(count));
+    let mut coupling = (Vec::with_capacity(count), Vec::with_capacity(count));
+    let mut pitch = (Vec::with_capacity(count), Vec::with_capacity(count));
     for &frequency in frequencies {
         let solved = heave_pitch_coefficients(strips, frequency, density, gravity, solver)?;
-        added_mass.push(solved.added_mass_heave);
-        damping.push(solved.damping_heave);
+        heave.0.push(solved.added_mass_heave);
+        heave.1.push(solved.damping_heave);
+        coupling.0.push(solved.added_mass_coupling);
+        coupling.1.push(solved.damping_coupling);
+        pitch.0.push(solved.added_mass_pitch);
+        pitch.1.push(solved.damping_pitch);
     }
-    Spectrum::new(frequencies.to_vec(), added_mass, damping).ok()
+    let grid = frequencies.to_vec();
+    Some((
+        Spectrum::new(grid.clone(), heave.0, heave.1).ok()?,
+        Spectrum::new(grid.clone(), coupling.0, coupling.1).ok()?,
+        Spectrum::new(grid, pitch.0, pitch.1).ok()?,
+    ))
 }
 
 #[cfg(test)]

@@ -137,6 +137,35 @@ impl RigidBody {
         Ok(())
     }
 
+    /// Adds a hydrodynamic added-mass matrix and refactorizes.
+    ///
+    /// This is where added mass belongs, and the reason is a stability one rather
+    /// than a matter of taste. Added mass multiplies acceleration, so treating it
+    /// as a force means computing a force from the acceleration the same step is
+    /// about to produce. Explicit schemes handle that by using the *previous*
+    /// step's acceleration, which for a yacht in heave — where the added mass is
+    /// several times the hull's own — is a feedback loop that diverges. In the
+    /// mass matrix it is exact, unconditional, and paid once.
+    ///
+    /// `added` is the infinite-frequency added mass in the body frame about the
+    /// body origin, in the same generalized ordering as
+    /// [`RigidBody::mass_matrix`]. Only the entries a caller has actually
+    /// computed need be non-zero: the matrix is added, not replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MassError::InvalidInertia`] if the sum is not positive definite.
+    /// That is a real failure and not a numerical nicety — an indefinite mass
+    /// matrix accelerates a boat against the force applied to it — and it is the
+    /// reason this returns a `Result` rather than asserting.
+    pub fn add_added_mass(&mut self, added: Matrix6<f64>) -> Result<(), MassError> {
+        let combined = self.mass_matrix + added;
+        let factorization = combined.cholesky().ok_or(MassError::InvalidInertia)?;
+        self.mass_matrix = combined;
+        self.factorization = factorization;
+        Ok(())
+    }
+
     /// Weight as a body-frame wrench about the body origin.
     ///
     /// Gravity is uniform, so it exerts no moment about the CoG — but it does

@@ -25,6 +25,7 @@
 pub mod buoyancy;
 pub mod hull;
 pub mod lateral;
+pub mod radiation;
 pub mod sails;
 
 pub use buoyancy::Buoyancy;

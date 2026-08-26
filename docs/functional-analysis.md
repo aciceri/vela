@@ -399,8 +399,90 @@ statement about the estimator.
 The whole pipeline, sweep included, is 0.34 s for the YD-41 and is paid once at
 load. Per step the simulation evaluates a four-by-four matrix-vector product.
 
-What remains: sway and roll sections for the other modes, and the viscous roll
-damping below, which is the larger gap for how a boat feels.
+#### 5.3d Viscous roll damping: Ikeda does not apply to this hull
+
+The plan named Ikeda's semi-empirical method as the source for the viscous roll
+damping that potential theory misses. It was read, measured against what the
+engine already has, and **not implemented**. The reasons are specific.
+
+Ikeda decomposes the viscous coefficient into five components. Taken one at a
+time, for a sailing yacht:
+
+- **Bilge keels** (`B44K`): a yacht has none. Not applicable.
+- **Forward-speed correction on potential roll damping** (`B44S`): multiplies a
+  potential roll damping this engine does not yet compute — the roll sections are
+  not written. Nothing to correct.
+- **Friction** (`B44F`): computed for the YD-41 rather than assumed. Kato's
+  formulation gives `S_f = L(1.7 D + C_B B) = 23.2 m²`, which agrees with the
+  22.3 m² the mesh integration reports — a good sign the transcription is right.
+  With `r_f = 0.78 m` the quadratic coefficient is about 90 kg·m², so at a roll
+  rate of 0.2 rad/s the moment is **3.6 N·m against the 700 N·m the appendage
+  model already produces**. Half a per cent. Implementing it would be adding a
+  term below the noise of the terms around it.
+- **Lift** (`B44L`): the hull's own lift-based damping. For a yacht this is the
+  small brother of the appendages' — keel span 1.9 m against 0.40 m of canoe
+  draft — and the appendage version is already in place and tested.
+- **Eddy making** (`B44E`): the one component that would matter, since the source
+  notes it *"decreases rapidly with the forward speed"* and low speed is where the
+  present model is weakest. It is also the one that cannot be transcribed.
+
+**Why the eddy term cannot be transcribed.** It needs an angle
+
+```text
+ψ₂ = 0.5 / cos( a₁(1 + a₃) / 4a₃ )        as printed
+```
+
+which is not an angle, and oscillates without meaning as `a₃ → 0`. The physical
+reading is `0.5 · arccos(·)` — the source's typesetting having lost the inverse.
+But with `arccos` the argument must lie in `[-1, 1]`, and it does not: evaluated
+on the seventeen stations of the YD-41 it ranges from **1.8 to 11.3**, every one
+out of range. The argument goes as `a₁/4a₃`, and a shallow wide section has `a₃`
+small and *positive* (0.018 to 0.041 here).
+
+That is not bad luck, it is the envelope. The containership section of §3.4 has
+`a₃ = -0.1136` and gives an argument of `-0.295` — comfortably in range. So the
+method's domain is ship sections, exactly as the source warns when it says it *"is
+not always accurate sufficiently"* for *"ships with a very large breadth to draft
+ratio"*. The YD-41 canoe body is `B/D = 7.9`.
+
+Two readings, both unusable, no oracle to choose between them, and a hull outside
+the envelope either way. Writing it would produce the first unverifiable number in
+this engine.
+
+**What would unblock it**: Ikeda, Himeno & Tanaka (1978) in the original, which
+would settle the expression and state the clamp; or any implementation with
+tabulated output to check against.
+
+**What the real roll gap is**, now that this has been measured: not the hull but
+the appendages at high incidence. At rest the appendage model still produces
+lift at an effective angle of attack near 90°, and its damping there is
+quadratic in roll rate — the right *shape* — but roughly eight times a
+flat-plate estimate. That is the term worth fixing, and it needs a source for
+the limiting behaviour rather than an invented stall angle.
+
+#### 5.3e Status: wired in
+
+`assembly::vertical_motion_sim` builds the whole chain from a boat file: sections,
+sweep, transform, fit, `A_∞` into the mass matrix via
+`RigidBody::add_added_mass`, and the memory as a force module. Heave and pitch
+free, everything else restrained and no sails — a deliberately narrow rig,
+because the vertical modes are the only ones whose radiation this engine can
+compute, and a general assembly would be quietly missing terms in four degrees
+of freedom.
+
+**A pushed hull now settles.** Six seconds after a 0.1 m displacement the YD-41
+is within 2 cm of its waterline, and the logarithmic decrement over the first
+cycle puts the damping ratio in the band the frequency domain predicted. Before
+this, hydrostatic stiffness was conservative and nothing in the vertical modes
+removed energy at all.
+
+Two things the integration test caught that the unit tests could not: the boat
+has to be allowed to find its own flotation before being perturbed — measuring
+against the origin measures sinkage, which made a 0.1 m push look like 0.4 m of
+leftover motion — and this mode is damped hard enough that only one clean peak
+follows the release, so the release point itself has to serve as the first.
+
+What remains for the phase: sway and roll sections for the other modes.
 
 ### 5.4 Appendages: keel and rudder
 
