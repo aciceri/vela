@@ -492,6 +492,18 @@ Seakeeping / time-domain:
 - <a id="bib-pf2009"></a>Perez & Fossen, "A Matlab toolbox for parametric identification of radiation-force models of ships and offshore structures", MIC 2009.
 - <a id="bib-taghipour"></a>Taghipour, Perez & Moan, "Hybrid frequency-time domain models for dynamic response analysis of marine structures", Ocean Engineering 2008. https://www.researchgate.net/publication/223453652
 - <a id="bib-mss"></a>MSS — Marine Systems Simulator (Fossen & Perez), reference implementation. https://github.com/cybergalactic/MSS
+- <a id="bib-lewis1929"></a>Lewis, F.M., "The Inertia of Water Surrounding a Vibrating Ship", Transactions SNAME 1929 — the two-parameter conformal mapping.
+- <a id="bib-jm2001"></a>Journée, J.M.J. & Massie, W.W., *Offshore Hydromechanics*, 1st ed., Delft University of Technology, 2001. §7.3 has the Lewis mapping (eq. 7.88–7.95, transcribed in `lewis.rs`) and the Ursell-Tasai treatment. https://ocw.tudelft.nl/wp-content/uploads/OffshoreHydromechanics_Journee_Massie.pdf
+- <a id="bib-seaway"></a>Journée, J.M.J., *Theoretical Manual of SEAWAY (Release 4.19)*, Ship Hydromechanics Laboratory, Delft, **Report 1216a**, 2001. The Tasai algorithm in implementable form (§4.1), plus viscous roll damping and bilge keels (§9), plus the comparison tables used as oracles. Journée's own site is gone; recovered from the Internet Archive: https://web.archive.org/web/20180328221043if_/http://www.shipmotions.nl/DUT/PapersReports/1216-TheoreticalManualSEAWAY.pdf
+- <a id="bib-seaway-val"></a>Journée, J.M.J., *Verification and Validation of Ship Motions Program SEAWAY*, Delft, Report 1213a, 2001. Archive path: `shipmotions.nl/DUT/PapersReports/1213-ValidationSEAWAY.pdf` — the 2020 capture is a parked-domain page, so an earlier snapshot is needed.
+- <a id="bib-vugts"></a>Vugts, J.H., "The hydrodynamic coefficients for swaying, heaving and rolling cylinders on a free surface", Shipbuilding Laboratory, Delft, Report 112, 1968 — the standard experimental oracle for 2-D sections. Not yet located.
+
+**Note on why these are here.** The primary source of this engine, Larsson,
+Eliasson & Orych, states that added mass and damping are *"out of scope of the
+present book"*, so the seakeeping side needs its own lineage. It is still Delft,
+which keeps it in the same tradition as the hull series. The archive URL is
+recorded because the original host has been sold and now serves a parking page:
+the document is otherwise hard to find again.
 
 DVPP context:
 

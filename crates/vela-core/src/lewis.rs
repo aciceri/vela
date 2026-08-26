@@ -433,4 +433,59 @@ mod tests {
         assert!(station_geometry(&wedge_station(), 0.0).is_none());
         assert!(station_geometry(&wedge_station(), -1.0).is_none());
     }
+
+    /// An external oracle: an independent published computation of the same fit.
+    ///
+    /// Journée, J.M.J., *Theoretical Manual of SEAWAY (Release 4.19)*, Ship
+    /// Hydromechanics Laboratory, Delft, Report 1216a, 2001, §3.4, tables the
+    /// two-parameter Lewis coefficients for the amidships section of a
+    /// container vessel of 25.40 m breadth and 9.00 m draft, whose offsets it
+    /// prints. Its answer is `Ms = 12.2400`, `a1 = +0.1511`, `a3 = -0.1136`.
+    ///
+    /// This is a different kind of check from the half-immersed circle. That one
+    /// verifies the algebra against a case with an analytic answer; this one
+    /// verifies the whole path — offsets in, area integrated, coefficients out —
+    /// against a number somebody else's program produced.
+    ///
+    /// The tolerance is 1 %, and the reason is stated rather than tuned: the
+    /// report interpolates *"33 new offsets at equidistant length intervals on
+    /// the contour"* with a second-degree routine before integrating, while this
+    /// integrates the nine published offsets trapezoidally. The two areas differ
+    /// slightly, and the coefficients follow. Note also that `a3` comes out
+    /// negative for a section this full, which is worth having in a test: a fit
+    /// that assumed a sign would pass every other test in this module.
+    #[test]
+    fn the_fit_matches_an_independently_published_computation() {
+        // Report 1216a, section 3.4: height above the keel against half-breadth.
+        let offsets = [
+            (0.000, 0.000),
+            (0.135, 4.950),
+            (0.270, 9.900),
+            (0.500, 10.960),
+            (1.000, 11.740),
+            (2.000, 12.440),
+            (3.050, 12.700),
+            (6.000, 12.700),
+            (9.000, 12.700),
+        ];
+        let station = Station {
+            x: 0.0,
+            points: offsets.into_iter().map(|(z, y)| Offset { y, z }).collect(),
+        };
+
+        let section = station_geometry(&station, 9.0).expect("the section is immersed");
+        assert_relative_eq!(section.beam, 25.40, max_relative = 1e-12);
+        assert_relative_eq!(section.draft, 9.00, max_relative = 1e-12);
+
+        let form = LewisForm::fit(&section);
+        assert!(
+            !form.clamped,
+            "a containership midship section is well inside the envelope"
+        );
+
+        assert_relative_eq!(form.scale, 12.2400, max_relative = 0.01);
+        assert_relative_eq!(form.a1, 0.1511, max_relative = 0.01);
+        assert_relative_eq!(form.a3, -0.1136, max_relative = 0.01);
+        assert!(form.a3 < 0.0, "a full section maps with a negative a3");
+    }
 }
