@@ -454,9 +454,40 @@
         rudder_at: 0.85,
         mast_at: 6.301,
     ),
+    // Mass. One of these two numbers was wrong and the other was not, and which
+    // was which came out of an experiment rather than an argument.
+    //
+    // `examples/motion_scale` reports the natural periods against what a twelve
+    // metre hull shows: two to three seconds in heave and pitch, three to five in
+    // roll. Heave and pitch were right. Roll was 2.09 s -- faster than a boat this
+    // size reaches, and the reason the simulator read as a wooden model in a
+    // bathtub, since the eye judges size by frequency.
+    //
+    // The obvious suspect was the vertical centre of gravity, at 0.20 m, giving
+    // GM 2.58 m against the 1.2 to 1.8 quoted for the type. **It was tried and the
+    // evidence rejected it.** Raising it to 0.98 m for GM 1.80 -- the stiff edge of
+    // that band -- made the boat heel 38 degrees in a working breeze, dropped
+    // upwind speed from the published 7.5 kn to 5.79, reversed the sign of "more
+    // wind means more speed", and left no sailing equilibrium at all in a strong
+    // breeze. Nine tests failed, including `upwind_performance_matches_the_
+    // published_polar`.
+    //
+    // That is decisive the other way round. A published polar is a measurement of
+    // *this* design; a GM band is a generic figure for a type. GM 2.58 m is what
+    // makes this hull sail the way its polar says it sails, so the stiffness is not
+    // the error -- the yardstick was. This hull's canoe body is shallow for its
+    // displacement and carries a large BM, and a form study is entitled to be an
+    // unusual form.
+    //
+    // The roll gyradius *was* wrong. At 1.25 m it was 0.30 of the beam, against
+    // 0.35 to 0.45 published for a sailing yacht's dry boat with its rig; 1.65 m is
+    // 0.40, the middle. It enters the dynamics and not the flotation, so it moves
+    // the roll period to 3.30 s without touching a single steady-sailing number --
+    // which is exactly why it survived the experiment that the centre of gravity
+    // did not.
     mass: (
         displacement_kg: 6221.0,
         cog: (x: 5.4509, y: 0.0, z: 0.2),
-        gyradii: (rx: 1.25, ry: 2.90, rz: 2.95),
+        gyradii: (rx: 1.65, ry: 2.90, rz: 2.95),
     ),
 )

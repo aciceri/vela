@@ -1452,6 +1452,48 @@ Neither changes a result: the full suite passes unchanged, and it runs in half
 the time, which is the same speedup seen from the other side. Measured at
 59.9 fps / 16.7 ms in the native frontend, against a 60 Hz vsync.
 
+### 7c. Motion scale, and a change the evidence rejected
+
+A separate budget, and the one a viewer complains about first: the simulator
+"moved too much and too fast, like a wooden model in a bathtub". That is a claim
+about **scale**, and scale in ship motions lives in the natural periods, because
+the eye judges size by frequency. `examples/motion_scale` measures them against
+what a twelve metre hull shows.
+
+| | before | after | expected |
+|---|---|---|---|
+| heave period | 2.20 s | 2.20 s | 2.0–3.0 |
+| pitch period | 2.12 s | 2.12 s | 2.0–3.0 |
+| roll period | 2.09 s | **2.49 s** | 3.0–5.0 |
+| sinkage swing, $H_s$ 1.5 m | 2.72 m | **1.98 m** | — |
+
+Heave and pitch were never the problem. Roll was, and the reference boat's file
+carried two candidate causes:
+
+- **Roll gyradius 1.25 m**, which is $0.30\,B$ against $0.35$–$0.45\,B$ published
+  for a sailing yacht's dry boat with its rig. Corrected to 1.65 m, the middle of
+  that range. It enters the dynamics and not the flotation, so it moved the roll
+  period and the coupled sinkage swing without touching a steady-sailing number.
+- **$GM = 2.58$ m**, against 1.2–1.8 quoted for the type. This one was **tried and
+  rejected by the evidence.** Raising the centre of gravity to give $GM = 1.80$ —
+  the stiff edge of the band — heeled the boat 38° in a working breeze, dropped
+  upwind speed from the published 7.5 kn to 5.79, reversed the sign of "more wind
+  means more speed", and left no equilibrium at all in a strong breeze. Nine tests
+  failed, `upwind_performance_matches_the_published_polar` among them.
+
+The second result is worth more than the first. A published polar is a measurement
+of *this* design; a $GM$ band is a generic figure for a type, and where the two
+disagree the measurement of the actual boat wins. So the stiffness is not an error
+in the file — the yardstick was wrong for a hull whose canoe body is this shallow
+for its displacement, and a form study is entitled to be an unusual form.
+
+What remains after both is the **amplitude** in a seaway, not the frequency: trim
+swings roughly twice a real forty-footer's in $H_s = 1.5$ m. §5.4 already names
+both causes and neither is the boat file — no diffraction, so Froude-Krylov
+over-predicts excitation at wavelengths near the hull's own, and no viscous
+damping, so nothing limits the response where the spectrum overlaps the pitch
+resonance. That is the next real piece of physics, not a number to tune.
+
 ---
 
 ## 8. Numerical libraries (constraints, not bindings)
