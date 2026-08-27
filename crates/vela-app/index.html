@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vela</title>
+    <style>
+      /* The canvas takes the whole page and Bevy's fit_canvas_to_parent makes
+         the render target follow it. Without both halves the canvas keeps a
+         fixed pixel size and the window resize does nothing. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #04070c;
+        color: #c8d4e0;
+        font: 14px/1.5 ui-monospace, monospace;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      #status {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-content: center;
+        text-align: center;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">
+      building the boat…
+      <br /><small
+        >the hull is lofted, the radiation model fitted and the sailing
+        condition solved before the first frame</small
+      >
+    </div>
+    <script type="module">
+      import init from "./vela-app.js";
+
+      const started = () => document.getElementById("status")?.remove();
+
+      // Bevy's wasm event loop never returns: winit ends the calling frame by
+      // throwing, and documents the throw in its own message. That arrives here
+      // as a rejection on the *successful* path, so a page that treated every
+      // rejection as a failure would report an error exactly when it worked.
+      const isTheEventLoopStarting = (error) =>
+        String(error?.message ?? error).includes("Using exceptions for control flow");
+
+      init({ module_or_path: "./vela-app_bg.wasm" })
+        .then(started)
+        .catch((error) => {
+          if (isTheEventLoopStarting(error)) {
+            started();
+            return;
+          }
+          // What is left is almost always a missing WebGL2 context or a browser
+          // without one. Saying so beats a blank page.
+          document.getElementById("status").innerHTML =
+            "vela could not start.<br /><small>" +
+            String(error) +
+            "</small>";
+          throw error;
+        });
+    </script>
+  </body>
+</html>

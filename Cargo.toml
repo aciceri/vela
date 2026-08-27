@@ -14,6 +14,31 @@ ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The release profile is the shipping one, and for this project shipping means a
+# download: 79 MB of unstripped Bevy wasm is not a link anyone follows.
+#
+# `strip` is the free half. Nothing reads the debug information — a browser stack
+# trace from a stripped module still names the JS frames, and anyone debugging the
+# physics has `vela-cli` and a native build. Thin LTO and one codegen unit are
+# here for the frame budget rather than the size.
+#
+# `panic = "abort"` is deliberately *not* set: `wasm32-unknown-unknown` has no
+# unwinding to begin with, so it buys nothing where the size matters and only
+# changes native semantics. Measured, not assumed.
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = "debuginfo"
+
+# Dependencies optimised for size, this workspace for speed.
+#
+# The split is the whole point: the 60 Hz budget lives in `vela-core`, and
+# everything expensive per frame — the Cholesky solve, the mesh clip, the wave
+# synthesis — is compiled there. Bevy is glue around it, drawing one boat and a
+# forty-cell water grid, and nothing it does is close to the budget. Paying for
+# its inlining in download size buys frames nobody needs.
+#
+# `"*"` reaches dependencies only, never workspace members, which is exactly the
+# line this wants.
+[profile.release.package."*"]
+opt-level = "s"

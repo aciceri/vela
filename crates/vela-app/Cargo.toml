@@ -1,0 +1,69 @@
+[package]
+name = "vela-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Browser and desktop frontend for the vela sailing yacht physics engine"
+
+[dependencies]
+vela-core = { path = "../vela-core" }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+
+# Pinned to a minor version on purpose, and this is the one dependency decision
+# in the workspace worth arguing about in a comment.
+#
+# Bevy breaks its API every minor release — components are renamed, bundles come
+# and go, shader import paths move. A `0.19` requirement takes patches and
+# refuses `0.20`, which is what keeps a frontend from being rewritten by a
+# `cargo update`. When this moves it should move deliberately, with the
+# migration guide open.
+#
+# Feature set is spelled out rather than taken from `default`, because Bevy's
+# `3d` feature transitively enables `default_platform` — gamepads, clipboard,
+# system-info probing, and both Linux windowing backends — none of which this
+# needs and all of which is compile time. The `*_bevy_render` features are the
+# same graph without that.
+[dependencies.bevy]
+version = "0.19"
+default-features = false
+features = [
+  "default_app",
+  "3d_bevy_render",
+  "ui_bevy_render",
+  "bevy_winit",
+  "default_font",
+  "std",
+]
+
+# Linux windowing backends, and threads. Both backends, because which one a
+# machine runs is not a build-time fact; threads because on a desktop they are
+# free. On the web they are not: `multi_threaded` there wants SharedArrayBuffer,
+# which wants COOP/COEP headers, which static hosting does not send. Asking for
+# them would trade "open the link" for "configure the server", and this engine's
+# frame budget was sized for one thread anyway.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.bevy]
+version = "0.19"
+default-features = false
+features = ["x11", "wayland", "multi_threaded"]
+
+# WebGL2 rather than WebGPU: it is what browsers have today, and the only thing
+# it costs this frontend is storage buffers, which the ocean material is
+# deliberately built without. Swapping in "webgpu" is a one-line change and
+# produces a second binary rather than a more capable one — Bevy documents the
+# two as mutually exclusive at runtime.
+[target.'cfg(target_arch = "wasm32")'.dependencies.bevy]
+version = "0.19"
+default-features = false
+features = ["webgl2"]
+
+# Pinned exactly, and not because this crate calls it: `wasm-bindgen` is half of
+# a matched pair. The generated module and the `wasm-bindgen` CLI that reads it
+# share a schema version and the CLI refuses a mismatch, so the crate has to
+# agree with whatever bundler the environment provides. Here that is nixpkgs,
+# which pins through `flake.lock`, so this is the dependent version rather than
+# the free one. Raise it in step with `wasm-bindgen-cli` in `flake.nix`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.126"
