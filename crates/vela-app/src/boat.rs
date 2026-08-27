@@ -28,6 +28,9 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::Indices;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
+use nalgebra::Vector3;
+use vela_core::aero::Sail;
+use vela_core::flying::Shape;
 use vela_core::TriMesh;
 
 use crate::frame;
@@ -78,34 +81,88 @@ pub fn hull_mesh(hull: &TriMesh) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// A flat triangular sail, in the render frame.
+/// A sail as a cambered surface, in the render frame.
 ///
-/// Two-sided, because a flat sail seen from leeward would otherwise vanish. A
-/// real sail has a windward and a leeward side and this does not model that;
-/// duplicating the triangle with reversed winding is the honest cheap answer.
-fn sail_mesh(tack: Vec3, head: Vec3, clew: Vec3) -> Mesh {
-    let front = [tack, head, clew];
-    let back = [tack, clew, head];
-    let mut positions = Vec::with_capacity(6);
-    let mut normals = Vec::with_capacity(6);
+/// # Why this is not a triangle
+///
+/// It was, and it looked exactly as wrong as it was: a flat sheet stretched on the
+/// IOR triangle. A sail is not flat. It takes a camber and a twist from the sheet,
+/// the traveller, the outhaul, the cunningham and the leech, and the engine already
+/// says what shape a given setting produces — [`vela_core::flying::Shape`] is a
+/// planform with camber, draft and twist distributed up the luff, over a NACA-style
+/// mean line. `Shape::point` is that surface, parametrically, and this walks it.
+///
+/// The shape drawn is therefore the engine's own, driven by the control positions
+/// the player is holding, and not a decorative bulge invented here. The one thing
+/// worth being straight about is that the reference boat sails on the *tabular*
+/// aerodynamic model, which consumes area, aspect ratio and angle and never asks
+/// for a shape. That does not make this fictional: the flying shape is what the
+/// sail does, and the table is a lossy consumer of it chosen because its
+/// coefficients are measured. Drawing the truth and approximating the forces is
+/// the honest way round.
+///
+/// Two-sided, because a sail seen from the leeward side would otherwise vanish.
+/// The two windings get opposed normals, so each face is lit as the surface it is.
+fn sail_mesh(shape: &Shape, tack: Vec3, chords: usize, panels: usize) -> Mesh {
+    // Sampled finely up the luff and coarsely across the chord: twist varies
+    // continuously with height and is the direction the eye reads, while the
+    // chordwise mean line is a smooth arc that eight panels already round off.
+    let station = |along: f64, up: f64| {
+        let point = shape.point(along, up);
+        // `Shape` works in the file frame — x forward, y to starboard, z up from
+        // the tack — and `frame` owns the one conversion to Bevy's axes.
+        tack + frame::to_render(Vector3::new(point.x, point.y, -point.z))
+    };
 
-    for triangle in [front, back] {
-        let normal = (triangle[1] - triangle[0])
-            .cross(triangle[2] - triangle[0])
-            .normalize_or_zero();
-        for vertex in triangle {
-            positions.push(vertex.to_array());
-            normals.push(normal.to_array());
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+
+    for panel in 0..panels {
+        let (low, high) = (
+            panel as f64 / panels as f64,
+            (panel + 1) as f64 / panels as f64,
+        );
+        for chord in 0..chords {
+            let (aft, forward) = (
+                chord as f64 / chords as f64,
+                (chord + 1) as f64 / chords as f64,
+            );
+            let corners = [
+                station(aft, low),
+                station(forward, low),
+                station(forward, high),
+                station(aft, high),
+            ];
+            // Two triangles a quad, then the same two reversed. The normal comes
+            // from the quad's own diagonals rather than from a triangle, so both
+            // halves of a panel are lit alike and the surface reads as cloth
+            // instead of as facets.
+            let normal = (corners[2] - corners[0])
+                .cross(corners[3] - corners[1])
+                .normalize_or_zero();
+            for (winding, sign) in [([0, 1, 2], 1.0), ([0, 2, 3], 1.0)] {
+                for index in winding {
+                    positions.push(corners[index].to_array());
+                    normals.push((normal * sign).to_array());
+                }
+            }
+            for winding in [[0, 2, 1], [0, 3, 2]] {
+                for index in winding {
+                    positions.push(corners[index].to_array());
+                    normals.push((-normal).to_array());
+                }
+            }
         }
     }
 
+    let count = positions.len() as u32;
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(Indices::U32((0..6).collect()))
+    .with_inserted_indices(Indices::U32((0..count).collect()))
 }
 
 /// Spawns the hull, the mast and two sails under one pose entity.
@@ -177,31 +234,34 @@ pub fn spawn(
                 Boom,
             ));
 
-            // Mainsail: `P` up the mast from the boom, `E` aft along it. The two
-            // IOR letters are exactly the triangle, which is the one place in
-            // this file where the drawing and the force model agree by
-            // construction rather than by resemblance.
-            boat.spawn((
-                Mesh3d(meshes.add(sail_mesh(
-                    Vec3::new(rig.mast_at, rig.boom, 0.0),
-                    Vec3::new(rig.mast_at, rig.boom + rig.main_hoist, 0.0),
-                    Vec3::new(rig.mast_at - rig.main_foot, rig.boom, 0.0),
-                ))),
-                MeshMaterial3d(cloth.clone()),
-                Mainsail,
-            ));
-
-            // Headsail: the foretriangle, `I` up the mast and `J` forward of it
-            // to the stemhead. Tack at the sheer, where a deck-swept jib sets.
-            boat.spawn((
-                Mesh3d(meshes.add(sail_mesh(
-                    Vec3::new(rig.mast_at + rig.foretriangle_base, rig.sheer, 0.0),
-                    Vec3::new(rig.mast_at, rig.sheer + rig.foretriangle_height, 0.0),
-                    Vec3::new(rig.mast_at, rig.sheer, 0.0),
-                ))),
-                MeshMaterial3d(cloth),
-                Headsail,
-            ));
+            // The sails, as the engine says they are flying.
+            //
+            // `sail_shapes` derives each planform from the rig's own letters — `P`
+            // and `E` for the main, `√(I²+J²)` and `LPG` for the jib — so the
+            // drawn sail is still exactly the size the force model is sailing.
+            // What it adds is the camber and twist the current control positions
+            // produce, which is the difference between a sail and a sheet of
+            // plywood.
+            //
+            // A boat whose file carries no flying-shape block gets nothing here
+            // rather than a fabricated bulge. That is the right failure: the
+            // engine has no opinion about that sail's shape, and neither should
+            // this.
+            for (sail, tack, shape) in
+                vela_core::assembly::sail_shapes(&engine.spec, *engine.sim.controls())
+            {
+                let tack = Vec3::new(tack.x as f32, rig.sheer + tack.z as f32, -(tack.y as f32));
+                let mesh = Mesh3d(meshes.add(sail_mesh(&shape, tack, 8, 14)));
+                match sail {
+                    Sail::Main => {
+                        boat.spawn((mesh, MeshMaterial3d(cloth.clone()), Mainsail));
+                    }
+                    Sail::Jib => {
+                        boat.spawn((mesh, MeshMaterial3d(cloth.clone()), Headsail));
+                    }
+                    _ => {}
+                }
+            }
         });
 }
 

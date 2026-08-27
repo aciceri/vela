@@ -32,7 +32,7 @@ use crate::boat::{
 use crate::controls::Controls;
 use crate::cummins::{MemoryError, MemoryOptions, TransformOptions};
 use crate::env::Environment;
-use crate::flying::{Planform, Response};
+use crate::flying::{Planform, Response, Shape};
 use crate::geometry::Point;
 use crate::lewis::{station_geometry, LewisForm};
 use crate::loft::{loft_hull, LoftOptions};
@@ -246,6 +246,48 @@ fn sail_plan_of(rig: &RigSpec) -> BalanceSailPlan {
         main_foot: rig.main_foot,
         boom_above_sheer: rig.boom_above_sheer,
     }
+}
+
+/// Each sail's flying shape at a control setting, with the tack it hangs from.
+///
+/// # Why this is public
+///
+/// A sail is not flat. It takes a camber and a twist from the sheet, the traveller,
+/// the outhaul, the cunningham and the leech, and [`crate::flying::Shape`] is the
+/// engine's statement of what shape a given setting produces. This exposes that
+/// statement so a renderer can *draw* it, rather than deriving a second version
+/// of the same geometry and drifting from this one — the same reason
+/// [`crate::seaway::Seaway::waves`] is public.
+///
+/// It is worth being precise about what a caller is getting, because the boat this
+/// engine ships with sails on the **tabular** aerodynamic model, and that model
+/// consumes only area, aspect ratio and angle: it never asks for a shape. That
+/// does not make the shape fictional. The flying shape is what the sail does; the
+/// tabular model is a lossy consumer of it, chosen because its coefficients are
+/// measured. Drawing the shape and integrating the table is drawing the truth and
+/// approximating the forces, which is the honest way round — the dishonest one
+/// would be to draw a flat triangle because the approximation cannot see the
+/// camber.
+///
+/// Returns the sails the geometric model would carry, in file order: the main and
+/// the jib, and only those the boat file describes well enough to build. Empty for
+/// a boat with no rig or no flying-shape block, which is a boat whose sails cannot
+/// be drawn any better than as triangles.
+///
+/// Tacks are in the **file** frame — `x` forward, `z` up from the sheer — which is
+/// the frame the rig's own dimensions are quoted in, not the body frame.
+#[must_use]
+pub fn sail_shapes(spec: &BoatSpec, controls: Controls) -> Vec<(Sail, Point, Shape)> {
+    let Some(rig) = spec.rig else {
+        return Vec::new();
+    };
+    sail_members(&rig, spec.sail_shapes.as_deref().unwrap_or_default())
+        .into_iter()
+        .map(|(sail, member)| {
+            let shape = member.response.shape(member.planform, controls.shape);
+            (sail, member.tack, shape)
+        })
+        .collect()
 }
 
 /// Turns a boat file's flying-shape block into members the geometric model can

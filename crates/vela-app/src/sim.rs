@@ -85,6 +85,13 @@ pub struct Engine {
     /// Held rather than re-parsed so that the frontend draws the rig the force
     /// model is using, and so that nothing here has to invent a mast height.
     pub rig: RigSpec,
+    /// The parsed boat file.
+    ///
+    /// Kept so the frontend can ask the engine what shape the sails have taken —
+    /// `vela_core::assembly::sail_shapes` needs the file's flying-shape block, and
+    /// re-parsing it per frame to draw a sail would be absurd. Nothing here reads
+    /// it for anything the engine could answer instead.
+    pub spec: BoatSpec,
     /// Where the mast stands along the hull, m forward of the aft perpendicular.
     ///
     /// `None` for a boat whose file declares no layout — which is also the boat
@@ -179,6 +186,7 @@ impl Engine {
             hull,
             rig,
             mast_at: spec.layout.map(|layout| layout.mast_at),
+            spec,
             sea: Some(realisation),
             balanced_helm: helm.rudder_angle,
         })
