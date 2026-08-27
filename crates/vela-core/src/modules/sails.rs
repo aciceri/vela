@@ -42,17 +42,14 @@
 //!
 //! # Known gaps, all inherited and none patched over
 //!
-//! - **No longitudinal centre of effort, hence no yaw moment.** Fig 8.19 gives
-//!   the centres of effort as *heights* only; the boat data carries no
-//!   longitudinal position for the mast, exactly as [`crate::sim::Captive`]
-//!   says of the keel and the rudder. So the centre of effort is placed on the
-//!   body `z` axis, in the athwartships plane through the origin, and this
-//!   module's yaw moment is identically zero. Inventing a lead here would
-//!   fabricate a yaw balance out of nothing, and a fabricated yaw balance is
-//!   invisible in a trajectory that looks like sailing.
-//! - **No heel correction on the apparent wind angle**, as
-//!   [`crate::sim::StepCtx::apparent_wind_at`] records: sail forces at large
-//!   heel are overestimated.
+//! - **The longitudinal centre of effort is a layout datum, not a coefficient.**
+//!   Fig 8.19 gives the centres of effort as *heights* only, so where the rig
+//!   sits along the hull cannot come from the force model: it arrives through
+//!   [`Sails::at`] from the boat file's `layout` block. A file that omits the
+//!   block leaves it at zero and this module's yaw moment vanishes — which is
+//!   why [`crate::sim::Captive`] holds yaw for exactly those boats, rather than
+//!   integrating a fabricated lead that would be invisible in a trajectory that
+//!   looks like sailing.
 //! - **Under bare poles the centre of effort collapses to the freeboard**,
 //!   because [`crate::aero`] does not locate the centre of pressure of mast and
 //!   topsides. The windage force is right; its arm understates the mast.

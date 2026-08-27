@@ -1286,6 +1286,98 @@ in recent literature with sub-3% volume error at 60 Hz
 radiation model of §5.3 so that the 6-DOF response in waves is properly damped —
 the piece game implementations fake with tuned drag.
 
+
+### 5.5a Status: the boat sails in waves, and two restraints were wrong
+
+`vela_core::assembly::sailing_sim` is the assembly where the two halves of this
+engine meet: the four sailing modules, both radiation sets, and a hull free to
+heave, roll and pitch under a passing wave. It is the only one that has both a
+rig and a sea.
+
+**The Froude-Krylov force needed no new code, which is the point of §5.5.**
+`hydrostatics_on` already clipped against `FreeSurface::depth` and loaded with
+`FreeSurface::pressure_head`; `Seaway2D` already answered both. A wave excites
+the hull through the same pressure integral that floats it, and still water is
+the degenerate case where the two questions have one answer — not a separate
+path. Added resistance in waves arrives the same way, as the longitudinal
+resultant of a pressure integral over a surface that is no longer flat, rather
+than as a coefficient.
+
+**The encounter frequency is not modelled — it happens.** Pressure is integrated
+over whichever triangles are under the instantaneous surface at the boat's own
+world position, so a boat driving into a head sea meets crests faster than one
+running with them and nothing in the code knows its speed relative to the waves.
+There is no Doppler term to get wrong because there is no Doppler term. What is
+absent is the forward-speed dependence of the radiation *coefficients*: strip
+theory here solves stationary sections, so the damping is the zero-speed one and
+motions are if anything larger than they should be.
+
+#### The restraint was in the wrong place
+
+Mounting radiation exposed a defect that had been invisible for as long as the
+time-domain path went unexercised with a captive mode. `Captive` cancelled a held
+mode's *velocity* after the integrator had run. That is not equivalent to holding
+it: the mass matrix couples modes — through `-m S(r)` whenever the centre of
+gravity is off the origin, and far more strongly through added mass — so an
+unbalanced force on a held mode accelerates the **free** ones, and deleting the
+held mode's own motion afterwards leaves that behind.
+
+On the YD-41 the heave-pitch added mass is `A₃₅ ≈ -4 × 10⁴ kg·m` against a
+displacement of 6221 kg. A yacht held in pitch carries an unbalanced trim moment,
+because no equation balanced it; that moment drove a heave acceleration of
+**0.42 m/s²** at a state whose heave residual was `7 × 10⁻¹⁰`. The boat rose until
+it had bought an equal and opposite buoyancy error and then sat there, in a steady
+state carrying **21.8 % of its weight** in unbalanced vertical force — reported by
+the telemetry and denied by the motion, which is the exact shape of error this
+engine is built to make impossible.
+
+The fix is the reduced system of the constrained dynamics: held rows and columns
+of the mass matrix become the identity, held rows of the right-hand side become
+zero, and `M_ff` is inverted alone. Held accelerations come out as exactly zero
+rather than as something small, and the constraint force is not computed because
+nothing needs it — the applied wrench on a held mode stays visible, which is what
+a captive measurement is for.
+
+#### The solved condition was sinking
+
+The velocity prediction's unknowns are body-frame surge and sway, and a body frame
+at `φ` of heel is tilted. Leaving the body heave velocity at zero gave the boat a
+*world* vertical velocity of `v sin φ` — 16 cm/s of sinking at 19° of heel — and a
+boat that is sinking is not in steady sailing however well its forces balance.
+
+It was not harmless. The horizontal speed the resistance regressions are handed is
+measured in the world: at zero body heave its athwartships part is `v cos φ`, and
+at true steady state it is `v / cos φ`. The two differ by `tan²φ`, which moved the
+solved speed by **1.7 %**. `state_of` now places the heave velocity so the world
+vertical velocity vanishes, and `Equilibrium::speed` is read off the state through
+the one definition of speed through the water this engine has rather than rebuilt
+from the unknowns.
+
+#### What the cross-check now says
+
+Released at the helm-balanced solution under the same restraint, the time-domain
+run holds it: heel and sinkage agree to five and four significant figures, and the
+total applied wrench settles to **(-0.45, -0.08, -0.08) N** on a 61 kN boat. The
+water's memory is passive at a steady state, as it must be. §11 phase 4's promise
+that a long run and the solver check each other is kept, and it is a test.
+
+#### What a seaway exposes next
+
+A boat with a fixed rudder has **no course stability**: the helm is solved to
+balance yaw at one state, and the moment it trims or a wave hits it the balance
+moves, with nothing steering. In a calm that costs nearly 40 % of the boat speed
+over a minute. `vela-cli seaway` therefore holds the heading the way a towing tank
+holds a model, and `--free-helm` releases it.
+
+The dominant error in waves is **§5.4's missing foil stall**, and it is worse than
+a missing clamp. The appendage lift is linear in angle of attack, and the angle at
+the keel includes the roll rate times its arm: as waves slow the boat that ratio
+grows without bound. Measured keel lift coefficient in a 1 m head sea reaches
+**11.7**, where a real foil stalls near 1.2 — a runaway, since the induced drag it
+charges slows the boat further. `vela-cli seaway` reports the worst coefficient and
+says so when the run has left the envelope. Until a stall model lands, seaway
+*motions* are usable and the seaway *speed loss* is not.
+
 ---
 
 ## 6. Waves and sea surface
@@ -1432,9 +1524,11 @@ What the phase also produced, recorded because they are properties of the
 - Buoyancy from a clipped mesh has a derivative sized by the triangles, not by
   floating point: a perturbation moving the waterline by microns differentiates
   the discretization.
-- There is **no damping in heave or roll** until phase 4, so steady sailing is
-  solved rather than integrated. This is the one place where the phase order
-  costs something real, and it is a solver, not a fudge.
+- Until phase 4 there was **no radiation damping in heave or roll**, so steady
+  sailing had to be solved rather than integrated. That is now a choice rather
+  than a necessity: `assembly::sailing_sim` mounts the memory and a long run
+  settles, and §5.5a records the two fixes it took to make the two routes agree.
+  The solver stays because a polar wants a hundred conditions, not one.
 
 ---
 
@@ -1445,7 +1539,7 @@ What the phase also produced, recorded because they are properties of the
 | 1 | Boat sails on flat water, playable | DSYHS hull + EKM appendages + tabular sail coefficients (Hazen/ORC-style), 6-DOF, wind shear |
 | 2 | Physical sail trim | VLM (§4.1a) + flying shape (§4.3a) + blending (§4.2a) + control mapping (§4.5), assembled and wired behind `ForceModule` (§4.6) — **the chain sails a boat**, and is opt-in until two named gaps close: the hull endplate image, and holding the wake fixed across an equilibrium solve |
 | 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle |
-| 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation — **done for five of six modes**; surge and viscous roll damping stated as absent in §5.3j |
+| 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation — **a boat sails in waves** (`sailing_sim`, §5.5a), and the long run now agrees with the solver; surge radiation and viscous roll damping absent (§5.3j), diffraction absent, and §5.4's missing foil stall is the dominant error in a seaway |
 
 Rationale: phase 1 produces a testable sailing boat in weeks; every later phase
 replaces one force component behind a stable interface and is validated against

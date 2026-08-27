@@ -61,7 +61,7 @@ pub mod wrench;
 
 pub use boat::{BoatSpec, SpecError};
 pub use controls::Controls;
-pub use env::{Environment, StillWater, UniformWind};
+pub use env::{Environment, Seaway2D, StillWater, UniformWind};
 pub use geometry::{Tri, TriMesh};
 pub use hydrostatics::{Flotation, FlotationError, Hydrostatics, Water};
 pub use loft::{loft_hull, LoftOptions};

@@ -27,43 +27,38 @@
 //! There are two descriptions of the water surface in this engine, and this
 //! module is exactly where they meet:
 //!
-//! - [`crate::hydrostatics`] integrates against the **flat world plane
-//!   `z = 0`**, and depends on that flatness twice: the pressure it integrates
-//!   is `ρ g z` with no unsteady term, and the waterplane lid can be left
-//!   ungenerated only because it is coplanar with the world origin and lies
-//!   where `p = 0`.
-//! - [`crate::env::Environment::depth`] is the **general signed-depth
-//!   surface** — positive below, negative above, zero on it — which a wave
-//!   field will supply.
+//! - [`crate::env::Environment::depth`] says **what is wet**: signed depth,
+//!   positive below the surface, negative above, zero on it.
+//! - [`crate::env::Environment::pressure_head`] says **what the load is**, and
+//!   it is not the same question. The dynamic part of a wave's pressure dies
+//!   away with depth as `e^(-kz)`, so a deeply immersed section feels far less
+//!   of a passing wave than its depth below the instantaneous surface suggests.
 //!
-//! Today the two agree exactly. The water is still, so `depth` returns the
-//! world `z` of the point and the flat plane *is* the free surface; calling
-//! `hydrostatics` here is not an approximation. But that agreement is a
-//! property of still water, not a property of this module, and it is worth
-//! being explicit about which of the two is being relied on.
+//! Both are handed to [`crate::hydrostatics::hydrostatics_on`] as one
+//! [`FreeSurface`], which clips against the first and integrates the second.
+//! **That is the Froude-Krylov force**: a wave changes the wetted geometry and
+//! the pressure field within it, and the same integral that floats the boat
+//! carries both. Nothing here is a wave-specific term — there is no wave-specific
+//! term to add.
 //!
-//! The generalisation path runs through [`crate::clip`], whose signed-depth
-//! closure is already the right shape: clipping against `|p| env.depth(p, t)`
-//! instead of `|p| p.z` gives the wetted geometry under a wave, and the
-//! pressure integral then needs the incident-wave pressure in place of `ρ g z`.
-//! Both changes live *inside* `hydrostatics`. This module's interface does not
-//! move — `step` would call the same function with the same arguments.
+//! In still water `pressure_head` is the depth and the two questions have one
+//! answer, so a calm is not a special case of this module but the degenerate
+//! case of the general one. That is what keeps the flat-water tests meaningful.
 //!
-//! # What is therefore missing today
+//! # What is missing
 //!
-//! **The Froude-Krylov force of an incident wave.** A passing wave changes both
-//! the wetted geometry and the pressure field within it, and neither effect is
-//! present here. In flat water that absence costs nothing; in a seaway it is
-//! the dominant wave-exciting force, so any seakeeping result obtained from
-//! this module as it stands is not a seakeeping result. It is deliberately not
-//! implemented and deliberately not approximated: a plausible stand-in would be
-//! indistinguishable from the real term inside a total, which is the one kind
-//! of error this engine has no way to catch.
+//! **Diffraction.** The pressure integrated here is the *incident* wave's, as
+//! though the hull were not there. A real hull scatters the wave it sits in, and
+//! that scattered field exerts its own force. For a hull short against the wave
+//! — which is where a yacht spends most of its life — the incident part
+//! dominates and this is the standard approximation. It is absent rather than
+//! approximated: a plausible stand-in would be indistinguishable from the real
+//! term inside a total, which is the one kind of error this engine has no way to
+//! catch.
 //!
-//! Diffraction and radiation are absent for the same reason and belong
-//! elsewhere in any case — radiation is its own module with its own memory
-//! states and its own added-mass contribution, not a correction to
-//! hydrostatics.
+//! **Radiation** is absent here too, and belongs elsewhere in any case: it is
+//! its own module with its own memory states and its own added-mass
+//! contribution, not a correction to a pressure integral.
 //!
 //! Also absent, by ownership rather than by omission:
 //!
@@ -71,7 +66,10 @@
 //!   flat surface is normal to the surface and integrates to a purely vertical
 //!   resultant, so there is no drag to be had here even in principle. The
 //!   canoe body's resistance belongs to [`crate::modules::hull`] and the
-//!   appendages' to [`crate::modules::lateral`].
+//!   appendages' to [`crate::modules::lateral`]. Under a *wave* the surface is
+//!   not flat and the same integral does produce a longitudinal force — which
+//!   is added resistance in waves, arriving as geometry rather than as a
+//!   coefficient.
 //! - **Weight.** [`crate::rigid_body::RigidBody`] owns gravity because it is
 //!   exact. The wrench returned here is buoyancy alone and therefore does
 //!   **not** vanish at equilibrium; it cancels the weight wrench, which this

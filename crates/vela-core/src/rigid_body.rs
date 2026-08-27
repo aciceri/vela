@@ -84,7 +84,12 @@ pub struct Acceleration {
 pub struct RigidBody {
     mass: MassProperties,
     mass_matrix: Matrix6<f64>,
+    /// Cholesky of the **restrained** mass matrix, which equals `mass_matrix`
+    /// when nothing is held. See [`RigidBody::restrain`].
     factorization: Cholesky<f64, Const<6>>,
+    /// Which generalized coordinates are held, in the order surge, sway, heave,
+    /// roll, pitch, yaw.
+    held: [bool; 6],
     gravity: f64,
 }
 
@@ -111,6 +116,7 @@ impl RigidBody {
             mass,
             mass_matrix,
             factorization,
+            held: [false; 6],
             gravity,
         })
     }
@@ -133,8 +139,61 @@ impl RigidBody {
     pub fn set_cog(&mut self, cog: Vector3<f64>) -> Result<(), MassError> {
         let mut mass = self.mass.clone();
         mass.set_cog(cog);
+        let held = self.held;
         *self = Self::with_gravity(mass, self.gravity)?;
+        self.restrain(held);
         Ok(())
+    }
+
+    /// Holds the given generalized coordinates at zero acceleration, in the
+    /// **equations of motion** rather than after them.
+    ///
+    /// # Why this cannot be done afterwards
+    ///
+    /// Cancelling a restrained mode's velocity once the step has been taken
+    /// looks equivalent and is not. The mass matrix couples modes — through
+    /// `-m S(r)` whenever the centre of gravity is off the origin, and far more
+    /// strongly through hydrodynamic added mass — so an unbalanced force on a
+    /// held mode accelerates the *free* ones, and deleting the held mode's own
+    /// motion afterwards leaves that behind.
+    ///
+    /// It is not a small effect. A yacht held in pitch carries an unbalanced
+    /// trim moment, because nothing balanced it; through the heave-pitch added
+    /// mass that moment drives a heave acceleration of order 0.4 m/s², and the
+    /// boat rises until it has bought an equal and opposite buoyancy error. The
+    /// result is a steady state carrying a fifth of the boat's weight in
+    /// unbalanced vertical force, reported by the telemetry and denied by the
+    /// motion — the exact shape of error this engine is built to make impossible.
+    ///
+    /// # What it does
+    ///
+    /// Replaces the held rows and columns of the mass matrix with the identity
+    /// and zeroes the held rows of the right-hand side. The free block `M_ff` is
+    /// then inverted alone, which is the reduced system of the constrained
+    /// dynamics, and the held accelerations come out as exactly zero rather than
+    /// as something small. The constraint force is not computed because nothing
+    /// needs it: the applied wrench on the held modes stays visible in
+    /// [`crate::sim::Sim::last_wrench`] and in the telemetry, which is what a
+    /// captive measurement is *for*.
+    ///
+    /// # Panics
+    ///
+    /// Never. A principal submatrix of a positive definite matrix is positive
+    /// definite and the identity is positive definite, so the restrained matrix
+    /// factorizes whenever the free one does — which construction has already
+    /// established. The `expect` states that theorem rather than returning an
+    /// error no caller could act on.
+    pub fn restrain(&mut self, held: [bool; 6]) {
+        self.held = held;
+        self.factorization = restrained(&self.mass_matrix, held)
+            .cholesky()
+            .expect("a restrained positive definite matrix is positive definite");
+    }
+
+    /// Which generalized coordinates are held.
+    #[must_use]
+    pub fn held(&self) -> [bool; 6] {
+        self.held
     }
 
     /// Adds a hydrodynamic added-mass matrix and refactorizes.
@@ -160,9 +219,12 @@ impl RigidBody {
     /// reason this returns a `Result` rather than asserting.
     pub fn add_added_mass(&mut self, added: Matrix6<f64>) -> Result<(), MassError> {
         let combined = self.mass_matrix + added;
-        let factorization = combined.cholesky().ok_or(MassError::InvalidInertia)?;
+        // Checked on the *unrestrained* sum: an indefinite added mass is a
+        // physical error whether or not the modes it corrupts happen to be held,
+        // and a restraint that hid it would let a bad fit through.
+        combined.cholesky().ok_or(MassError::InvalidInertia)?;
         self.mass_matrix = combined;
-        self.factorization = factorization;
+        self.restrain(self.held);
         Ok(())
     }
 
@@ -203,7 +265,12 @@ impl RigidBody {
         velocity: Vector3<f64>,
         omega: Vector3<f64>,
     ) -> Acceleration {
-        let rhs = applied.to_generalized() - self.inertial_terms(velocity, omega);
+        let mut rhs = applied.to_generalized() - self.inertial_terms(velocity, omega);
+        for (row, held) in self.held.iter().enumerate() {
+            if *held {
+                rhs[row] = 0.0;
+            }
+        }
         let solution = self.factorization.solve(&rhs);
         Acceleration {
             linear: solution.fixed_rows::<3>(0).into_owned(),
@@ -298,4 +365,27 @@ impl RigidBody {
     pub fn mass_matrix(&self) -> &Matrix6<f64> {
         &self.mass_matrix
     }
+}
+
+/// The mass matrix a restrained body inverts: held rows and columns replaced by
+/// the identity.
+///
+/// Zeroing the off-diagonal entries is the whole point — those are the terms
+/// through which a held mode's unbalanced force reaches the free ones. What is
+/// left on the free block is `M_ff` exactly, which is the reduced system of the
+/// constrained dynamics, and the identity on the diagonal makes the held
+/// accelerations come out as zero instead of as a division by nothing.
+fn restrained(matrix: &Matrix6<f64>, held: [bool; 6]) -> Matrix6<f64> {
+    let mut out = *matrix;
+    for (index, is_held) in held.iter().enumerate() {
+        if !is_held {
+            continue;
+        }
+        for other in 0..6 {
+            out[(index, other)] = 0.0;
+            out[(other, index)] = 0.0;
+        }
+        out[(index, index)] = 1.0;
+    }
+    out
 }

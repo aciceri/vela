@@ -138,22 +138,57 @@ pub fn velocity_prediction_sim(
     controls: Controls,
     loft: &LoftOptions,
 ) -> Result<Sim, AssemblyError> {
-    let parameters = spec
-        .hull_parameters()
-        .ok_or(AssemblyError::MissingParameters)?;
-    let appendages = spec.appendages.ok_or(AssemblyError::MissingAppendages)?;
-    let rig = spec.rig.ok_or(AssemblyError::MissingRig)?;
     let hull = spec
         .hull
         .as_ref()
         .ok_or(AssemblyError::MissingHullOffsets)?;
-
     let mesh = loft_hull(hull, loft);
     if mesh.triangle_count() == 0 {
         return Err(AssemblyError::DegenerateHull);
     }
 
     let body = RigidBody::new(spec.mass_properties()?)?;
+    let modules = sailing_modules(spec, mesh)?;
+
+    // Pitch is restrained even when the layout frees yaw. No resistance
+    // component has a published line of action, so the steady trim moment of a
+    // boat under way is missing rather than small, and a calm-water device has
+    // nothing to gain from integrating a mode whose forcing it has not got.
+    // [`sailing_sim`] frees it, for a reason that only exists in a seaway.
+    let captive = if spec.layout.is_some() {
+        Captive {
+            pitch: true,
+            ..Captive::free()
+        }
+    } else {
+        Captive::velocity_prediction()
+    };
+    Ok(Sim::new(body, BodyState::default(), env, modules, controls).with_captive(captive))
+}
+
+/// The four modules a boat sails on: flotation, hull, foils, rig.
+///
+/// Shared so that the calm-water device and the seaway one cannot drift apart in
+/// what a boat is made of. The water's memory is deliberately **not** here — it
+/// is precisely what [`sailing_sim`] adds to [`velocity_prediction_sim`], and a
+/// helper that hid the difference would defeat the point of having both.
+///
+/// Takes the mesh rather than lofting one, because the seaway assembly has
+/// already cut sections from it and a second loft could disagree with the first
+/// about the hull the sections came from.
+///
+/// # Errors
+///
+/// [`AssemblyError`] naming the block of the boat file that is missing.
+fn sailing_modules(
+    spec: &BoatSpec,
+    mesh: crate::geometry::TriMesh,
+) -> Result<Vec<Box<dyn ForceModule>>, AssemblyError> {
+    let parameters = spec
+        .hull_parameters()
+        .ok_or(AssemblyError::MissingParameters)?;
+    let appendages = spec.appendages.ok_or(AssemblyError::MissingAppendages)?;
+    let rig = spec.rig.ok_or(AssemblyError::MissingRig)?;
 
     let keel = keel_of(&appendages);
     let rudder = planform_of(&appendages.rudder);
@@ -199,16 +234,7 @@ pub fn velocity_prediction_sim(
             },
         )),
     ];
-
-    let captive = if layout.is_some() {
-        Captive {
-            pitch: true,
-            ..Captive::free()
-        }
-    } else {
-        Captive::velocity_prediction()
-    };
-    Ok(Sim::new(body, BodyState::default(), env, modules, controls).with_captive(captive))
+    Ok(modules)
 }
 
 /// The sail plan geometry of a rig, for [`crate::balance`].
@@ -565,6 +591,95 @@ pub fn seakeeping_sim(
         pitch: false,
         yaw: false,
     }))
+}
+
+/// A boat that sails, in water that remembers.
+///
+/// [`velocity_prediction_sim`] with the water's memory mounted and the vertical
+/// modes released: the four sailing modules, both radiation sets, and a hull free
+/// to heave, roll and pitch under a passing wave. This is the only assembly in
+/// which the two halves of this engine meet — the rig drives the boat and the sea
+/// moves it, through the same pressure integral.
+///
+/// # What the waves do, and what they do not
+///
+/// The **encounter frequency is not modelled — it happens.** [`Buoyancy`]
+/// integrates pressure over whichever triangles are under the instantaneous
+/// surface at the boat's own world position, so a boat driving into a head sea
+/// meets crests faster than one running with them, and nothing in the code knows
+/// the boat's speed relative to the waves. There is no Doppler term to get wrong
+/// because there is no Doppler term.
+///
+/// What is *not* modelled is the forward-speed dependence of the radiation
+/// coefficients themselves. Strip theory here solves stationary sections, so the
+/// added mass and damping are the zero-speed ones and the classical
+/// speed-correction terms are absent. The damping is therefore understated at
+/// speed — the direction that makes motions larger rather than smaller, which is
+/// at least the direction that shows.
+///
+/// # Which modes are free, and why they differ from both neighbours
+///
+/// **Surge is free here and restrained in [`seakeeping_sim`]**, because
+/// [`CanoeBody`] supplies a surge force where the seakeeping rig has none:
+/// resistance *is* the surge damping, and a far better model of it than a
+/// radiation coefficient would be. Surge added mass is still absent, so the boat
+/// accelerates fore-and-aft a few per cent too readily in a transient, and
+/// steady sailing is untouched.
+///
+/// **Pitch is free here and restrained in [`velocity_prediction_sim`]**, which is
+/// the more interesting reversal. The reason pitch is held in the calm-water
+/// device — no resistance component has a published line of action, so the steady
+/// trim moment is missing — has not gone away. But in a seaway the excitation and
+/// the restoring in pitch are the dominant terms, both come out of the pressure
+/// integral, and holding the mode would delete a boat's principal motion to avoid
+/// a smaller error in its mean attitude. So the mean running trim of this
+/// assembly is wrong by the missing moment, and the motion about it is not.
+///
+/// # The cross-check this unlocks
+///
+/// [`crate::equilibrium`] exists because a boat with no hydrodynamic damping in
+/// heave or roll is an undamped oscillator that never settles, so steady sailing
+/// had to be *solved* rather than reached. With radiation mounted it can be
+/// reached: run this assembly in still water and it converges — and it must
+/// converge to what the Newton solver says. Two independent routes to one answer,
+/// which is the cross-check [`crate::sim`] promises in its own header.
+///
+/// # Errors
+///
+/// As [`velocity_prediction_sim`] and [`seakeeping_sim`] together: a missing
+/// block of the boat file, or [`AssemblyError::Radiation`] if the hull admits no
+/// stable memory model.
+pub fn sailing_sim(
+    spec: &BoatSpec,
+    env: Box<dyn Environment>,
+    controls: Controls,
+    loft: &LoftOptions,
+    options: RadiationOptions,
+) -> Result<Sim, AssemblyError> {
+    let setup = seakeeping(spec, loft, options)?;
+    let (vertical, vertical_mass) = vertical_radiation(&setup, options)?;
+    let (lateral, lateral_mass) = lateral_radiation(&setup, options)?;
+
+    let mut body = RigidBody::new(spec.mass_properties()?)?;
+    // Disjoint blocks, so one call with the sum is the same as two calls, and the
+    // sum is what a single Cholesky has to stay positive definite through.
+    body.add_added_mass(vertical_mass + lateral_mass)?;
+
+    let mut modules = sailing_modules(spec, setup.mesh)?;
+    modules.push(Box::new(vertical));
+    modules.push(Box::new(lateral));
+
+    // Every mode the forces can carry: pitch for the reason above, surge on the
+    // hull's resistance rather than on a radiation coefficient it has not got.
+    let captive = if spec.layout.is_some() {
+        Captive::free()
+    } else {
+        Captive {
+            yaw: true,
+            ..Captive::free()
+        }
+    };
+    Ok(Sim::new(body, BodyState::default(), env, modules, controls).with_captive(captive))
 }
 
 /// The frequencies the radiation problem is solved at: a uniform grid with a

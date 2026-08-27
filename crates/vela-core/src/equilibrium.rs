@@ -3,21 +3,33 @@
 //! # Why a solver and not just a long run
 //!
 //! The engine integrates in time, so the obvious way to find steady sailing is
-//! to start the boat and wait. That does not work yet, and the reason is a
-//! stated gap rather than a bug: **there is no hydrodynamic damping in heave or
-//! roll.** Buoyancy supplies the restoring force, nothing removes energy, and
-//! an undamped oscillator does not settle — it rings at its natural frequency
-//! indefinitely. Radiation damping is what removes that energy in the real
-//! ship, and it arrives with the strip-theory work; until then a time-domain
-//! run cannot converge, and pretending otherwise by adding a damping
-//! coefficient nobody measured would put a fabricated number underneath every
-//! predicted speed.
+//! to start the boat and wait. Both routes now exist, and they are kept for
+//! different reasons rather than one being a stand-in for the other.
 //!
-//! So steady sailing is *solved* instead. This is what a velocity prediction
-//! program has always done, it needs no damping, and it reuses the same force
-//! modules the time-domain loop uses — [`Sim::applied_wrench`] is the residual.
-//! When damping lands, a long run must settle to the same answer this returns,
-//! which makes each a check on the other.
+//! A solver is **cheap and unconditional**. It reaches the answer in a handful
+//! of force evaluations instead of tens of thousands, it needs no damping to get
+//! there, and it cannot be defeated by a mode that rings for longer than the run
+//! — which matters most for the thing this is used for, a polar, where the
+//! answer is wanted at a hundred conditions rather than one. It is also what a
+//! velocity prediction program has always been, which is what makes the
+//! published polars of §10 comparable at all.
+//!
+//! A long run is the **independent check**. Nothing makes a Newton iteration on
+//! four residuals agree with a six-degree-of-freedom body stepped at two hundred
+//! hertz with the water's memory in it, so agreement is a real closure over the
+//! whole stack. It is asserted in `tests/sailing.rs`, and it took two fixes to
+//! get: the restraint had to move into the mass matrix
+//! ([`crate::rigid_body::RigidBody::restrain`]) and the trial state here had to
+//! stop giving the boat a vertical velocity. Until both, the
+//! run walked away from a solution it had been released at.
+//!
+//! The reason the check could not run before is worth keeping: without radiation
+//! there is no hydrodynamic damping in heave, and buoyancy supplies restoring
+//! while nothing removes energy. What damping there is comes from the appendages
+//! — a heaving keel is a foil at incidence — and it is enough to settle a boat in
+//! a calm but not enough to make the settling quick. Radiation is what removes
+//! the energy in the real ship, and [`crate::assembly::sailing_sim`] is the
+//! assembly that mounts it.
 //!
 //! # The system
 //!
@@ -312,11 +324,44 @@ pub fn solve(
 /// Pitch and yaw are held at zero: they are the restrained modes, and letting
 /// the solver move them would be solving for an attitude no equation
 /// constrains.
+///
+/// # Why the heave velocity is not zero
+///
+/// The unknowns are the boat's **body-frame** surge and sway, and a body frame
+/// at `φ` of heel is tilted. Leaving the body heave velocity at zero therefore
+/// gives the boat a *world* vertical velocity of `v sin φ` — sixteen centimetres
+/// a second of sinking at twenty degrees and half a knot of leeway — and a boat
+/// that is sinking is not in steady sailing however well its forces balance.
+///
+/// It is not harmless, because the horizontal speed the resistance regressions
+/// are given is measured in the world: at zero body heave the athwartships part
+/// of it is `v cos φ`, and at true steady state it is `v / cos φ`. The two
+/// differ by `tan²φ`, which is four per cent of the sway term at twenty degrees
+/// and moved the solved speed by nearly two per cent against a time-domain run
+/// of the same boat.
+///
+/// So the heave velocity is whatever makes the world vertical velocity vanish:
+/// `w = -(R₃₁u + R₃₂v) / R₃₃`. With pitch and yaw held at zero the attitude is a
+/// pure roll and that is `-v tan φ`, but it is written against the rotation so
+/// that it stays right if the restrained attitude ever stops being one.
+///
+/// `R₃₃` is `cos φ` here, so it only vanishes with the mast in the water. That is
+/// a knockdown rather than a sailing condition and no heave velocity can hold a
+/// boat level in it, so the degenerate case takes zero rather than an infinity
+/// that would poison every residual downstream.
 fn state_of(unknowns: &Vector4<f64>) -> BodyState {
+    let attitude = UnitQuaternion::from_euler_angles(unknowns[3], 0.0, 0.0);
+    let horizontal = attitude * Vector3::new(unknowns[0], unknowns[1], 0.0);
+    let vertical = (attitude * Vector3::z()).z;
+    let heave = if vertical.abs() < 1e-6 {
+        0.0
+    } else {
+        -horizontal.z / vertical
+    };
     BodyState {
         position: Vector3::new(0.0, 0.0, unknowns[2]),
-        attitude: UnitQuaternion::from_euler_angles(unknowns[3], 0.0, 0.0),
-        velocity: Vector3::new(unknowns[0], unknowns[1], 0.0),
+        attitude,
+        velocity: Vector3::new(unknowns[0], unknowns[1], heave),
         angular_velocity: Vector3::zeros(),
     }
 }
@@ -364,12 +409,18 @@ fn finish(sim: &mut Sim, unknowns: &Vector4<f64>, residual: f64, iterations: usi
     sim.set_state(state.clone());
     sim.applied_wrench(EVALUATION_STEP);
 
-    let surge = unknowns[0];
+    // Speed is read off the state, not rebuilt from the unknowns, because
+    // "speed through the water" has one definition in this engine and it is
+    // [`crate::sim::StepCtx::speed_through_water`]: the horizontal velocity in
+    // the *world*. At heel that is not the norm of the body-frame surge and
+    // sway, and reporting a second answer to the same question is how a polar
+    // and the resistance it was computed from come to disagree.
     let sway = unknowns[1];
+    let speed = state.world_velocity().xy().norm();
     Equilibrium {
         state,
-        speed: (surge * surge + sway * sway).sqrt(),
-        leeway: (-sway).atan2(surge),
+        speed,
+        leeway: (-sway).atan2(unknowns[0]),
         heel: unknowns[3],
         sinkage: unknowns[2],
         residual,

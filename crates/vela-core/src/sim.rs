@@ -327,6 +327,15 @@ impl Captive {
     const fn any_rotation(self) -> bool {
         self.roll || self.pitch || self.yaw
     }
+
+    /// The restraint as the generalized mask [`crate::rigid_body::RigidBody`]
+    /// wants, in the order surge, sway, heave, roll, pitch, yaw.
+    #[must_use]
+    pub const fn held(self) -> [bool; 6] {
+        [
+            self.surge, self.sway, self.heave, self.roll, self.pitch, self.yaw,
+        ]
+    }
 }
 
 /// A boat, its environment, and its force modules, advanced in fixed steps.
@@ -375,9 +384,15 @@ impl Sim {
     ///
     /// The pose is captured here rather than at construction so that a caller
     /// can settle a boat, then restrain it about the attitude it settled at.
+    ///
+    /// The restraint goes into the mass matrix — see
+    /// [`RigidBody::restrain`] for why it has to, and what goes wrong when a
+    /// held mode's force is allowed to reach the free ones through the added
+    /// mass before being cancelled.
     #[must_use]
     pub fn with_captive(mut self, captive: Captive) -> Self {
         self.captive = captive;
+        self.body.restrain(captive.held());
         self.restrained_pose = self.state.clone();
         self
     }
@@ -480,13 +495,25 @@ impl Sim {
         self.time += dt;
     }
 
-    /// Removes the motion of every restrained degree of freedom.
+    /// Anchors the pose of every restrained degree of freedom.
     ///
-    /// Applied after the integrator rather than by zeroing forces before it,
-    /// because a dynamometer does not delete the force a model pushes on it
-    /// with — it absorbs it. The force stays visible in [`Sim::last_wrench`]
-    /// and in the telemetry, which is exactly what a captive measurement is
-    /// for: the restrained mode's residual force is the reading.
+    /// The *dynamics* of the restraint live in the mass matrix
+    /// ([`RigidBody::restrain`]), which is what makes a held mode's
+    /// acceleration exactly zero and stops its unbalanced force leaking into the
+    /// free modes. Two jobs are left over for this, and both are about the pose
+    /// rather than the forces:
+    ///
+    /// - A caller may hand in a state that is already moving in a held mode
+    ///   through [`Sim::set_state`]. Zero acceleration would preserve that
+    ///   velocity forever; the restraint means it should not have one.
+    /// - Zero body-frame pitch rate is **not** a frozen Euler pitch angle. With
+    ///   `φ` of heel and a yaw rate `r`, `θ̇ = q cos φ - r sin φ`, so a boat held
+    ///   at `q = 0` still changes trim as it turns. Rebuilding the attitude from
+    ///   the angles is what actually holds the trim.
+    ///
+    /// The applied wrench on a held mode is never deleted, before or after: a
+    /// dynamometer absorbs a force rather than removing it, and that residual
+    /// reading stays in [`Sim::last_wrench`] and in the telemetry.
     fn enforce_captive(&mut self) {
         let captive = self.captive;
 

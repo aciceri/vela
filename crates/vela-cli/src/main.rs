@@ -12,7 +12,7 @@
 use std::process::ExitCode;
 
 use vela_core::aero::{EffectiveSpan, SailSet, Trim};
-use vela_core::assembly::velocity_prediction_sim;
+use vela_core::assembly::{sailing_sim, velocity_prediction_sim, RadiationOptions};
 use vela_core::balance::{Balance, ExtendedKeel, RigType, SailPlan};
 use vela_core::boat::HullSpec;
 use vela_core::cummins::{FluidMemory, MemoryOptions, TransformOptions};
@@ -22,12 +22,14 @@ use vela_core::flying::Controls as SailTrim;
 use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
 use vela_core::lewis::{area_coefficient_bounds, station_geometry, LewisForm};
+use vela_core::seaway::SeaState;
 use vela_core::sections::{hull_form, FormOptions};
+use vela_core::sim::Captive;
 use vela_core::strip::{self, Strip};
 use vela_core::tasai;
 use vela_core::{
-    loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, Sim, StillWater, TriMesh, UniformWind,
-    Water, SEA_WATER_DENSITY,
+    loft_hull, BoatSpec, Controls, LoftOptions, RigidBody, Seaway2D, Sim, StillWater, TriMesh,
+    UniformWind, Water, SEA_WATER_DENSITY,
 };
 
 /// Knots per metre per second, for reporting only. Nothing in the engine knows
@@ -56,6 +58,9 @@ USAGE:
     vela-cli lewis            <boat.ron> [--waterline M]
     vela-cli radiation        <boat.ron> [--waterline M]
     vela-cli balance          <boat.ron> [--keel-at M] [--mast-at M]
+    vela-cli seaway           <boat.ron> [--tws M/S] [--twa DEG] [--wave-height M]
+                                        [--wave-period S] [--wave-heading DEG]
+                                        [--seconds S] [--seed N]
 
 COMMANDS:
     mesh              Report the lofted physics mesh without solving anything
@@ -68,6 +73,7 @@ COMMANDS:
     lewis             Fit Lewis forms to the stations and check the envelope
     radiation         Heave added mass and damping across frequency
     balance           Where the rig sits relative to the keel
+    seaway            Sail the boat forward in time, in waves, and report its motion
 
 OPTIONS:
     --points N      Contour points per station (default 16)
@@ -80,6 +86,12 @@ OPTIONS:
     --flat F        Flattening factor, 1.0 full (depowers lift, keeps the arm)
     --reef R        Reef factor, 1.0 full sail (depowers area and lowers the arm)
     --waterline M   Waterline height above the baseline (default: design draft)
+    --wave-height M Significant wave height (default 0, a calm)
+    --wave-period S Peak period (default 5)
+    --wave-heading DEG  Direction the waves travel towards (default: a head sea)
+    --seconds S     How long to sail (default 60)
+    --seed N        Phase seed of the sea realisation (default 1)
+    --free-helm     Release the heading: nothing steers, so the boat luffs up
 
 Commands needing geometry require a boat file with hull offsets; commands
 needing form parameters require the parameters block. Most boats have one or
@@ -106,6 +118,18 @@ struct Options {
     keel_at: Option<f64>,
     /// Longitudinal position of the mast, m.
     mast_at: Option<f64>,
+    /// Significant wave height, m. Zero is a calm.
+    wave_height: f64,
+    /// Peak period of the sea, s.
+    wave_period: f64,
+    /// Direction the waves travel towards, radians. `None` is a head sea.
+    wave_heading: Option<f64>,
+    /// How long to integrate, s.
+    seconds: f64,
+    /// Phase seed of the sea realisation.
+    seed: u64,
+    /// Release the heading instead of holding the solved course.
+    free_helm: bool,
 }
 
 fn main() -> ExitCode {
@@ -145,6 +169,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
         "lewis" => report_lewis(&spec, &options),
         "radiation" => report_radiation(&spec, &options),
         "balance" => report_balance(&spec, &options),
+        "seaway" => report_seaway(&spec, &options),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     }
 }
@@ -163,6 +188,12 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         waterline: None,
         keel_at: None,
         mast_at: None,
+        wave_height: 0.0,
+        wave_period: 5.0,
+        wave_heading: None,
+        seconds: 60.0,
+        seed: 1,
+        free_helm: false,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
@@ -184,6 +215,19 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             "--waterline" => options.waterline = Some(number(rest.next(), "--waterline")?),
             "--keel-at" => options.keel_at = Some(number(rest.next(), "--keel-at")?),
             "--mast-at" => options.mast_at = Some(number(rest.next(), "--mast-at")?),
+            "--wave-height" => options.wave_height = number(rest.next(), "--wave-height")?,
+            "--wave-period" => options.wave_period = number(rest.next(), "--wave-period")?,
+            "--wave-heading" => {
+                options.wave_heading = Some(number(rest.next(), "--wave-heading")?.to_radians());
+            }
+            "--seconds" => options.seconds = number(rest.next(), "--seconds")?,
+            "--seed" => {
+                let raw = rest.next().ok_or("--seed needs a value")?;
+                options.seed = raw
+                    .parse()
+                    .map_err(|_| format!("--seed expects an integer, got {raw}"))?;
+            }
+            "--free-helm" => options.free_helm = true,
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }
@@ -1192,4 +1236,240 @@ fn report_balance(spec: &BoatSpec, options: &Options) -> Result<String, String> 
          method is for fin keels alone. Positive lead puts the sails forward.\n",
     );
     Ok(out)
+}
+
+/// Sails the boat forward in time and reports what the sea did to it.
+///
+/// The only command that integrates rather than solves, and the only one that
+/// exercises both halves of the engine at once — the rig drives the boat while
+/// the waves move it, through the same pressure integral.
+///
+/// Released at the *solved* sailing condition rather than from rest, so the run
+/// measures the sea's effect instead of a start-up transient. With no wave
+/// height the boat should sit where the solver put it, which makes a calm run
+/// the control experiment for a wavy one.
+///
+/// Every mode is free except the heading, and that exception is the interesting
+/// one: a boat with a fixed rudder has no course stability. The helm angle is
+/// solved to balance yaw at *one* state, and the moment it trims or a wave hits
+/// it the balance moves — with nothing steering, the heading is a free
+/// integrator and the boat luffs up until the yaw moment vanishes somewhere
+/// else. In a calm that costs nearly forty per cent of the boat speed over a
+/// minute, which drowns whatever the waves were doing. So the course is held,
+/// the way a towing tank holds a model in waves, and `--free-helm` releases it
+/// for anyone who wants to watch the boat round up.
+fn report_seaway(spec: &BoatSpec, options: &Options) -> Result<String, String> {
+    let hull = parameters(spec)?;
+    let sails = if options.downwind {
+        SailSet::downwind()
+    } else {
+        SailSet::upwind()
+    };
+    let base = if options.downwind {
+        Controls::eased(sails)
+    } else {
+        Controls::close_hauled(sails)
+    };
+    let trimmed = base.with_trim(base.trim.with_flat(options.flat).with_reef(options.reef));
+    let wind = UniformWind::uniform(options.wind, options.wind_angle);
+    let start = EquilibriumOptions {
+        initial_sinkage: hull.canoe_draft,
+        ..EquilibriumOptions::default()
+    };
+
+    let mut vpp = velocity_prediction_sim(
+        spec,
+        Box::new(StillWater::new(wind)),
+        trimmed,
+        &options.loft,
+    )
+    .map_err(|error| format!("{}: {error}", spec.name))?;
+    let (solved, controls) = if spec.layout.is_some() {
+        let helm = equilibrium::solve_with_helm(&mut vpp, hull.waterline_length, &start)
+            .map_err(|error| format!("{}: {error}", spec.name))?;
+        let rudder = helm.rudder_angle;
+        (helm.equilibrium, trimmed.with_rudder(rudder))
+    } else {
+        let solution = equilibrium::solve(&mut vpp, hull.waterline_length, &start)
+            .map_err(|error| format!("{}: {error}", spec.name))?;
+        (solution, trimmed)
+    };
+
+    // Waves travel *towards* a heading, and the wind is named by where it comes
+    // from, so a head sea is the wind's direction plus half a turn.
+    let heading = options
+        .wave_heading
+        .unwrap_or(options.wind_angle + std::f64::consts::PI);
+    let sea = SeaState {
+        significant_height: options.wave_height,
+        peak_period: options.wave_period,
+        heading,
+        seed: options.seed,
+        ..SeaState::default()
+    };
+    let environment: Box<dyn vela_core::Environment> = if options.wave_height > 0.0 {
+        Box::new(Seaway2D::new(wind, sea))
+    } else {
+        Box::new(StillWater::new(wind))
+    };
+
+    let mut sim = sailing_sim(
+        spec,
+        environment,
+        controls,
+        &options.loft,
+        RadiationOptions::default(),
+    )
+    .map_err(|error| format!("{}: {error}", spec.name))?;
+    if !options.free_helm {
+        sim = sim.with_captive(Captive {
+            yaw: true,
+            ..Captive::free()
+        });
+    }
+    sim.set_state(solved.state.clone());
+
+    let dt = 1.0 / 200.0;
+    let steps = (options.seconds / dt).max(1.0) as usize;
+    // The second half is the measurement; the first is however long the boat
+    // takes to stop caring where it was let go.
+    let sample_from = steps / 2;
+    let mut speed = Extent::default();
+    let mut heel = Extent::default();
+    let mut trim = Extent::default();
+    let mut sinkage = Extent::default();
+    // The keel's lift coefficient is watched for one reason: the appendage model
+    // is linear in angle of attack with no limiting term, and a hull heaving and
+    // rolling in a seaway swings the keel's incidence far further than steady
+    // sailing ever does. Past about 1.2 a real foil has stalled and this one has
+    // not, so the run has left the model's envelope and the report must say so
+    // rather than let a plausible number stand.
+    let mut worst_keel_lift: f64 = 0.0;
+
+    for step in 0..steps {
+        sim.step(dt);
+        let state = sim.state();
+        if !state.position.z.is_finite() {
+            return Err(format!(
+                "{}: the simulation diverged at t = {:.2} s",
+                spec.name,
+                sim.time()
+            ));
+        }
+        if step < sample_from {
+            continue;
+        }
+        let (roll, pitch, _) = state.attitude.euler_angles();
+        speed.add(state.world_velocity().xy().norm());
+        heel.add(roll.to_degrees());
+        trim.add(pitch.to_degrees());
+        sinkage.add(state.position.z);
+        if let Some(lift) = sim.telemetry().get("lateral.keel.lift_coefficient") {
+            worst_keel_lift = worst_keel_lift.max(lift.abs());
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} — sailed for {:.0} s, TWS {:.2} m/s, TWA {:.1} deg, {}\n",
+        spec.name,
+        options.seconds,
+        options.wind,
+        options.wind_angle.to_degrees(),
+        sails
+    ));
+    if options.wave_height > 0.0 {
+        out.push_str(&format!(
+            "sea: Hs {:.2} m, Tp {:.1} s, travelling towards {:.0} deg, seed {}\n\n",
+            options.wave_height,
+            options.wave_period,
+            heading.to_degrees(),
+            options.seed
+        ));
+    } else {
+        out.push_str("sea: calm — the control run\n\n");
+    }
+    out.push_str(&format!(
+        "released at   speed {:.3} m/s   heel {:.2} deg   sinkage {:.3} m\n\n",
+        solved.speed,
+        solved.heel.to_degrees(),
+        solved.sinkage
+    ));
+    out.push_str("over the second half of the run:\n\n");
+    out.push_str(&format!(
+        "                     {:>10} {:>10} {:>10} {:>10}\n",
+        "mean", "min", "max", "amplitude"
+    ));
+    out.push_str(&format!("speed      m/s   {speed}\n"));
+    out.push_str(&format!("heel       deg   {heel}\n"));
+    out.push_str(&format!("trim       deg   {trim}\n"));
+    out.push_str(&format!("sinkage      m   {sinkage}\n"));
+    out.push_str(&format!(
+        "\nworst keel lift coefficient {worst_keel_lift:>7.2}"
+    ));
+    if worst_keel_lift > 1.2 {
+        out.push_str("   ** past stall: see below **\n");
+    } else {
+        out.push('\n');
+    }
+    out.push_str(
+        "\nAmplitude is half the peak-to-peak excursion. The trim is free here and\n\
+         the heading is not, so a calm run holds its released condition to a\n\
+         fraction of a per cent and everything a wavy run shows is the sea's.\n\
+         The trim it settles at is its own: no resistance component in this engine\n\
+         has a published line of action, so nothing balances the steady trim\n\
+         moment of a boat under way.\n",
+    );
+    if worst_keel_lift > 1.2 {
+        out.push_str(
+            "\nThe keel went past stall. The appendage model is linear in angle of\n\
+             attack with no limiting term, and a hull heaving and rolling swings its\n\
+             incidence much further than steady sailing does — so beyond this point\n\
+             the foils are generating lift a real keel could not, which both damps\n\
+             the motion too heavily and charges too much induced drag. Expect the\n\
+             speed loss in waves to be overstated. This is the gap named in\n\
+             `modules::lateral` and it is the first thing a seaway exercises.\n",
+        );
+    }
+    out.push_str(
+        "\nRadiation damping is the zero-speed one — the forward-speed corrections\n\
+         are absent — so motions are if anything larger than they should be. There\n\
+         is no measured seakeeping campaign for this hull in hand, so the\n\
+         amplitudes above are not validated against anything.\n",
+    );
+    Ok(out)
+}
+
+/// Running mean and extremes of one quantity over a run.
+#[derive(Default)]
+struct Extent {
+    total: f64,
+    count: usize,
+    low: Option<f64>,
+    high: Option<f64>,
+}
+
+impl Extent {
+    fn add(&mut self, value: f64) {
+        self.total += value;
+        self.count += 1;
+        self.low = Some(self.low.map_or(value, |it: f64| it.min(value)));
+        self.high = Some(self.high.map_or(value, |it: f64| it.max(value)));
+    }
+}
+
+impl std::fmt::Display for Extent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Some(low), Some(high)) = (self.low, self.high) else {
+            return write!(formatter, "{:>43}", "no samples");
+        };
+        write!(
+            formatter,
+            "{:>10.3} {:>10.3} {:>10.3} {:>10.3}",
+            self.total / self.count as f64,
+            low,
+            high,
+            0.5 * (high - low)
+        )
+    }
 }

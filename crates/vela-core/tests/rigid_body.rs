@@ -318,3 +318,97 @@ fn torque_free_rotation_conserves_kinetic_energy() {
     // bound sits where it does.
     assert!(drift < 1e-6, "kinetic energy drifted by {drift}");
 }
+
+/// A body whose mass matrix couples heave to pitch, the way added mass does.
+///
+/// The off-diagonal term is the whole subject of the two tests below, so it is
+/// stated here rather than buried: `A₃₅ = A₅₃ = -40000 kg·m` is the order a
+/// yacht's heave-pitch coupling actually reaches, and the diagonal entries keep
+/// the matrix positive definite.
+fn coupled_body() -> RigidBody {
+    let mass = MassProperties::from_gyradii(6000.0, Vector3::zeros(), Vector3::new(1.5, 3.5, 3.5))
+        .expect("valid mass properties");
+    let mut body = RigidBody::with_gravity(mass, 0.0).expect("valid rigid body");
+    let mut added = nalgebra::Matrix6::zeros();
+    added[(2, 2)] = 26000.0;
+    added[(4, 4)] = 900_000.0;
+    added[(2, 4)] = -40_000.0;
+    added[(4, 2)] = -40_000.0;
+    body.add_added_mass(added).expect("positive definite");
+    body
+}
+
+/// The coupling is real, and this is the test that says so.
+///
+/// A pure pitch moment on a free body accelerates it in heave, because the mass
+/// matrix is not diagonal. Without this the restraint test below would pass on a
+/// body that had no coupling to suppress, and would be checking nothing.
+#[test]
+fn a_pitch_moment_alone_accelerates_an_unrestrained_body_in_heave() {
+    let body = coupled_body();
+    let state = BodyState::at_rest(Vector3::zeros());
+    let moment = Wrench {
+        force: Vector3::zeros(),
+        moment: Vector3::new(0.0, 50_000.0, 0.0),
+    };
+
+    let acceleration = body.acceleration(&state, moment);
+    assert!(
+        acceleration.linear.z.abs() > 0.05,
+        "a pitch moment must reach heave through the coupling, got {} m/s²",
+        acceleration.linear.z
+    );
+}
+
+/// Restraining pitch must stop that force reaching heave at all.
+///
+/// This is the failure the restraint exists to prevent, and it is not a
+/// numerical nicety. A yacht held in pitch — the condition a velocity
+/// prediction is posed in — carries an unbalanced trim moment, because no
+/// equation balanced it. Cancelling the pitch *velocity* after the step leaves
+/// the heave acceleration that moment induced, so the boat rises until it has
+/// bought an equal and opposite buoyancy error, and settles carrying a fifth of
+/// its weight in vertical force that the telemetry reports and the motion
+/// denies.
+///
+/// Both parts are asserted: the held mode gets exactly zero, and so does the
+/// mode it would otherwise have driven.
+#[test]
+fn a_restrained_mode_cannot_drive_a_free_one_through_the_mass_matrix() {
+    let mut body = coupled_body();
+    // Surge, sway, heave, roll, pitch, yaw — pitch alone.
+    body.restrain([false, false, false, false, true, false]);
+    let state = BodyState::at_rest(Vector3::zeros());
+    let moment = Wrench {
+        force: Vector3::zeros(),
+        moment: Vector3::new(0.0, 50_000.0, 0.0),
+    };
+
+    let acceleration = body.acceleration(&state, moment);
+    assert_relative_eq!(acceleration.angular.y, 0.0, epsilon = 1e-12);
+    assert_relative_eq!(acceleration.linear.z, 0.0, epsilon = 1e-12);
+}
+
+/// The free block must be untouched by the restraint.
+///
+/// A restraint that also changed the answer for the modes it does not hold would
+/// be a different boat, not a captive one. Heave alone is loaded, and the heave
+/// acceleration must be what `M₃₃` says whether or not pitch is held — which it
+/// is only because the held row and column are removed rather than merely
+/// zeroed on one side.
+#[test]
+fn restraining_one_mode_leaves_the_others_on_their_own_mass() {
+    let mut body = coupled_body();
+    let state = BodyState::at_rest(Vector3::zeros());
+    let heave = Wrench {
+        force: Vector3::new(0.0, 0.0, 32_000.0),
+        moment: Vector3::zeros(),
+    };
+
+    body.restrain([false, false, false, false, true, false]);
+    let held = body.acceleration(&state, heave);
+    let expected = heave.force.z / body.mass_matrix()[(2, 2)];
+
+    assert_relative_eq!(held.linear.z, expected, max_relative = 1e-12);
+    assert_relative_eq!(held.angular.y, 0.0, epsilon = 1e-12);
+}

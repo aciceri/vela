@@ -29,10 +29,14 @@
 
 use approx::assert_relative_eq;
 use vela_core::aero::SailSet;
-use vela_core::assembly::velocity_prediction_sim;
+use vela_core::assembly::{sailing_sim, velocity_prediction_sim, RadiationOptions};
 use vela_core::boat::Aerodynamics;
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
-use vela_core::{BoatSpec, Controls, LoftOptions, Sim, StillWater, UniformWind};
+use vela_core::seaway::SeaState;
+use vela_core::sim::Captive;
+use vela_core::{
+    BoatSpec, BodyState, Controls, Environment, LoftOptions, Seaway2D, Sim, StillWater, UniformWind,
+};
 
 const SPEC: &str = include_str!("../../../boats/yd41-form-study.ron");
 
@@ -687,5 +691,270 @@ fn the_geometric_model_sails_and_differs_by_what_is_missing() {
                 .expect("the key"),
             max_relative = 1e-12
         );
+    }
+}
+
+/// The condition a velocity prediction reports must be one a boat could hold.
+///
+/// The unknowns are body-frame surge and sway, and a body frame at heel is
+/// tilted, so leaving the body heave velocity at zero gives the boat a *world*
+/// vertical velocity of `v sin φ`. A boat sinking at sixteen centimetres a
+/// second is not sailing steadily however well its forces balance, and it is not
+/// harmless: the horizontal speed the resistance regressions are handed is
+/// measured in the world, so the error moves the solved speed.
+///
+/// Heel and leeway are asserted to be substantial first. Without that this would
+/// pass on an upright boat, where every frame agrees and there is nothing to get
+/// wrong.
+#[test]
+fn the_solved_condition_is_not_sinking() {
+    let mut sim = sailing(MODERATE_WIND, 40.0, 1.0, 1.0);
+    let solution = solve(&mut sim).expect("a yacht must sail upwind in ten knots");
+
+    assert!(
+        solution.heel.abs() > 0.15,
+        "heel {} rad is too small for this test to mean anything",
+        solution.heel
+    );
+    assert!(
+        solution.state.velocity.y.abs() > 0.1,
+        "sway {} m/s is too small for this test to mean anything",
+        solution.state.velocity.y
+    );
+
+    let rising = solution.state.world_velocity().z;
+    assert_relative_eq!(rising, 0.0, epsilon = 1e-12);
+
+    // And the reported speed is the horizontal one, not the norm of the body
+    // surge and sway — which at this heel is half a per cent smaller.
+    assert_relative_eq!(
+        solution.speed,
+        solution.state.world_velocity().xy().norm(),
+        max_relative = 1e-12
+    );
+}
+
+/// The two routes to steady sailing must arrive at the same place.
+///
+/// A velocity prediction *solves* the force balance; [`sailing_sim`] integrates
+/// the equations of motion until it stops changing. Nothing makes them agree —
+/// one runs a Newton iteration on four residuals, the other steps a
+/// six-degree-of-freedom body with the water's memory in it at two hundred hertz
+/// — so agreement is a real closure over the whole stack, and the sharpest
+/// single check in this file.
+///
+/// It is also what the water's memory bought. Without radiation the vertical
+/// modes have only the appendages to damp them; with it the run settles, and it
+/// settles here.
+#[test]
+fn the_time_domain_reaches_the_solved_condition() {
+    let spec = boat();
+    let base = Controls::close_hauled(SailSet::upwind());
+    let wind = UniformWind::uniform(MODERATE_WIND, 40.0_f64.to_radians());
+    let options = EquilibriumOptions {
+        initial_sinkage: 0.40,
+        ..EquilibriumOptions::default()
+    };
+
+    let mut vpp = velocity_prediction_sim(
+        &spec,
+        Box::new(StillWater::new(wind)),
+        base,
+        &LoftOptions::default(),
+    )
+    .expect("the boat assembles");
+    let helm = equilibrium::solve_with_helm(&mut vpp, WATERLINE_LENGTH, &options)
+        .expect("a yacht must sail upwind in ten knots");
+    let solved = helm.equilibrium;
+
+    // The same restraint the solver posed the problem in: comparing a
+    // four-degree-of-freedom solution against a run that also trims and yaws
+    // would be comparing two different questions.
+    let mut run = sailing_sim(
+        &spec,
+        Box::new(StillWater::new(wind)),
+        base.with_rudder(helm.rudder_angle),
+        &LoftOptions::default(),
+        RadiationOptions::default(),
+    )
+    .expect("the boat assembles with radiation")
+    .with_captive(Captive::velocity_prediction());
+    run.set_state(solved.state.clone());
+
+    let dt = 1.0 / 200.0;
+    for _ in 0..(120.0 / dt) as usize {
+        run.step(dt);
+    }
+
+    let state = run.state();
+    let (heel, _, _) = state.attitude.euler_angles();
+    assert_relative_eq!(
+        state.world_velocity().xy().norm(),
+        solved.speed,
+        max_relative = 1e-3
+    );
+    assert_relative_eq!(heel, solved.heel, max_relative = 1e-3);
+    assert_relative_eq!(state.position.z, solved.sinkage, max_relative = 1e-3);
+}
+
+/// A boat that sails in waves: the only assembly where the two halves meet.
+///
+/// What is asserted is that the sea does something and that the boat survives
+/// it. Response amplitudes are not asserted against a number — there is no
+/// measured YD-41 seakeeping campaign in hand, and inventing a target pitch
+/// amplitude would be fabricating an oracle. What the bands catch is a model
+/// that has stopped being a boat in a seaway: motion that dies away to the calm
+/// answer, or motion that runs away.
+#[test]
+fn a_seaway_moves_a_sailing_boat_and_a_calm_does_not() {
+    let spec = boat();
+    let base = Controls::close_hauled(SailSet::upwind());
+    let wind = UniformWind::uniform(MODERATE_WIND, 40.0_f64.to_radians());
+
+    // Both runs start from the solved sailing condition rather than from a
+    // hand-set pose. The question is what a sea does to a boat that was already
+    // sailing steadily, and starting anywhere else would spend the run watching
+    // a transient that has nothing to do with the waves.
+    let mut vpp = velocity_prediction_sim(
+        &spec,
+        Box::new(StillWater::new(wind)),
+        base,
+        &LoftOptions::default(),
+    )
+    .expect("the boat assembles");
+    let helm = equilibrium::solve_with_helm(
+        &mut vpp,
+        WATERLINE_LENGTH,
+        &EquilibriumOptions {
+            initial_sinkage: 0.40,
+            ..EquilibriumOptions::default()
+        },
+    )
+    .expect("a yacht must sail upwind in ten knots");
+    let start = helm.equilibrium.state;
+    let controls = base.with_rudder(helm.rudder_angle);
+
+    let calm = motion_of(&spec, controls, &start, Box::new(StillWater::new(wind)));
+    let sea = SeaState {
+        significant_height: 1.0,
+        peak_period: 5.0,
+        // Travelling towards the boat: a head sea at this true wind angle.
+        heading: 220.0_f64.to_radians(),
+        ..SeaState::default()
+    };
+    let wavy = motion_of(&spec, controls, &start, Box::new(Seaway2D::new(wind, sea)));
+
+    // Released at the four-degree-of-freedom solution with all six free, the
+    // boat drifts slowly: nothing balanced its trim moment, and the helm was
+    // solved for a course it no longer holds. That drift is real and documented,
+    // so the claim here is a ratio rather than a zero — the sea has to be the
+    // thing moving the boat, by an order of magnitude over what the release does.
+    assert!(
+        calm.pitch < 0.1 && calm.heave < 0.05,
+        "still water moved the boat more than a drift: {:.3} deg of pitch and {:.4} m of heave",
+        calm.pitch,
+        calm.heave
+    );
+    assert!(
+        wavy.pitch > 10.0 * calm.pitch && wavy.heave > 10.0 * calm.heave,
+        "the sea barely beat the release drift: pitch {:.3} against {:.3} deg, heave {:.3} against {:.4} m",
+        wavy.pitch,
+        calm.pitch,
+        wavy.heave,
+        calm.heave
+    );
+
+    // A metre of significant height is a real sea for a forty-footer. Pitch of
+    // less than a degree would mean the excitation is not reaching the hull;
+    // fifteen would mean nothing is damping it.
+    assert!(
+        (1.0..15.0).contains(&wavy.pitch),
+        "pitch amplitude {:.3} deg is not a boat in a one-metre sea",
+        wavy.pitch
+    );
+    // Heave follows the surface at long periods and lags it at short ones, so
+    // the amplitude is bounded by the wave height rather than equal to it.
+    assert!(
+        (0.1..1.5).contains(&wavy.heave),
+        "heave amplitude {:.3} m is not a boat in a one-metre sea",
+        wavy.heave
+    );
+    // And it is still sailing: making way, and not lying on its side.
+    assert!(
+        wavy.speed > 0.5 * calm.speed,
+        "the sea stopped the boat: {:.3} m/s against {:.3} in the calm",
+        wavy.speed,
+        calm.speed
+    );
+    assert!(
+        wavy.worst_heel.to_degrees() < 60.0,
+        "the boat was knocked down to {:.1} deg",
+        wavy.worst_heel.to_degrees()
+    );
+}
+
+/// What a run of the seaway assembly did.
+struct Motion {
+    /// Mean horizontal speed over the sampling window, m/s.
+    speed: f64,
+    /// Half the peak-to-peak trim over the window, degrees.
+    pitch: f64,
+    /// Half the peak-to-peak sinkage over the window, m.
+    heave: f64,
+    /// Largest heel reached, radians.
+    worst_heel: f64,
+}
+
+/// Sails the boat from a given state for a minute and measures the last half.
+fn motion_of(
+    spec: &BoatSpec,
+    controls: Controls,
+    start: &BodyState,
+    env: Box<dyn Environment>,
+) -> Motion {
+    let mut sim = sailing_sim(
+        spec,
+        env,
+        controls,
+        &LoftOptions::default(),
+        RadiationOptions::default(),
+    )
+    .expect("the boat assembles with radiation");
+    sim.set_state(start.clone());
+
+    let dt = 1.0 / 200.0;
+    let steps = (60.0 / dt) as usize;
+    let mut speed = 0.0;
+    let mut samples = 0.0;
+    let (mut low_pitch, mut high_pitch) = (f64::MAX, f64::MIN);
+    let (mut low_heave, mut high_heave) = (f64::MAX, f64::MIN);
+    let mut worst_heel: f64 = 0.0;
+
+    for step in 0..steps {
+        sim.step(dt);
+        if step < steps / 2 {
+            continue;
+        }
+        let state = sim.state();
+        assert!(
+            state.position.z.is_finite(),
+            "the simulation diverged at t = {:.2} s",
+            sim.time()
+        );
+        let (heel, trim, _) = state.attitude.euler_angles();
+        speed += state.world_velocity().xy().norm();
+        samples += 1.0;
+        low_pitch = low_pitch.min(trim.to_degrees());
+        high_pitch = high_pitch.max(trim.to_degrees());
+        low_heave = low_heave.min(state.position.z);
+        high_heave = high_heave.max(state.position.z);
+        worst_heel = worst_heel.max(heel.abs());
+    }
+
+    Motion {
+        speed: speed / samples,
+        pitch: 0.5 * (high_pitch - low_pitch),
+        heave: 0.5 * (high_heave - low_heave),
+        worst_heel,
     }
 }
