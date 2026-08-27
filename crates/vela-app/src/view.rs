@@ -122,23 +122,55 @@ pub struct Sea;
 #[derive(Component)]
 pub struct Chase;
 
+/// How sharply the sea grid's cells grow with distance from the boat.
+///
+/// One would be a uniform grid, and a uniform grid is what made the water look
+/// polygonal. The trouble is dimensional: 160 cells over 400 m is a 2.5 m cell,
+/// while the shortest wave the realisation carries is about 3.5 m long, so a crest
+/// was described by less than a cell and a half and came out as a zigzag. Adding
+/// cells fixes it and costs the frame budget — every vertex evaluates the whole
+/// sixty-component sum.
+///
+/// So the cells are graded instead. The same vertices, redistributed: sub-metre
+/// near the boat where a facet is a facet, tens of metres at the rim where the
+/// displacement is being faded out anyway and nothing is left to resolve. Two is
+/// cell size growing linearly with radius, which is the natural choice — it is
+/// what keeps a cell roughly constant in *screen* space for a camera looking down
+/// at a plane, the same argument the ripple detail uses.
+const GRADING: f32 = 2.0;
+
+/// Where a grid line sits along an axis, m.
+///
+/// Signed and symmetric about the boat: the grading applies outward in both
+/// directions from the middle of the window, not from one corner.
+///
+/// One property is given up here and it should be named. A uniform grid could be
+/// snapped to its own cell size, which kept every vertex on a fixed world lattice
+/// so the sampling stayed still while the window slid — see the module
+/// documentation. A graded grid has no such lattice, so its vertices move with the
+/// boat and the polygonal approximation shifts under the waves as it goes. That
+/// trade is worth taking: the crawl is a slow low-contrast shimmer in the middle
+/// distance, and the faceting it buys out was the first thing anyone noticed. It is
+/// also the trade every geometry clipmap makes, for the same reason.
+fn graded(index: u32, cells: u32, reach: f32) -> f32 {
+    // Parameter in [-1, 1] across the window.
+    let parameter = 2.0 * index as f32 / cells as f32 - 1.0;
+    parameter.abs().powf(GRADING) * parameter.signum() * reach
+}
+
 /// A flat grid in the render plane, for the ocean shader to displace.
 ///
 /// Positions only: the shader computes the normal from the analytic slope, so an
 /// uploaded normal would be overwritten. No UVs either — nothing samples a
 /// texture.
 fn grid(reach: f32, cells: u32) -> Mesh {
-    let step = 2.0 * reach / cells as f32;
     let count = (cells + 1) as usize;
     let mut positions = Vec::with_capacity(count * count);
 
     for row in 0..=cells {
+        let north = graded(row, cells, reach);
         for column in 0..=cells {
-            positions.push([
-                -reach + column as f32 * step,
-                0.0,
-                -reach + row as f32 * step,
-            ]);
+            positions.push([graded(column, cells, reach), 0.0, north]);
         }
     }
 
@@ -402,22 +434,26 @@ pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>
     }
 }
 
-/// Keeps the sea grid centred on the boat, snapped to its own cell size.
+/// Keeps the sea centred on the boat.
+///
+/// Continuously, not snapped, and the change of mind is worth recording. A uniform
+/// grid could be snapped to its own cell size, which kept every vertex on a fixed
+/// world lattice so the sampling stayed still while the window slid — see the
+/// module documentation, which is still the right argument for a uniform grid.
+///
+/// The grid is graded now (see [`graded`]) and has no lattice to snap to, so
+/// snapping would only quantise the window's position into two-and-a-half-metre
+/// jumps while the sampling moved anyway: all of the lurch and none of the
+/// benefit. Following the boat exactly is both simpler and smoother.
 pub fn follow_sea(engine: Res<Engine>, mut seas: Query<&mut Transform, With<Sea>>) {
     let centre = frame::to_render(engine.sim.state().position);
-    let step = 2.0 * REACH / CELLS as f32;
-    let snapped = Vec3::new(
-        (centre.x / step).round() * step,
-        0.0,
-        (centre.z / step).round() * step,
-    );
     for mut transform in &mut seas {
         // Horizontal only. The two tessellations sit at different heights on
         // purpose — see the ring's own comment — and overwriting the whole
         // translation here would flatten them back together and bring the depth
         // fighting with it.
-        transform.translation.x = snapped.x;
-        transform.translation.z = snapped.z;
+        transform.translation.x = centre.x;
+        transform.translation.z = centre.z;
     }
 }
 
