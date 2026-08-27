@@ -94,6 +94,21 @@ pub struct SeaState {
     /// seed are the same sea, which is what makes a wave test reproducible and
     /// what lets a renderer draw the water the physics is using.
     pub seed: u64,
+    /// Directional spreading exponent at the spectral peak, `s_p`.
+    ///
+    /// A real sea is short-crested: its components do not all travel the same
+    /// way, and the ones that carry the least energy are the least organised.
+    /// This is the `s` of the Longuet-Higgins spreading function
+    /// `D(θ) ∝ cos^(2s)((θ - θ₀)/2)`, quoted at the peak frequency, from which
+    /// [`Seaway`] derives the exponent at every other frequency by Mitsuyasu's
+    /// law. Ten is the usual wind-sea value; a long swell is nearer twenty-five.
+    ///
+    /// **Zero means unidirectional** — every component on `heading`, a sea whose
+    /// crests are parallel and infinitely long. That is a real sea state only for
+    /// a pure distant swell, and it is worth knowing that it is the degenerate
+    /// case rather than the simple one: a long-crested sea excites no roll from
+    /// a head sea and looks, from a boat, like corrugated iron.
+    pub spreading: f64,
 }
 
 impl Default for SeaState {
@@ -104,6 +119,9 @@ impl Default for SeaState {
             heading: 0.0,
             components: 60,
             seed: 1,
+            // A wind sea, not a swell. The old default was implicitly zero and
+            // that was the wrong way round: unidirectional is the special case.
+            spreading: 10.0,
         }
     }
 }
@@ -137,6 +155,94 @@ impl SeaState {
     }
 }
 
+/// Mitsuyasu's directional spreading exponent at a frequency.
+///
+/// ```text
+/// s(ω) = s_p (ω/ω_p)^5      below the peak
+/// s(ω) = s_p (ω/ω_p)^-2.5   above it
+/// ```
+///
+/// The asymmetry is the observation the law exists for, and it is what makes a
+/// drawn sea look like water: energy at the peak arrives nearly all from one
+/// bearing, while the short waves are scattered across a wide fan. A single
+/// exponent for the whole spectrum gets both ends wrong at once — either the
+/// swell wanders or the ripples line up.
+///
+/// Clamped below at a value near unity because `cos²ˢ` with `s` under one is
+/// nearly uniform and the exponent is then doing no work, and above at a value
+/// where the fan is already narrower than the direction resolution sixty
+/// components can carry.
+fn mitsuyasu_exponent(peak_exponent: f64, frequency: f64, peak: f64) -> f64 {
+    if peak_exponent <= 0.0 || peak <= 0.0 || frequency <= 0.0 {
+        return 0.0;
+    }
+    let ratio = frequency / peak;
+    let exponent = if ratio < 1.0 {
+        peak_exponent * ratio.powi(5)
+    } else {
+        peak_exponent * ratio.powf(-2.5)
+    };
+    exponent.clamp(0.6, 80.0)
+}
+
+/// Angle off the mean direction at a given cumulative probability, radians.
+///
+/// Inverts the Longuet-Higgins spreading `D(θ) ∝ cos^(2s)(θ/2)` on `[-π, π]`.
+/// There is no closed form for the inverse, so the CDF is integrated on a fixed
+/// grid and inverted by linear interpolation between the two straddling nodes.
+///
+/// A table rather than a Newton solve because this runs at most a few hundred
+/// times per boat load and the grid makes the result a deterministic function of
+/// `(quantile, spread)` on every platform — which the shared-realisation
+/// contract needs, since a renderer and the physics must agree on the sea to the
+/// last bit. Sixty-four intervals of Simpson's rule resolve even the narrowest
+/// admitted fan to well under a degree.
+///
+/// `spread` of zero is the unidirectional case and returns zero: every component
+/// on the mean heading.
+fn spreading_quantile(quantile: f64, spread: f64) -> f64 {
+    if spread <= 0.0 {
+        return 0.0;
+    }
+    const NODES: usize = 64;
+
+    // Unnormalised density, and its running integral from -π.
+    let density = |angle: f64| (0.5 * angle).cos().abs().powf(2.0 * spread);
+    let step = 2.0 * PI / NODES as f64;
+
+    let mut cumulative = [0.0; NODES + 1];
+    for node in 0..NODES {
+        let left = -PI + node as f64 * step;
+        // Simpson on the interval: the density is smooth and this keeps the
+        // narrow-fan case from being under-integrated by the trapezoid rule.
+        let middle = left + 0.5 * step;
+        let right = left + step;
+        let slab = step / 6.0 * (density(left) + 4.0 * density(middle) + density(right));
+        cumulative[node + 1] = cumulative[node] + slab;
+    }
+
+    let total = cumulative[NODES];
+    if total <= 0.0 {
+        return 0.0;
+    }
+    let target = quantile * total;
+
+    // The CDF is monotone, so a linear scan is both correct and, at sixty-four
+    // nodes, faster than the bisection that would replace it.
+    for node in 0..NODES {
+        if cumulative[node + 1] >= target {
+            let slab = cumulative[node + 1] - cumulative[node];
+            let within = if slab > 0.0 {
+                (target - cumulative[node]) / slab
+            } else {
+                0.0
+            };
+            return -PI + (node as f64 + within) * step;
+        }
+    }
+    PI
+}
+
 /// A realised sea: a fixed set of components with fixed phases.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Seaway {
@@ -158,6 +264,29 @@ impl Seaway {
     /// Phases come from a small deterministic generator seeded by
     /// [`SeaState::seed`], so a realisation is reproducible across runs,
     /// machines and — the point of it — between the physics and a renderer.
+    ///
+    /// # Why each component gets its own direction
+    ///
+    /// A sea is a function of two horizontal coordinates. Give every component
+    /// the same heading and it collapses to a function of one: crests become
+    /// parallel ridges, identical to the horizon, and the surface has no
+    /// short-crestedness for a hull to feel. That is not a discretisation
+    /// artefact to be lived with, it is the wrong sea.
+    ///
+    /// The textbook fix is a double summation over frequency *and* direction,
+    /// which costs `N × M` components for `N` frequencies. This uses the
+    /// **single-summation** method instead: each frequency band keeps its whole
+    /// variance and is assigned one direction drawn from the spreading function.
+    /// The component count, and so the per-step cost, is unchanged — see
+    /// `examples/frame_cost`, where the component count is nearly the entire
+    /// step — while the surface becomes genuinely two-dimensional.
+    ///
+    /// What single summation gives up is stated plainly in the literature: the
+    /// realisation is not spatially homogeneous, because a single direction per
+    /// frequency cannot represent the directional variance *within* a band. Over
+    /// a hull twelve metres long against wavelengths of tens of metres that is
+    /// far below the errors already accepted in §5, and it buys the difference
+    /// between a sea and a corrugated roof.
     #[must_use]
     pub fn new(state: SeaState, gravity: f64) -> Self {
         let mut components = Vec::with_capacity(state.components);
@@ -167,18 +296,53 @@ impl Seaway {
             let highest = 4.0 * peak;
             let step = (highest - lowest) / state.components as f64;
             let mut phases = Phases::new(state.seed);
-            let (sin_heading, cos_heading) = state.heading.sin_cos();
+
+            // Directions come from their own generator, not from the phase
+            // stream. Sharing one would mean that turning spreading on moved
+            // every crest in the sea as well as fanning it, and that a swell
+            // written with `spreading: 0.0` was no longer the sea it used to be.
+            // One stream per question keeps `spreading: 0.0` bit-identical to a
+            // unidirectional realisation.
+            //
+            // Drawn stratified rather than independently: stratum `i` of `N`
+            // covers cumulative probability `[i/N, (i+1)/N)` and the draw lands
+            // inside it. That guarantees the realised directions cover the
+            // spreading function instead of clumping by luck, which for sixty
+            // components matters — an unlucky independent draw can leave a whole
+            // flank of the distribution empty and put a false ridge in the sea.
+            //
+            // The strata are then shuffled, because assigning stratum `i` to
+            // frequency band `i` would tie direction to frequency: the sea would
+            // fan out monotonically from the longest wave to the shortest, which
+            // is a pattern no wind ever made.
+            let mut bearings = Phases::new(state.seed ^ 0x9E37_79B9_7F4A_7C15);
+            let mut strata: Vec<usize> = (0..state.components).collect();
+            for index in (1..strata.len()).rev() {
+                // `Phases::next` returns a phase in `[0, 2π)`; scaled to a unit
+                // fraction it is a perfectly good uniform for a Fisher-Yates.
+                let unit = bearings.next() / (2.0 * PI);
+                let pick = ((unit * (index + 1) as f64) as usize).min(index);
+                strata.swap(index, pick);
+            }
+
             for index in 0..state.components {
                 // Mid-interval, so that no component sits on the band edges.
                 let frequency = lowest + (index as f64 + 0.5) * step;
                 let amplitude = (2.0 * state.density(frequency) * step).sqrt();
+                let spread = mitsuyasu_exponent(state.spreading, frequency, peak);
+                // Jittered inside the stratum, so the fan is not a fixed comb of
+                // sixty bearings that would repeat between realisations.
+                let jitter = bearings.next() / (2.0 * PI);
+                let quantile = (strata[index] as f64 + jitter) / strata.len() as f64;
+                let offset = spreading_quantile(quantile, spread);
+                let (sine, cosine) = (state.heading + offset).sin_cos();
                 components.push(Wave {
                     amplitude,
                     wavenumber: frequency * frequency / gravity,
                     frequency,
                     phase: phases.next(),
                     // A compass bearing: x is north, y is east.
-                    direction: (cos_heading, sin_heading),
+                    direction: (cosine, sine),
                 });
             }
         }
@@ -454,6 +618,10 @@ mod tests {
             components: 1,
             peak_period: 6.0,
             heading: 0.0,
+            // Unidirectional, so that "a wavelength north" is a wavelength along
+            // the wave and not a slanted section through it. Dispersion is what
+            // this measures; the fan has its own test.
+            spreading: 0.0,
             ..SeaState::default()
         };
         let sea = Seaway::new(state, GRAVITY);
@@ -619,10 +787,15 @@ mod tests {
     /// call site.
     #[test]
     fn the_heading_points_where_the_waves_go() {
+        // Unidirectional, because the claim is about the *mean* heading and a fan
+        // around it would blur exactly the "across it, nothing varies" half of
+        // the check. The fan's own centring is asserted in
+        // `the_realised_directions_follow_the_spread`.
         let northward = Seaway::new(
             SeaState {
                 components: 1,
                 heading: 0.0,
+                spreading: 0.0,
                 ..moderate()
             },
             GRAVITY,
@@ -631,6 +804,7 @@ mod tests {
             SeaState {
                 components: 1,
                 heading: 0.5 * PI,
+                spreading: 0.0,
                 ..moderate()
             },
             GRAVITY,
@@ -673,6 +847,11 @@ mod tests {
     /// If this fails after an intentional change, the shader is now wrong too.
     #[test]
     fn the_synthesis_convention_is_pinned() {
+        // Unidirectional on purpose. This test pins the frequency, amplitude and
+        // phase conventions, and mixing the direction machinery into it would
+        // mean a change to the spreading law showed up as a failure here, in a
+        // test about something else. `the_realised_directions_follow_the_spread`
+        // pins the other half.
         let sea = Seaway::new(
             SeaState {
                 significant_height: 2.0,
@@ -680,6 +859,7 @@ mod tests {
                 heading: 0.5,
                 components: 8,
                 seed: 12345,
+                spreading: 0.0,
             },
             9.81,
         );
@@ -777,5 +957,115 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The property the whole spreading change exists for.
+    ///
+    /// A unidirectional sea is a function of one horizontal coordinate: walk
+    /// along a crest, perpendicular to the heading, and the surface does not
+    /// move. That is what makes such a sea look like corrugated iron out to the
+    /// horizon, and it is a physical claim about the water rather than a
+    /// complaint about the picture — a hull in a long-crested head sea feels no
+    /// asymmetry across its beam and so no wave-induced roll.
+    ///
+    /// Measured along the crest direction, at a spacing well over a wavelength so
+    /// that a small residue could not pass for a wave.
+    #[test]
+    fn a_spread_sea_is_not_a_function_of_one_coordinate() {
+        let along_crest = |spreading: f64| {
+            let heading = 0.0;
+            let sea = Seaway::new(
+                SeaState {
+                    significant_height: 2.0,
+                    peak_period: 6.0,
+                    heading,
+                    components: 60,
+                    seed: 4,
+                    spreading,
+                },
+                9.81,
+            );
+            // Heading is north, so the crests run east: sample along east.
+            let samples: Vec<f64> = (0..48)
+                .map(|step| sea.elevation(0.0, f64::from(step) * 37.0, 0.0))
+                .collect();
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            (samples.iter().map(|it| (it - mean).powi(2)).sum::<f64>() / samples.len() as f64)
+                .sqrt()
+        };
+
+        // Long-crested: the surface is constant along the crest, to the bit.
+        assert!(
+            along_crest(0.0) < 1e-12,
+            "a unidirectional sea varied along its own crests"
+        );
+
+        // Short-crested: the variation along the crest is a real sea's worth. Not
+        // compared against a published number — there is no measurement campaign
+        // here — but against the sea's own scale: a spread sea should vary along
+        // the crest by a decent fraction of its standard deviation.
+        let deviation = 2.0 / 4.0;
+        let spread = along_crest(10.0);
+        assert!(
+            spread > 0.3 * deviation,
+            "a spread sea barely varied along the crest: {spread:.3} m against {deviation:.3} m"
+        );
+    }
+
+    /// The directions themselves, against the law they are drawn from.
+    ///
+    /// Two claims worth pinning, both of which a plausible sign or normalisation
+    /// error breaks: the fan is centred on the sea's heading, and it is narrower
+    /// for a larger exponent. Checked with circular statistics, because a mean of
+    /// bearings taken as plain numbers is meaningless.
+    #[test]
+    fn the_realised_directions_follow_the_spread() {
+        let circular = |spreading: f64| {
+            let heading = 1.1;
+            let sea = Seaway::new(
+                SeaState {
+                    significant_height: 2.0,
+                    peak_period: 6.0,
+                    heading,
+                    components: 200,
+                    seed: 9,
+                    spreading,
+                },
+                9.81,
+            );
+            // Weighted by variance, which is what the spreading function is a
+            // distribution of: an unweighted mean would be dominated by the
+            // near-zero-amplitude tail of the band.
+            let mut north = 0.0;
+            let mut east = 0.0;
+            let mut total = 0.0;
+            for wave in sea.waves() {
+                let weight = wave.amplitude * wave.amplitude;
+                north += weight * wave.direction.0;
+                east += weight * wave.direction.1;
+                total += weight;
+            }
+            let resultant = (north * north + east * east).sqrt() / total;
+            let mean = east.atan2(north);
+            // Circular standard deviation, radians.
+            (mean, (-2.0 * resultant.ln()).sqrt())
+        };
+
+        let (narrow_mean, narrow) = circular(25.0);
+        let (wide_mean, wide) = circular(3.0);
+
+        assert_relative_eq!(narrow_mean, 1.1, epsilon = 0.05);
+        assert_relative_eq!(wide_mean, 1.1, epsilon = 0.12);
+        assert!(
+            narrow < wide,
+            "a larger exponent gave a wider fan: {:.3} against {:.3} rad",
+            narrow,
+            wide
+        );
+        // And the fan is a fan, not a line and not a puddle.
+        assert!(
+            (0.05..1.4).contains(&narrow) && (0.1..1.6).contains(&wide),
+            "spreads out of any physical range: {narrow:.3}, {wide:.3} rad"
+        );
     }
 }

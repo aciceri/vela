@@ -253,6 +253,9 @@ fn a_beam_sea_rolls_the_boat_and_a_calm_does_not() {
         // From abeam, which is what makes this a roll test rather than a pitch one.
         heading: std::f64::consts::FRAC_PI_2,
         seed: 11,
+        // Long-crested, so that "from abeam" means exactly abeam. Spreading
+        // would only add roll, so this is also the harder condition to pass.
+        spreading: 0.0,
     };
     let dt = 0.01;
     let swing = |mut sim: Sim| {

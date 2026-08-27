@@ -238,6 +238,10 @@ fn a_hull_rides_a_wave_much_longer_than_itself() {
         components: 1,
         heading: 0.0,
         seed: 7,
+        // Long-crested. A response amplitude operator is defined for a
+        // long-crested wave, and a single component with a direction drawn off
+        // the heading would not be the wave this test is about.
+        spreading: 0.0,
     };
     let sea = Seaway::new(state, 9.81);
     // One component of variance a^2/2 gives H_s = 4a/sqrt(2).
@@ -386,6 +390,8 @@ fn the_wave_following_pose_becomes_an_equilibrium_in_long_waves() {
             components: 1,
             heading: 0.0,
             seed: 7,
+            // Long-crested: see the note in the quasi-static test above.
+            spreading: 0.0,
         };
         let sea = Seaway::new(state, 9.81);
         let mut sim = in_water(
