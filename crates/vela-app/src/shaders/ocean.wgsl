@@ -153,36 +153,70 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     return out;
 }
 
-/// A cheap 2D hash, in `[0, 1)`. Dave Hoskins' `hash12`: no transcendentals, and
-/// the same one `vela::atmosphere` uses so the two noises are of a piece.
-fn hash(cell: vec2<f32>) -> f32 {
-    var scattered = fract(vec3<f32>(cell.xyx) * 0.1031);
+/// A cheap 2D vector hash, roughly uniform in `[-1, 1]²`. Dave Hoskins' `hash22`.
+///
+/// Two outputs rather than one because what this feeds is a *gradient* per lattice
+/// point, and no transcendentals because a `cos`/`sin` pair per corner per octave
+/// is four sines a fragment for a direction nobody can identify.
+fn hash_gradient(cell: vec2<f32>) -> vec2<f32> {
+    var scattered = fract(vec3<f32>(cell.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
     scattered = scattered + dot(scattered, scattered.yzx + 33.33);
-    return fract((scattered.x + scattered.y) * scattered.z);
+    return fract((scattered.xx + scattered.yz) * scattered.zy) * 2.0 - 1.0;
 }
 
-/// Gradient of a smooth value-noise field, for perturbing a normal.
+/// Slope of a smooth gradient-noise field, for perturbing a normal.
 ///
-/// Returns the two partial derivatives rather than the value: nothing here needs
-/// the height, only the slope it would have had. Differentiating the interpolant
-/// analytically is exact and costs one extra multiply over evaluating it.
+/// # Why gradient noise and not the derivative of value noise
+///
+/// This was the derivative of value noise, and it drew a grid. The reason is
+/// arithmetic rather than bad luck: value noise interpolates hashed *heights* with
+/// `f²(3 - 2f)`, whose derivative is `6f(1 - f)`, and that vanishes at `f = 0` and
+/// `f = 1` — on every cell boundary. The slope field therefore has a line of
+/// exactly zero slope along every lattice edge, and a sea lit through those lines
+/// shows a tiling of squares, most visible at a grazing angle where a single cell
+/// spans many pixels of screen.
+///
+/// Gradient noise interpolates hashed *gradients* instead, so the derivative on a
+/// cell boundary is the lattice gradient there rather than zero, and there is no
+/// structure to see. The quintic weight is Perlin's improved one: its second
+/// derivative also vanishes at the boundaries, which the cubic's does not, and a
+/// discontinuous curvature in a slope field is visible as faint creases along the
+/// same lines this is meant to remove.
+///
+/// Returns only the two partials. Nothing here wants the height — the wave sum
+/// already owns the surface — and the value would cost an extra dot product.
 fn ripple_slope(at: vec2<f32>) -> vec2<f32> {
     let cell = floor(at);
     let offset = fract(at);
-    let a = hash(cell);
-    let b = hash(cell + vec2<f32>(1.0, 0.0));
-    let c = hash(cell + vec2<f32>(0.0, 1.0));
-    let d = hash(cell + vec2<f32>(1.0, 1.0));
 
-    // Smoothstep weights and their derivative.
-    let weight = offset * offset * (3.0 - 2.0 * offset);
-    let slope = 6.0 * offset * (1.0 - offset);
+    let g00 = hash_gradient(cell);
+    let g10 = hash_gradient(cell + vec2<f32>(1.0, 0.0));
+    let g01 = hash_gradient(cell + vec2<f32>(0.0, 1.0));
+    let g11 = hash_gradient(cell + vec2<f32>(1.0, 1.0));
 
-    let bottom = b - a;
-    let top = d - c;
+    // Each corner's contribution is its gradient dotted with the offset from it.
+    let v00 = dot(g00, offset);
+    let v10 = dot(g10, offset - vec2<f32>(1.0, 0.0));
+    let v01 = dot(g01, offset - vec2<f32>(0.0, 1.0));
+    let v11 = dot(g11, offset - vec2<f32>(1.0, 1.0));
+
+    // Quintic weight and its derivative.
+    let weight = offset * offset * offset * (offset * (offset * 6.0 - 15.0) + 10.0);
+    let slope = 30.0 * offset * offset * (offset * (offset - 2.0) + 1.0);
+
+    // Bilinear blend of the four contributions, differentiated by hand: the weights
+    // move as well as the values, and dropping the second term is what makes a
+    // hand-rolled gradient noise look subtly wrong.
+    let bottom = mix(v00, v10, weight.x);
+    let top = mix(v01, v11, weight.x);
+    let d_bottom_dx = mix(g00.x, g10.x, weight.x) + slope.x * (v10 - v00);
+    let d_top_dx = mix(g01.x, g11.x, weight.x) + slope.x * (v11 - v01);
+    let d_bottom_dy = mix(g00.y, g10.y, weight.x);
+    let d_top_dy = mix(g01.y, g11.y, weight.x);
+
     return vec2<f32>(
-        slope.x * mix(bottom, top, weight.y),
-        slope.y * ((c - a) + weight.x * (top - bottom)),
+        mix(d_bottom_dx, d_top_dx, weight.y),
+        mix(d_bottom_dy, d_top_dy, weight.y) + slope.y * (top - bottom),
     );
 }
 
@@ -211,22 +245,43 @@ fn ripple_slope(at: vec2<f32>) -> vec2<f32> {
 /// changes is the normal a fragment reflects with — which is also, physically,
 /// almost all that a centimetre-scale ripple does.
 ///
-/// Two octaves travelling in different directions at different speeds, because
-/// one octave drifting one way reads as a moving texture rather than as water.
-/// Faded out with distance: beyond a hundred metres a ripple is far below a pixel
-/// and keeping it only produces aliasing that no amount of sampling removes.
+/// # Why the scale follows the distance
+///
+/// The obvious thing is to fade this out with range, and that was the first
+/// attempt: beyond a hundred metres a ripple is below a pixel, and asking for it
+/// there is asking for aliasing. But the displacement fades out by two hundred
+/// metres too — a mesh with metre-scale triangles cannot carry a twenty metre wave
+/// without shimmering — so fading both left the sea a *perfectly flat mirror* from
+/// two hundred metres to the haze. That is most of the screen, and it is the
+/// strange smooth band a viewer notices immediately: water does not stop having
+/// texture because it is far away.
+///
+/// So the feature size grows with distance instead, keeping the ripple roughly
+/// constant in *screen* space. That is what a mip level does, done by hand:
+/// aliasing comes from detail below a pixel, and the cure is to stop asking for
+/// detail below a pixel rather than to stop asking for detail.
+///
+/// Two octaves travelling in different directions at different speeds, because one
+/// octave drifting one way reads as a moving texture rather than as water.
 fn ripples(plane: vec2<f32>, time: f32, distance: f32) -> vec2<f32> {
-    let fade = 1.0 - smoothstep(30.0, 160.0, distance);
-    if (fade <= 0.0) {
-        return vec2<f32>(0.0, 0.0);
-    }
+    // One at the reference range, coarsening beyond it. Never below: the near
+    // water is where the detail belongs at its true size.
+    let coarsen = max(distance / 45.0, 1.0);
 
-    // Roughly 0.6 m and 0.22 m features. Chosen to sit below the shortest wave
-    // the realisation carries, so this adds to the spectrum rather than competing
-    // with it.
-    let first = ripple_slope(plane * 1.7 + vec2<f32>(0.31, -0.18) * time) * 0.055;
-    let second = ripple_slope(plane * 4.6 + vec2<f32>(-0.24, 0.37) * time) * 0.026;
-    return (first + second) * fade;
+    // Roughly 0.6 m and 0.22 m features at the reference range, both below the
+    // shortest wave the realisation carries, so this adds to the spectrum rather
+    // than competing with it.
+    //
+    // The amplitudes are deliberately *not* rescaled with `coarsen`. What
+    // `ripple_slope` returns is a derivative with respect to its own argument, and
+    // the magnitude of that does not depend on how the argument was scaled — so
+    // widening the feature while keeping the amplitude keeps the slope the light
+    // sees. Compensating "to preserve the slope", which this did first,
+    // multiplies it by a hundred and seventy at the horizon and turns the far sea
+    // into razor wire.
+    let first = ripple_slope((plane * 1.7 + vec2<f32>(0.31, -0.18) * time) / coarsen) * 0.016;
+    let second = ripple_slope((plane * 4.6 + vec2<f32>(-0.24, 0.37) * time) / coarsen) * 0.008;
+    return first + second;
 }
 
 /// A specular lobe that sharpens with distance.
