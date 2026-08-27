@@ -35,6 +35,7 @@ mod helm;
 mod hud;
 mod ocean;
 mod sim;
+mod sky;
 mod view;
 
 use bevy::prelude::*;
@@ -60,6 +61,10 @@ fn main() {
         // an assets directory, so there is no asset path to configure and no
         // directory to ship. See `ocean`.
         .add_plugins(ocean::OceanPlugin)
+        // The sky owns the sun, and registers the atmosphere library that it and
+        // the ocean both import. Before the ocean would work too; after it is
+        // where a reader looks for "what is the water reflecting".
+        .add_plugins(sky::SkyPlugin)
         .add_plugins(sim::EnginePlugin)
         .init_resource::<view::Orbit>()
         .init_resource::<hud::FrameRate>()
@@ -84,6 +89,13 @@ fn main() {
                 .after(helm::steer),
         )
         // The camera follows the boat's drawn pose, so it must run after it.
-        .add_systems(Update, (view::orbit, view::chase.after(boat::follow)))
+        .add_systems(
+            Update,
+            (
+                view::orbit,
+                view::orbit_with_mouse,
+                view::chase.after(boat::follow),
+            ),
+        )
         .run();
 }

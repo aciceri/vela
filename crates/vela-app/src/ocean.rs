@@ -92,10 +92,25 @@ pub struct SeaUniform {
     pub count: u32,
     /// The **engine's** time, s. See the module documentation.
     pub time: f32,
+    /// Significant wave height of the realisation, m.
+    ///
+    /// The shader needs a scale to judge a crest against: "steep and high" is
+    /// meaningless without one, and the foam threshold has to mean the same thing
+    /// in a half-metre chop as in a four-metre sea. Sits here rather than being
+    /// recomputed in the shader because it is a property of the realisation, and
+    /// it packs into the same sixteen-byte slot as the two fields above it.
+    pub significant_height: f32,
     /// Colour of deep water, linear RGB.
     pub deep: Vec3,
     /// Colour where the surface faces the sky, linear RGB.
     pub shallow: Vec3,
+    /// Direction towards the sun, `.w` unused.
+    ///
+    /// Taken from [`crate::sky::SUN`] rather than chosen here: the same constant
+    /// orients the `DirectionalLight`, and a highlight that did not line up with
+    /// the sun lighting the boat is the kind of wrongness that is obvious on
+    /// screen and invisible in the code.
+    pub sun: Vec4,
 }
 
 /// The ocean surface material.
@@ -140,12 +155,19 @@ impl OceanMaterial {
             };
         }
 
+        // Deeper and less saturated than a postcard sea on purpose. This is the
+        // *transmitted* colour, seen only where the Fresnel term lets it through;
+        // the blue a viewer actually reads is mostly the reflected sky, which is
+        // how water works and why picking water colours by eye without the
+        // reflection in place produces something that looks like paint.
         Self {
             sea: SeaUniform {
                 count: source.len() as u32,
                 time: time as f32,
-                deep: Vec3::new(0.008, 0.035, 0.070),
-                shallow: Vec3::new(0.060, 0.180, 0.230),
+                significant_height: sea.state().significant_height as f32,
+                deep: Vec3::new(0.004, 0.022, 0.045),
+                shallow: Vec3::new(0.055, 0.200, 0.180),
+                sun: crate::sky::SUN.normalize().extend(0.0),
             },
             waves,
         }
@@ -161,38 +183,59 @@ impl OceanMaterial {
     }
 }
 
-/// The embedded WGSL, as an asset path.
+/// One of this module's embedded shaders, as an asset path.
 ///
 /// `embedded_path!` gives the path the `embedded_asset!` in [`OceanPlugin`]
 /// registered it under; the `embedded` source has to be named explicitly because
 /// the default source is the filesystem. This is the same two-step
 /// `StandardMaterial` uses for its own shader.
-fn shader() -> ShaderRef {
-    ShaderRef::Path(
-        AssetPath::from_path_buf(embedded_path!("shaders/ocean.wgsl")).with_source("embedded"),
-    )
+macro_rules! embedded_shader {
+    ($file:literal) => {
+        ShaderRef::Path(AssetPath::from_path_buf(embedded_path!($file)).with_source("embedded"))
+    };
 }
 
 impl Material for OceanMaterial {
     fn vertex_shader() -> ShaderRef {
-        shader()
+        embedded_shader!("shaders/ocean.wgsl")
     }
 
     fn fragment_shader() -> ShaderRef {
-        shader()
+        embedded_shader!("shaders/ocean.wgsl")
+    }
+
+    /// The depth and shadow passes need the same displacement as the visible one.
+    ///
+    /// Without this override they get Bevy's default, which draws the flat grid:
+    /// the boat's shadow would then land on a plane at the mean water level while
+    /// the water it is supposed to fall on is a metre higher or lower. See
+    /// `shaders/ocean_prepass.wgsl`.
+    fn prepass_vertex_shader() -> ShaderRef {
+        embedded_shader!("shaders/ocean_prepass.wgsl")
+    }
+
+    /// Opaque, and therefore depth-writing.
+    ///
+    /// The transparency is faked by the Fresnel mix rather than by blending. Real
+    /// alpha would put the sea in the transparent phase, where it stops writing
+    /// depth and stops occluding the hull below the waterline — a boat seen
+    /// through its own water, keel and all.
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Opaque
     }
 }
 
-/// Registers the ocean material and its shader.
+/// Registers the ocean material and its shaders.
 ///
-/// Both together on purpose: a material whose shader was not embedded fails at
-/// the first frame with a missing-asset error, and the two lines belong in one
-/// place so that cannot happen.
+/// All together on purpose: a material whose shader was not embedded fails at
+/// the first frame with a missing-asset error, and the lines belong in one place
+/// so that cannot happen.
 pub struct OceanPlugin;
 
 impl Plugin for OceanPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/ocean.wgsl");
+        embedded_asset!(app, "shaders/ocean_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<OceanMaterial>::default());
     }
 }
@@ -210,6 +253,7 @@ mod tests {
                 heading: 0.7,
                 components,
                 seed: 9,
+                spreading: 8.0,
             },
             9.81,
         )

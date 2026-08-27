@@ -16,12 +16,21 @@
 //! hard over in about two seconds on a boat this size, and a mainsheet through
 //! its full travel in about three.
 //!
-//! The rudder centres itself when neither key is held. That is a lie about a
-//! tiller and a truth about a wheel, and it is here for a reason the engine
-//! makes unavoidable: §5.5a records that a boat with a fixed rudder has no course
-//! stability at all, so a helm that stayed where it was left would send the boat
-//! into a slow uncommanded turn the moment the player stopped steering. Centring
-//! is the smallest honest stand-in for a helmsman.
+//! The rudder returns to its *balanced* angle when neither key is held — not to
+//! amidships. A sailing boat is not balanced with the rudder centred: the sails'
+//! side force acts forward of the lateral plane's centre, the hull carries a
+//! standing yaw moment against it, and holding a straight course takes a
+//! permanent angle of weather helm. `Engine::balanced_helm` is the angle the
+//! equilibrium solve found, so returning there is returning to the trim the boat
+//! was released in, and the boat sails itself with nobody touching anything.
+//!
+//! Returning to zero instead — which this file did first — releases a perfectly
+//! trimmed boat with its helm in the wrong place. It luffs up within seconds and
+//! stops, and the fault reads as a physics problem when it is a frontend one.
+//! §5.5a is still true and still the reason a helm has to return anywhere at all:
+//! with a fixed rudder there is no course stability, so a helm left wherever the
+//! player abandoned it walks the boat into a slow uncommanded turn. Returning to
+//! the balanced angle is the smallest honest stand-in for a helmsman.
 
 use bevy::prelude::*;
 use vela_core::equilibrium::MAX_HELM;
@@ -59,13 +68,15 @@ pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMu
     }
 
     if steering == 0.0 {
-        // Towards centre, never past it: a decay would leave a residual angle
-        // forever and a step could overshoot into the other tack.
+        // Towards the balanced helm, never past it: a decay would leave a
+        // residual offset forever and a step could overshoot into the other tack.
+        let balanced = engine.balanced_helm;
+        let error = balanced - controls.rudder_angle;
         let step = CENTRING_RATE * dt;
-        controls.rudder_angle = if controls.rudder_angle.abs() <= step {
-            0.0
+        controls.rudder_angle = if error.abs() <= step {
+            balanced
         } else {
-            controls.rudder_angle - step * controls.rudder_angle.signum()
+            controls.rudder_angle + step * error.signum()
         };
     } else {
         controls.rudder_angle =

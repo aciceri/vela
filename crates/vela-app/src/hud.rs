@@ -46,7 +46,8 @@ pub fn spawn(mut commands: Commands) {
         Text::new(
             "left/right  helm        up/down  mainsheet\n\
              q/e  traveller          f/r  flatten\n\
-             j/l  orbit              i/k  raise      u/o  zoom",
+             j/l  orbit              i/k  raise      u/o  zoom\n\
+             right-drag orbit   wheel zoom",
         ),
         TextFont {
             font_size: 13.0.into(),

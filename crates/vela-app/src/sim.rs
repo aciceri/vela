@@ -50,9 +50,23 @@ const WIND_ANGLE: f64 = 45.0;
 
 /// The sea the boat is released into.
 ///
-/// A metre of significant height at a six second period: a real sea for a
-/// forty-footer, and enough that the surface visibly moves without putting the
-/// appendage model somewhere §5.5a says not to trust it.
+/// A metre at six seconds: a moderate sea for a forty-footer, and the condition
+/// every seakeeping number quoted in `docs/functional-analysis.md` was measured
+/// at.
+///
+/// It was briefly raised to a metre and a half, to make the water look like it
+/// had weather in it. `examples/motion_scale` is why it came back down: at that
+/// height the boat swings seventeen degrees of trim and nearly three metres of
+/// sinkage against a hull only 1.84 m deep, which is roughly twice a real
+/// forty-footer's response. The natural periods are right — heave 2.2 s, pitch
+/// 2.1 s, both inside the published band — so this is not a scale error but an
+/// amplitude one, and §5.4 already names its two causes: no diffraction, so the
+/// Froude-Krylov excitation is over-predicted at wavelengths near the hull's own,
+/// and no viscous damping, so nothing limits the response where the spectrum
+/// overlaps the pitch resonance.
+///
+/// Choosing the sea to flatter the model would have been the wrong lever, and
+/// choosing it to stay inside what the model is measured at is the right one.
 const WAVE_HEIGHT: f64 = 1.0;
 const WAVE_PERIOD: f64 = 6.0;
 
@@ -82,6 +96,21 @@ pub struct Engine {
     /// than faking with a zero-height sea: a flat surface and a sea of no waves
     /// are the same picture and not the same object.
     pub sea: Option<vela_core::seaway::Seaway>,
+    /// Rudder angle that balances the boat at the condition it was released in,
+    /// radians.
+    ///
+    /// The helm a hand would hold, not amidships. A sailing boat is not balanced
+    /// with the rudder centred — the sails' side force acts forward of the
+    /// lateral plane's centre and the hull carries a permanent yaw moment against
+    /// it, so a straight course needs a standing angle of weather helm. The
+    /// equilibrium solve computes it, and this is where the answer is kept so the
+    /// frontend can return the helm *there* when nobody is steering.
+    ///
+    /// Centring on zero instead, which is what this file did first, releases a
+    /// perfectly trimmed boat with its rudder in the wrong place: it luffs up
+    /// within seconds and stops. That looked like a physics problem and was a
+    /// frontend one.
+    pub balanced_helm: f64,
 }
 
 impl Engine {
@@ -151,6 +180,7 @@ impl Engine {
             rig,
             mast_at: spec.layout.map(|layout| layout.mast_at),
             sea: Some(realisation),
+            balanced_helm: helm.rudder_angle,
         })
     }
 }
