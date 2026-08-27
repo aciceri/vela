@@ -270,7 +270,22 @@ pub fn spawn(
                 HORIZON_RINGS,
             ))),
             MeshMaterial3d(ocean),
-            Transform::default(),
+            // Held a hand's breadth below the near grid, and that offset is the
+            // whole fix for a real artefact.
+            //
+            // The ring's inner radius is the circle *inscribed* in the near grid's
+            // square, so the square's corners reach out to `REACH * sqrt(2)` and
+            // overlap the ring across a band two hundred metres wide. Out there
+            // both surfaces are flat -- the displacement has faded to nothing by
+            // 200 m -- so they are exactly coplanar, and two coplanar surfaces
+            // fighting over the same depth is the flicker that shows up as
+            // "something odd near the horizon".
+            //
+            // Five centimetres settles it in the near grid's favour everywhere
+            // they meet. At two hundred metres and beyond that is far under a
+            // pixel of parallax, and nothing else in the scene is within metres of
+            // the water to notice.
+            Transform::from_xyz(0.0, -0.05, 0.0),
             Sea,
             // The sea casts no shadow. Nothing in this scene is under it, and
             // leaving it a caster put both tessellations -- seventy-eight thousand
@@ -397,7 +412,12 @@ pub fn follow_sea(engine: Res<Engine>, mut seas: Query<&mut Transform, With<Sea>
         (centre.z / step).round() * step,
     );
     for mut transform in &mut seas {
-        transform.translation = snapped;
+        // Horizontal only. The two tessellations sit at different heights on
+        // purpose — see the ring's own comment — and overwriting the whole
+        // translation here would flatten them back together and bring the depth
+        // fighting with it.
+        transform.translation.x = snapped.x;
+        transform.translation.z = snapped.z;
     }
 }
 

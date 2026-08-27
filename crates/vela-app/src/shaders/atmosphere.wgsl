@@ -32,10 +32,16 @@ const ZENITH: vec3<f32> = vec3<f32>(0.10, 0.26, 0.56);
 /// Colour the sky fades to at the horizon: hazier, warmer, much paler.
 const HAZE: vec3<f32> = vec3<f32>(0.56, 0.66, 0.74);
 
-/// Colour below the horizon, which only shows through the sea's reflection when
-/// a wave face is steep enough to reflect downwards. Kept close to the haze so
-/// that such a facet reads as a dull reflection rather than as a hole.
-const NADIR: vec3<f32> = vec3<f32>(0.22, 0.28, 0.33);
+/// Colour below the horizon.
+///
+/// Two things see it, and both want it close to the haze. A wave face steep
+/// enough to reflect downwards should read as a dull patch of sky rather than as a
+/// hole; and the dome shows a thin sliver of it *below* the far sea, because a sea
+/// cut off at eight kilometres has its edge a fifth of a degree under the true
+/// horizon. A dark nadir drew that sliver as a dark line along the horizon, which
+/// is the second half of "something odd out there". Only a shade below the haze
+/// now, so the sliver is invisible whether or not it is covered.
+const NADIR: vec3<f32> = vec3<f32>(0.50, 0.60, 0.69);
 
 /// Colour and strength of the sun itself.
 const SUN_COLOUR: vec3<f32> = vec3<f32>(1.0, 0.93, 0.80);
