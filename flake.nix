@@ -86,6 +86,35 @@
           };
 
           cargoLock.lockFile = ./Cargo.lock;
+
+          # What Bevy links against. Split from the runtime set below because
+          # they are different questions: these have to be present to compile
+          # and link, those have to be findable when a window opens.
+          graphicsBuildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.alsa-lib
+            pkgs.udev
+            pkgs.libxkbcommon
+            pkgs.wayland
+            pkgs.xorg.libX11
+            pkgs.xorg.libXcursor
+            pkgs.xorg.libXi
+            pkgs.xorg.libXrandr
+            pkgs.vulkan-loader
+          ];
+
+          # Loaded by name at runtime rather than linked, so a plain `cargo run`
+          # needs them on the loader path. This is the one piece of NixOS
+          # awkwardness the frontend introduces, and it is why `nix develop` sets
+          # it rather than leaving it to the reader.
+          graphicsRuntime = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.vulkan-loader
+            pkgs.libxkbcommon
+            pkgs.wayland
+            pkgs.xorg.libX11
+            pkgs.xorg.libXcursor
+            pkgs.xorg.libXi
+            pkgs.xorg.libXrandr
+          ];
         in
         {
           _module.args.pkgs = import nixpkgs {
@@ -103,14 +132,24 @@
               version = "0.1.0";
               inherit src cargoLock;
 
+              nativeBuildInputs = [ pkgs.pkg-config ];
+              buildInputs = graphicsBuildInputs;
+
               meta = {
                 description = "Sailing yacht physics engine";
                 platforms = lib.platforms.unix;
               };
             };
 
-            # Proves the core stays wasm-compatible: no system BLAS, no threads,
-            # no renderer deps sneaking in.
+            # Proves the engine stays wasm-compatible: no system BLAS, no
+            # threads, no renderer deps sneaking in.
+            #
+            # Scoped to the engine and its headless driver rather than the whole
+            # workspace, because the frontend's answer to "does this cross-compile
+            # to wasm" is a different and much larger question — it needs a
+            # graphics backend feature and `wasm-bindgen` to produce anything
+            # runnable. Building it here would turn a fast structural check into
+            # a slow one and would stop testing the thing this check is for.
             vela-wasm = rustPlatform.buildRustPackage {
               pname = "vela-wasm-check";
               version = "0.1.0";
@@ -118,16 +157,74 @@
 
               buildPhase = ''
                 runHook preBuild
-                cargo build --release --target wasm32-unknown-unknown --workspace
+                cargo build --release --target wasm32-unknown-unknown \
+                  -p vela-core -p vela-cli
                 runHook postBuild
               '';
               # Cross-compiled artifacts cannot run here.
               doCheck = false;
-              # The check is "does the core still cross-compile"; the artifacts
+              # The check is "does the engine still cross-compile"; the artifacts
               # are not the deliverable, so nothing is kept.
               installPhase = ''
                 runHook preInstall
                 mkdir -p $out
+                runHook postInstall
+              '';
+            };
+
+            # The frontend, cross-compiled and bundled for a browser.
+            #
+            # Separate from `vela-wasm` on purpose: this is the deliverable and
+            # that is a structural check. This one links a graphics backend and
+            # runs `wasm-bindgen`, so it is slow and its output is a directory
+            # someone can serve.
+            vela-web = rustPlatform.buildRustPackage {
+              pname = "vela-web";
+              version = "0.1.0";
+              inherit src cargoLock;
+
+              # Version-matched on purpose: `wasm-bindgen` embeds a schema
+              # version in the module and the CLI refuses to read a module it did
+              # not write. The bound is enforced from the other side too, by an
+              # exact `wasm-bindgen` pin in `crates/vela-app/Cargo.toml`; the two
+              # move together or the build fails loudly, which is the good case.
+              nativeBuildInputs = [
+                pkgs.wasm-bindgen-cli_0_2_126
+                # `wasm-opt`. Run after `wasm-bindgen` rather than instead of the
+                # release profile: the two shrink different things. Cargo drops
+                # debug information; binaryen rewrites the code, and on a module
+                # this size that is several more megabytes off the download.
+                pkgs.binaryen
+              ];
+
+              buildPhase = ''
+                runHook preBuild
+                cargo build --release --target wasm32-unknown-unknown -p vela-app
+                runHook postBuild
+              '';
+              doCheck = false;
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out
+                wasm-bindgen --no-typescript --target web --out-dir $out \
+                  target/wasm32-unknown-unknown/release/vela-app.wasm
+
+                # `-O2` rather than `-Oz`: this module contains a 60 Hz physics
+                # loop, and trading its speed for bytes is the wrong way round
+                # for a simulator. Size still falls substantially.
+                wasm-opt -O2 --strip-debug -o $out/vela-app_bg.wasm.opt \
+                  $out/vela-app_bg.wasm
+                mv $out/vela-app_bg.wasm.opt $out/vela-app_bg.wasm
+
+                # No assets directory: the ocean shader is embedded in the
+                # binary, so what a browser needs is the module, the glue and the
+                # page. Anything else here would be a file nobody fetches.
+                cp crates/vela-app/index.html $out/index.html
+
+                # Printed because it is the number that decides whether anyone
+                # waits for the link to load.
+                echo "vela-web: $(du -h --apparent-size $out/vela-app_bg.wasm | cut -f1) wasm," \
+                  "$(gzip -c $out/vela-app_bg.wasm | wc -c | numfmt --to=iec) gzipped"
                 runHook postInstall
               '';
             };
@@ -137,6 +234,12 @@
             # cargo build + cargo test, via the package's own check phase.
             vela = self.packages.${system}.vela;
             wasm = self.packages.${system}.vela-wasm;
+
+            # The deliverable itself. In `checks` and not only in `packages`
+            # because a frontend that stops cross-compiling is the failure this
+            # project would notice last and care about most: the native build
+            # keeps working, the tests keep passing, and the link stops existing.
+            web = self.packages.${system}.vela-web;
 
             fmt = rustPlatform.buildRustPackage {
               pname = "vela-fmt";
@@ -151,6 +254,13 @@
               pname = "vela-clippy";
               version = "0.1.0";
               inherit src cargoLock;
+
+              # The frontend is in the workspace, so `--all-targets` links Bevy's
+              # windowing crates and needs what they need. Without these the check
+              # fails on `wayland-sys` rather than on any lint.
+              nativeBuildInputs = [ pkgs.pkg-config ];
+              buildInputs = graphicsBuildInputs;
+
               # cargo-clippy ships in buildToolchain, already on PATH.
               buildPhase = "cargo clippy --all-targets --workspace -- -D warnings";
               doCheck = false;
@@ -162,7 +272,14 @@
             packages = [
               devToolchain
               pkgs.cargo-nextest
-            ];
+              pkgs.pkg-config
+              pkgs.wasm-bindgen-cli_0_2_126
+            ]
+            ++ graphicsBuildInputs;
+
+            # Bevy loads Vulkan and the windowing libraries by name at runtime,
+            # which on NixOS means they have to be on the loader path explicitly.
+            LD_LIBRARY_PATH = lib.makeLibraryPath graphicsRuntime;
 
             shellHook = ''
               echo "vela devshell — $(rustc --version)"

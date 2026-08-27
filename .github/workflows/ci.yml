@@ -39,3 +39,37 @@ jobs:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - run: nix build -L '.#${{ matrix.attr }}'
+
+  # Publishes the browser bundle, which is how anyone is meant to see this
+  # project at all. Only from the default branch: a preview per pull request
+  # would need one deployment environment per branch and this is a physics
+  # engine, not a web product.
+  pages:
+    name: Publish the simulator
+    needs: nix-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      # Wider than the workflow default above, and only for this job.
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: Build the bundle
+        run: nix build -L '.#vela-web' --out-link result
+      - name: Copy out of the store
+        # The store path is read-only and the upload action needs to walk a
+        # normal directory, so dereference the symlink and drop the permissions.
+        run: |
+          set -Eeu
+          cp -rL result site
+          chmod -R u+w site
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
