@@ -45,18 +45,27 @@
 use std::f64::consts::PI;
 
 /// One linear wave component of a realisation.
+///
+/// Public because a renderer needs exactly these numbers to draw the water the
+/// physics is using. Named `Wave` rather than `Component` deliberately: the
+/// frontend this is shared with calls something else a component, and a type
+/// that means two things across a boundary is a bug waiting for a busy day.
+///
+/// A realisation is long-crested, so every wave shares one direction; it is
+/// carried per wave anyway rather than alongside, because that is the form the
+/// synthesis below reads and a directional spectrum would need it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Component {
+pub struct Wave {
     /// Amplitude, m.
-    amplitude: f64,
+    pub amplitude: f64,
     /// Wavenumber, rad/m.
-    wavenumber: f64,
+    pub wavenumber: f64,
     /// Radian frequency, rad/s.
-    frequency: f64,
+    pub frequency: f64,
     /// Phase at the origin at `t = 0`, rad.
-    phase: f64,
-    /// Unit direction of travel in the world plane.
-    direction: (f64, f64),
+    pub phase: f64,
+    /// Unit direction of travel in the world plane, as `(north, east)`.
+    pub direction: (f64, f64),
 }
 
 /// How a sea is specified.
@@ -132,7 +141,7 @@ impl SeaState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Seaway {
     state: SeaState,
-    components: Vec<Component>,
+    components: Vec<Wave>,
     gravity: f64,
 }
 
@@ -163,7 +172,7 @@ impl Seaway {
                 // Mid-interval, so that no component sits on the band edges.
                 let frequency = lowest + (index as f64 + 0.5) * step;
                 let amplitude = (2.0 * state.density(frequency) * step).sqrt();
-                components.push(Component {
+                components.push(Wave {
                     amplitude,
                     wavenumber: frequency * frequency / gravity,
                     frequency,
@@ -184,6 +193,20 @@ impl Seaway {
     #[must_use]
     pub fn state(&self) -> SeaState {
         self.state
+    }
+
+    /// The waves this realisation is made of.
+    ///
+    /// This is the shared-realisation contract in its concrete form: a renderer
+    /// that evaluates the closed form of [`Seaway::elevation`] over these waves
+    /// draws exactly the water the physics is standing on, on whatever grid it
+    /// likes, with no per-frame traffic between them. Changing the synthesis
+    /// convention is therefore a breaking change to this crate's public API and
+    /// not an implementation detail, which is what
+    /// `the_synthesis_convention_is_pinned` exists to enforce.
+    #[must_use]
+    pub fn waves(&self) -> &[Wave] {
+        &self.components
     }
 
     /// Surface elevation above the mean level at a world point and time, m,
@@ -249,23 +272,50 @@ impl Seaway {
     /// surface value is the standard treatment.
     #[must_use]
     pub fn pressure_head(&self, north: f64, east: f64, down: f64, time: f64) -> f64 {
-        let mut dynamic = 0.0;
-        let mut elevation = 0.0;
-        for component in &self.components {
-            let along = north * component.direction.0 + east * component.direction.1;
-            elevation += component.amplitude
-                * (component.wavenumber * along - component.frequency * time + component.phase)
-                    .cos();
+        self.depth_and_pressure_head(north, east, down, time).1
+    }
+
+    /// Both of the surface's questions at one point, sharing their expensive half.
+    ///
+    /// Callers that ask "is this wet?" almost always go on to ask "what does it
+    /// carry?", and both answers are built from the same sum over components. A
+    /// hull clip asks the pair at every vertex of a thousand-triangle mesh two
+    /// hundred times a second, so evaluating the elevation once instead of twice
+    /// is a third of the step rather than a micro-optimisation.
+    ///
+    /// Above the surface the second sum is skipped rather than approximated. It
+    /// is not an optimisation with an error: with the decay clamped at the surface
+    /// the dynamic part there is exactly the elevation, so the head is exactly the
+    /// depth, which the first sum already gave. Dry vertices are most of a hull
+    /// above the waterline and the clip discards them, so this is the common case.
+    #[must_use]
+    pub fn depth_and_pressure_head(
+        &self,
+        north: f64,
+        east: f64,
+        down: f64,
+        time: f64,
+    ) -> (f64, f64) {
+        let elevation = self.elevation(north, east, time);
+        let depth = down + elevation;
+        if depth <= 0.0 {
+            return (depth, depth);
         }
-        let attenuation_depth = (down + elevation).max(0.0);
-        for component in &self.components {
-            let along = north * component.direction.0 + east * component.direction.1;
-            dynamic += component.amplitude
-                * (-component.wavenumber * attenuation_depth).exp()
-                * (component.wavenumber * along - component.frequency * time + component.phase)
-                    .cos();
-        }
-        down + dynamic
+
+        // Wheeler stretching: the decay is taken from the instantaneous surface,
+        // which is what makes the head vanish there exactly. See the note above.
+        let attenuation_depth = depth;
+        let dynamic: f64 = self
+            .components
+            .iter()
+            .map(|it| {
+                let along = north * it.direction.0 + east * it.direction.1;
+                it.amplitude
+                    * (-it.wavenumber * attenuation_depth).exp()
+                    * (it.wavenumber * along - it.frequency * time + it.phase).cos()
+            })
+            .sum();
+        (depth, down + dynamic)
     }
 
     /// The variance the realised components actually carry, m².
@@ -602,5 +652,130 @@ mod tests {
             epsilon = 1e-9
         );
         assert!((eastward.elevation(0.0, 20.0, 0.0) - reference).abs() > 1e-6);
+    }
+
+    /// The synthesis convention is public API, and this is what says so.
+    ///
+    /// A renderer resynthesises the same water from [`Seaway::waves`] on its own
+    /// grid, so the convention — the sign of the phase, the direction of the `ω t`
+    /// term, the dispersion relation, the order the waves come out in, and the
+    /// bit pattern of the phase generator — is a contract rather than an
+    /// implementation choice. Any change to it moves the water under a boat that
+    /// is already floating on it.
+    ///
+    /// So this pins the realisation rather than a property of it: a fixed seed
+    /// against elevations recorded from this implementation. It is deliberately a
+    /// stored-number test, which the rest of this file avoids on principle. The
+    /// numbers are not a physical oracle and are not claimed to be one — they are
+    /// the CPU side of an agreement with a shader, and a test that let them drift
+    /// silently would be no agreement at all.
+    ///
+    /// If this fails after an intentional change, the shader is now wrong too.
+    #[test]
+    fn the_synthesis_convention_is_pinned() {
+        let sea = Seaway::new(
+            SeaState {
+                significant_height: 2.0,
+                peak_period: 6.0,
+                heading: 0.5,
+                components: 8,
+                seed: 12345,
+            },
+            9.81,
+        );
+
+        // Dispersion, applied to every wave: a renderer that recomputed `k` from
+        // `ω` with a different gravity would draw waves of the wrong length.
+        for wave in sea.waves() {
+            assert_relative_eq!(
+                wave.wavenumber,
+                wave.frequency * wave.frequency / 9.81,
+                max_relative = 1e-15
+            );
+            assert_relative_eq!(wave.direction.0, 0.5_f64.cos(), max_relative = 1e-15);
+            assert_relative_eq!(wave.direction.1, 0.5_f64.sin(), max_relative = 1e-15);
+        }
+
+        // The first wave, whole: amplitude and phase together, because a phase
+        // generator that changed its stream would keep the amplitudes and move
+        // every crest.
+        let first = sea.waves()[0];
+        assert_relative_eq!(
+            first.amplitude,
+            7.770_671_769_839_567e-5,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(first.phase, 1.589_529_189_573_176_7, max_relative = 1e-12);
+
+        // And the sum, at points and times chosen so that no term is stationary:
+        // this is what a vertex shader has to reproduce.
+        for (north, east, time, expected) in [
+            (0.0, 0.0, 0.0, 6.609_954_400_768_778e-1),
+            (17.0, -9.0, 3.5, -3.359_566_594_173_393e-1),
+            (-40.0, 25.0, 11.25, 6.993_477_678_858_909e-2),
+        ] {
+            assert_relative_eq!(
+                sea.elevation(north, east, time),
+                expected,
+                max_relative = 1e-12
+            );
+        }
+    }
+
+    /// The pressure head against the closed form in the documentation, not
+    /// against the other accessor: `pressure_head` delegates to the pair, so
+    /// comparing the two would be a test that cannot fail. The formula is
+    /// transcribed here from [`Seaway::pressure_head`]'s own doc comment, which
+    /// makes this the oracle for the branch at the surface — where a plausible
+    /// "a dry point carries nothing" simplification would return zero instead of
+    /// the depth and silently move the waterline.
+    #[test]
+    fn the_pressure_head_follows_the_stretched_closed_form() {
+        let sea = Seaway::new(
+            SeaState {
+                significant_height: 2.5,
+                peak_period: 6.0,
+                components: 24,
+                seed: 7,
+                ..SeaState::default()
+            },
+            9.81,
+        );
+
+        let expected = |north: f64, east: f64, down: f64, time: f64| {
+            let elevation = sea.elevation(north, east, time);
+            let attenuation = (down + elevation).max(0.0);
+            let dynamic: f64 = sea
+                .waves()
+                .iter()
+                .map(|wave| {
+                    let along = north * wave.direction.0 + east * wave.direction.1;
+                    wave.amplitude
+                        * (-wave.wavenumber * attenuation).exp()
+                        * (wave.wavenumber * along - wave.frequency * time + wave.phase).cos()
+                })
+                .sum();
+            down + dynamic
+        };
+
+        for &time in &[0.0, 1.3, 7.75] {
+            for &north in &[-30.0, 0.0, 12.5] {
+                for &east in &[-5.0, 0.0, 21.0] {
+                    // Straddle the *local* surface, not the mean level: the branch
+                    // is on depth, and depth is measured from the wave.
+                    let surface = -sea.elevation(north, east, time);
+                    for offset in [-4.0, -0.05, 0.0, 0.05, 4.0] {
+                        let down = surface + offset;
+                        let (depth, head) = sea.depth_and_pressure_head(north, east, down, time);
+                        assert_relative_eq!(depth, down + sea.elevation(north, east, time));
+                        assert_relative_eq!(
+                            head,
+                            expected(north, east, down, time),
+                            epsilon = 1e-12
+                        );
+                    }
+                }
+            }
+        }
     }
 }

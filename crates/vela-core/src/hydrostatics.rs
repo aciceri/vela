@@ -42,7 +42,7 @@
 //! need the general treatment.
 
 use crate::clip::{enclosed_area, Clipped};
-use crate::geometry::{Point, Tri, TriMesh};
+use crate::geometry::{Point, TriMesh};
 use crate::rigid_body::RigidBody;
 use crate::state::BodyState;
 use crate::wrench::Wrench;
@@ -129,6 +129,15 @@ pub trait FreeSurface {
     fn pressure_head(&self, at: Point) -> f64 {
         self.depth(at)
     }
+
+    /// Both answers at one point, for callers that always want both.
+    ///
+    /// Defaults to asking separately. Override where the two share work; see
+    /// [`crate::env::Environment::depth_and_pressure_head`] for the case that
+    /// motivates it.
+    fn depth_and_pressure_head(&self, at: Point) -> (f64, f64) {
+        (self.depth(at), self.pressure_head(at))
+    }
 }
 
 /// Still water with its surface on the world plane `z = 0`.
@@ -161,12 +170,25 @@ pub fn hydrostatics_on(
 
     // Work in world coordinates: that is where the surface is defined, and where
     // the origin-on-the-plane volume trick applies.
-    let to_world = |p: Point| origin + rotation * p;
-    clipped.extend_from(
-        mesh.triangles()
-            .map(|t| Tri::new(to_world(t.a), to_world(t.b), to_world(t.c))),
-        &|p: Point| surface.depth(p),
-    );
+    //
+    // Transformed and asked its two questions once per *vertex*, not once per
+    // triangle corner. A hull mesh shares every vertex between five or six
+    // triangles, and in a seaway each answer is a sum over every wave component,
+    // so the difference is most of the step. The clip carries the heads through
+    // to the integral below, which is why it never asks the surface again.
+    let world: Vec<Point> = mesh
+        .vertices()
+        .iter()
+        .map(|point| origin + rotation * point)
+        .collect();
+    let mut depths = Vec::with_capacity(world.len());
+    let mut heads = Vec::with_capacity(world.len());
+    for point in &world {
+        let (depth, head) = surface.depth_and_pressure_head(*point);
+        depths.push(depth);
+        heads.push(head);
+    }
+    clipped.extend_from_indexed(&world, mesh.indices(), &depths, &heads);
 
     let mut volume = 0.0;
     let mut volume_moment = Point::zeros();
@@ -176,7 +198,7 @@ pub fn hydrostatics_on(
 
     let unit_weight = water.density * gravity;
 
-    for tri in &clipped.triangles {
+    for (tri, heads) in clipped.triangles.iter().zip(&clipped.heads) {
         let tetra = tri.signed_tetrahedron_volume();
         volume += tetra;
         volume_moment += tetra * (tri.a + tri.b + tri.c) / 4.0;
@@ -189,14 +211,10 @@ pub fn hydrostatics_on(
         wetted_area += area;
         let normal = area_normal / area;
 
-        // Pressure at the vertices, from the surface's own head. For still water
-        // the head is the depth and this is `ρ g z`; for a seaway it carries the
-        // wave's dynamic part with its decay already in it.
-        let pressures = [
-            unit_weight * surface.pressure_head(tri.a),
-            unit_weight * surface.pressure_head(tri.b),
-            unit_weight * surface.pressure_head(tri.c),
-        ];
+        // Pressure at the vertices, from the head the clip carried. For still
+        // water the head is the depth and this is `ρ g z`; for a seaway it carries
+        // the wave's dynamic part with its decay already in it.
+        let pressures = heads.map(|head| unit_weight * head);
         let pressure_sum = pressures[0] + pressures[1] + pressures[2];
 
         // Exact integrals of a linear pressure field over the triangle.

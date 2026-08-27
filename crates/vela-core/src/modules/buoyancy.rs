@@ -252,6 +252,10 @@ impl FreeSurface for EnvironmentSurface<'_> {
     fn pressure_head(&self, at: Point) -> f64 {
         self.env.pressure_head(at, self.time)
     }
+
+    fn depth_and_pressure_head(&self, at: Point) -> (f64, f64) {
+        self.env.depth_and_pressure_head(at, self.time)
+    }
 }
 
 #[cfg(test)]

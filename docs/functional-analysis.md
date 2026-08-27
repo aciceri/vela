@@ -1400,7 +1400,9 @@ says so when the run has left the envelope. Until a stall model lands, seaway
 
 ---
 
-## 7. Frame budget (estimate, single wasm thread)
+## 7. Frame budget
+
+### 7a. The original estimate
 
 | Item | Cadence | Est. cost |
 |---|---|---|
@@ -1411,9 +1413,44 @@ says so when the run has left the envelope. Until a stall model lands, seaway
 | FFT surface (256²–512²) | every frame | GPU-side; CPU inverse for physics patch ~0.5 ms |
 | 6-DOF integration | every physics step | negligible |
 
-These are estimates to be validated by benchmarks in native and wasm builds
-before any architectural commitment hardens. If the clip step dominates, a
-lower-resolution physics proxy mesh (decimated hull) is the first lever.
+### 7b. Measured
+
+`cargo run --release -p vela-core --example frame_cost` times the assembled
+sailing simulation — every module, radiation included — on the YD-41 in
+$H_s = 1$ m. The frontend steps at 200 Hz inside a 60 Hz frame, so 3.3 steps
+have to fit in 16.7 ms.
+
+| Sea components | Hull triangles | µs/step | Share of a 60 Hz frame |
+|---|---|---|---|
+| 60 (default) | 1054 | 674 | 13 % |
+| 16 | 1054 | 217 | 4 % |
+| 60 | 850 | 613 | 12 % |
+
+The estimate was right about the ranking and wrong about the lever. Mesh
+resolution barely registers — 1054 triangles against 850 is 10 % — while the
+**number of wave components is nearly the whole cost**, because each one is a
+term in a sum evaluated at every hull vertex. The proposed first lever, a
+decimated physics proxy mesh, would have bought almost nothing.
+
+Getting here took two fixes, both removing arithmetic rather than approximating
+it, and the first measurement was 3812 µs — 76 % of a frame, which is what the
+frame rate looked like:
+
+1. **The clip asked per triangle corner, not per vertex.** A hull mesh shares
+   each vertex among five or six triangles, so `depth` was evaluated six times
+   over. `Clipped::extend_from_indexed` evaluates once per vertex.
+   3812 → 2685 µs.
+2. **`depth` and `pressure_head` recomputed the same elevation sum, and
+   `pressure_head` summed the components twice internally.** Three sums where
+   one and a half do. `Seaway::depth_and_pressure_head` shares the elevation;
+   the clip carries the resulting head through to the pressure integral
+   (`Clipped::heads`) so the surface is never asked twice; and cut points take
+   the exact zero that §6's Wheeler stretching guarantees on the surface.
+   2685 → 674 µs.
+
+Neither changes a result: the full suite passes unchanged, and it runs in half
+the time, which is the same speedup seen from the other side. Measured at
+59.9 fps / 16.7 ms in the native frontend, against a 60 Hz vsync.
 
 ---
 

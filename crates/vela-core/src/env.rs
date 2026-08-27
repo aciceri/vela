@@ -25,7 +25,15 @@ use crate::seaway::{SeaState, Seaway};
 use nalgebra::Vector3;
 
 /// Everything outside the boat.
-pub trait Environment {
+///
+/// `Send + Sync` for the same reason [`crate::sim::ForceModule`] is: a [`Sim`]
+/// holds one as a trait object, and that bound is what lets a simulation be
+/// owned by a frontend, a worker thread, or a host running several at once.
+/// Every environment here is a handful of numbers and a wave realisation, so the
+/// bound is free.
+///
+/// [`Sim`]: crate::sim::Sim
+pub trait Environment: Send + Sync {
     /// True wind velocity of the air at a world-frame point, m/s.
     ///
     /// A vector, not a speed: see the module documentation. The vertical
@@ -46,6 +54,24 @@ pub trait Environment {
     /// in short waves.
     fn pressure_head(&self, position: Vector3<f64>, time: f64) -> f64 {
         self.depth(position, time)
+    }
+
+    /// Both questions at one point, for callers that always ask both.
+    ///
+    /// Defaults to asking them separately, which is correct and is what a still
+    /// water or a hand-written test environment wants. An implementation whose two
+    /// answers share work — a seaway, where each is a sum over wave components —
+    /// should override this: a hull clip asks the pair thousands of times a step
+    /// and the sharing is worth a third of it.
+    ///
+    /// An override must agree with [`Environment::depth`] and
+    /// [`Environment::pressure_head`] evaluated separately. Nothing enforces
+    /// that, so it is the implementor's contract to keep.
+    fn depth_and_pressure_head(&self, position: Vector3<f64>, time: f64) -> (f64, f64) {
+        (
+            self.depth(position, time),
+            self.pressure_head(position, time),
+        )
     }
 
     /// Water properties: density and kinematic viscosity.
@@ -336,6 +362,11 @@ impl Environment for Seaway2D {
     fn pressure_head(&self, position: Vector3<f64>, time: f64) -> f64 {
         self.sea
             .pressure_head(position.x, position.y, position.z, time)
+    }
+
+    fn depth_and_pressure_head(&self, position: Vector3<f64>, time: f64) -> (f64, f64) {
+        self.sea
+            .depth_and_pressure_head(position.x, position.y, position.z, time)
     }
 
     fn water(&self) -> Water {
