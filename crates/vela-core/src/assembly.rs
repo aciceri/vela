@@ -23,20 +23,24 @@
 //! Lifting this restriction is a schema change plus sourced positions, not a
 //! change to any force model.
 
-use crate::aero::RigDimensions;
-use crate::aero::SailSet;
+use crate::aero::{RigDimensions, Sail, SailSet};
 use crate::appendages::{FoilPlanform, HullScalars, Keel};
 use crate::balance::SailPlan as BalanceSailPlan;
-use crate::boat::{AppendagesSpec, BoatSpec, FoilSpec, RigSpec, SpecError};
+use crate::boat::{
+    Aerodynamics, AppendagesSpec, BoatSpec, FoilSpec, RigSpec, SailShapeSpec, SpecError,
+};
 use crate::controls::Controls;
 use crate::cummins::{MemoryError, MemoryOptions, TransformOptions};
 use crate::env::Environment;
+use crate::flying::{Planform, Response};
+use crate::geometry::Point;
 use crate::lewis::{station_geometry, LewisForm};
 use crate::loft::{loft_hull, LoftOptions};
 use crate::mass::MassError;
 use crate::modules::radiation::{Radiation, RadiationSpectra};
 use crate::modules::{Buoyancy, CanoeBody, LateralSystem, Sails};
 use crate::rigid_body::RigidBody;
+use crate::sail::{Member, Options as SailOptions};
 use crate::sim::{Captive, ForceModule, Sim};
 use crate::state::BodyState;
 use crate::strip::{lateral_spectra, vertical_spectra, Strip};
@@ -184,7 +188,16 @@ pub fn velocity_prediction_sim(
             rudder,
             lateral_centre(rudder_at, parameters.canoe_draft, &rudder),
         )),
-        Box::new(Sails::new(rig_dimensions(&rig)).at(sails_at)),
+        Box::new(Sails::new(rig_dimensions(&rig)).at(sails_at).with_geometry(
+            match spec.aerodynamics {
+                // The default, and the oracle: a boat that did not ask for
+                // the geometric model gets none of it, not even a partial one.
+                Aerodynamics::Tabular => Vec::new(),
+                Aerodynamics::Geometric => {
+                    sail_members(&rig, spec.sail_shapes.as_deref().unwrap_or_default())
+                }
+            },
+        )),
     ];
 
     let captive = if layout.is_some() {
@@ -207,6 +220,65 @@ fn sail_plan_of(rig: &RigSpec) -> BalanceSailPlan {
         main_foot: rig.main_foot,
         boom_above_sheer: rig.boom_above_sheer,
     }
+}
+
+/// Turns a boat file's flying-shape block into members the geometric model can
+/// carry, keyed by which sail each describes.
+///
+/// The luff and foot are **derived from the rig**, never declared: `P` and `E` for
+/// the mainsail, and for a jib the forestay length `√(I² + J²)` with `LPG` as the
+/// foot. That is the point of splitting the data this way — a boat file can declare
+/// the shape a measurement rule cannot imply, and cannot declare a sail whose size
+/// disagrees with the rig the tabular model is sailing.
+///
+/// Everything else is the file's. A sail whose declared travel runs the wrong way —
+/// an outhaul that adds camber, leech tension that adds twist — is dropped here
+/// rather than sailed, because [`crate::flying::Response`] refuses it and this
+/// function has no business inventing a replacement.
+///
+/// Sails other than the main and the jib are skipped: a spinnaker's luff and foot
+/// follow from no IOR letter, and downwind is where the literature has coefficients
+/// rather than theory.
+fn sail_members(rig: &RigSpec, shapes: &[SailShapeSpec]) -> Vec<(Sail, Member)> {
+    let mut members = Vec::new();
+    for shape in shapes {
+        let (luff, foot) = match shape.sail {
+            Sail::Main => (rig.main_hoist, rig.main_foot),
+            Sail::Jib => (
+                rig.foretriangle_height.hypot(rig.foretriangle_base),
+                rig.jib_perpendicular,
+            ),
+            _ => continue,
+        };
+        let Some(planform) = Planform::new(luff, foot, shape.head_chord, shape.roach) else {
+            continue;
+        };
+        let Some(response) = Response::new(
+            (shape.angle.0.to_radians(), shape.angle.1.to_radians()),
+            (shape.twist.0.to_radians(), shape.twist.1.to_radians()),
+            shape.camber,
+            shape.head_camber,
+            shape.draft,
+        ) else {
+            continue;
+        };
+        members.push((
+            shape.sail,
+            Member {
+                planform,
+                response,
+                // File frame: `x` forward, `z` up from the sheer. The tack's height
+                // is the boom for a main and the deck for a jib, and both are
+                // measured from the same datum the windage model uses.
+                tack: Point::new(shape.tack_at, 0.0, shape.tack_above_water),
+                options: SailOptions {
+                    stall: shape.stall.to_radians(),
+                    ..SailOptions::default()
+                },
+            },
+        ));
+    }
+    members
 }
 
 /// The body-frame point a foil's side force is applied at.

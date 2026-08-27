@@ -259,6 +259,29 @@ impl Planform {
         self.luff
     }
 
+    /// Chord at the foot, m.
+    #[must_use]
+    pub fn foot(&self) -> f64 {
+        self.foot
+    }
+
+    /// Chord at the head, m.
+    #[must_use]
+    pub fn head(&self) -> f64 {
+        self.head
+    }
+
+    /// Leech round, as a fraction of the foot chord.
+    ///
+    /// The four together are what a caller needs to build a *modified* outline —
+    /// a reefed sail, which is the same shape at a smaller size. Without them
+    /// reefing could only be done by rebuilding from the boat file, which puts the
+    /// file's parsing in the middle of a force model's step.
+    #[must_use]
+    pub fn roach(&self) -> f64 {
+        self.roach
+    }
+
     /// Chord at a height fraction, m.
     #[must_use]
     pub fn chord(&self, up: f64) -> f64 {

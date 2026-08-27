@@ -415,6 +415,39 @@
         max_beam: 4.20,
     ),
 
+    // Flying-shape data for the geometric aerodynamic model. ASSUMED, NOT
+    // SOURCED - see the same block in boats/yd41.ron for what that means. A polar
+    // computed through this block demonstrates the chain and does NOT validate
+    // against the published YD-41 polar.
+    sail_shapes: Some([
+        (
+            sail: Main,
+            head_chord: 0.35,
+            roach: 0.06,
+            tack_at: 6.301,
+            tack_above_water: 2.98,
+            angle: (25.0, 5.0),
+            twist: (20.0, 4.0),
+            camber: (0.15, 0.08),
+            head_camber: 0.60,
+            draft: (0.48, 0.36),
+            stall: 18.0,
+        ),
+        (
+            sail: Jib,
+            head_chord: 0.10,
+            roach: 0.0,
+            tack_at: 11.401,
+            tack_above_water: 1.28,
+            angle: (22.0, 8.0),
+            twist: (18.0, 5.0),
+            camber: (0.13, 0.07),
+            head_camber: 0.65,
+            draft: (0.44, 0.33),
+            stall: 20.0,
+        ),
+    ]),
+
     // Longitudinal layout, derived rather than measured: see boats/yd41.ron.
     layout: (
         keel_at: 5.95,

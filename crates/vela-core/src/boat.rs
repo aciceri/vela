@@ -12,6 +12,7 @@
 //! The physics mesh is lofted from these at load time by [`crate::loft`]; the
 //! visual mesh is a frontend concern and deliberately absent from this format.
 
+use crate::aero::Sail;
 use crate::dsyhs::HullParameters;
 use crate::frames::file_to_body;
 use crate::mass::{MassError, MassProperties};
@@ -53,6 +54,21 @@ pub struct BoatSpec {
     pub appendages: Option<AppendagesSpec>,
     #[serde(default)]
     pub rig: Option<RigSpec>,
+    /// Flying-shape data, one entry per sail the geometric model should carry.
+    ///
+    /// Absent, or missing an entry for a sail the crew sets, means that sail set
+    /// runs on the tabular model of [`crate::aero`]. That is the fallback rather
+    /// than an error: a boat with no shape data is not a broken boat, it is a boat
+    /// whose forces come from a table.
+    #[serde(default)]
+    pub sail_shapes: Option<Vec<SailShapeSpec>>,
+    /// Which aerodynamic model this boat's forces come from.
+    ///
+    /// Defaults to [`Aerodynamics::Tabular`], and that default is load-bearing:
+    /// the tabular model is the oracle §10 of the design validates against, and a
+    /// boat that did not ask for the geometric one must not silently get it.
+    #[serde(default)]
+    pub aerodynamics: Aerodynamics,
     #[serde(default)]
     pub layout: Option<LayoutSpec>,
     pub mass: MassSpec,
@@ -230,6 +246,106 @@ pub struct RigSpec {
     /// `BMAX` — maximum beam of the hull, m. Here for the same reason as
     /// [`Self::average_freeboard`].
     pub max_beam: f64,
+}
+
+/// Which aerodynamic model computes a boat's sail forces.
+///
+/// Two, because there are two, and they are not interchangeable yet. The choice is
+/// in the boat file rather than in code because it is a property of the *data*: a
+/// boat with no flying-shape block has no geometric model available, and a boat
+/// that has one may still want the tabular answer to compare against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum Aerodynamics {
+    /// The coefficient tables of [`crate::aero`] — Hazen (1980) as transcribed
+    /// from Larsson, Eliasson & Orych.
+    ///
+    /// The default, and the default matters: this is the model §10 of the design
+    /// validates against a published polar, and it is the oracle every later model
+    /// has to answer to. A boat that did not ask for the other one must not get it.
+    #[default]
+    Tabular,
+    /// The geometric model of [`crate::sail`] — a vortex lattice over the flying
+    /// shape, with an empirical handover past stall.
+    ///
+    /// Requires a `sail_shapes` entry for every sail the crew sets; a set that is
+    /// not fully covered falls back to the tabular model for that set, which is how
+    /// a boat computes its upwind forces from geometry and its downwind forces from
+    /// a table.
+    ///
+    /// **Not yet the default, and the reasons are measured rather than cautious.**
+    /// Two things stand between it and being one:
+    ///
+    /// - **No hull endplate.** The tabular model's effective span takes the deck as
+    ///   a partial reflection plane; a lattice with a free foot vortex does not, and
+    ///   the missing image shows up as excess induced drag — 13 % more `C_D` than
+    ///   the tabular model on the reference boat.
+    /// - **The wake threshold is a discontinuity.** Refactorising when the wake has
+    ///   drifted makes the force depend on the history of wind angles rather than
+    ///   only on the current one, and an equilibrium solver differentiates that step
+    ///   numerically. It costs 0.1 % of asymmetry between the two tacks, which is
+    ///   invisible in a time-stepping simulation and poison to a Newton.
+    Geometric,
+}
+
+/// Flying-shape data for one sail, for the geometric model of [`crate::sail`].
+///
+/// # Why this block exists at all
+///
+/// The IOR letters of [`RigSpec`] describe a rig for *measurement*, and a
+/// measurement rule carries what it needs to compute a rating. It has no head
+/// chord, no leech round, no camber and no twist — so a model that computes forces
+/// from geometry cannot be fed from it, and the missing numbers have to come from
+/// somewhere.
+///
+/// They come from here, per sail, and the luff and foot deliberately do **not**:
+/// those are derived from the rig, so a boat file cannot declare a sail whose size
+/// disagrees with the rig the tabular model is sailing. What is declared is the
+/// shape the rig cannot imply.
+///
+/// # What the control travel means
+///
+/// Each pair is `(eased, hard)`, in degrees or as a fraction of chord. This is the
+/// calibration [`crate::flying::Response`] refuses to invent: a sailmaker knows
+/// that a given main goes from sixteen per cent camber with the outhaul off to
+/// eight with it hard on, and no published measurement knows it for a sail in
+/// general. Declaring it puts the number where it can be argued about.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct SailShapeSpec {
+    /// Which sail of the plan this describes.
+    ///
+    /// Only `Main` and `Jib` can be built: their luff and foot follow from the rig
+    /// (`P`/`E` for the main, the forestay length and `LPG` for the jib). A
+    /// spinnaker's do not follow from any IOR letter, and downwind is where the
+    /// literature has coefficients rather than theory anyway — so a plan carrying
+    /// one stays on the tabular model.
+    pub sail: Sail,
+    /// Chord at the head, m. Zero for a sail that comes to a point.
+    pub head_chord: f64,
+    /// Leech round as a fraction of the foot chord, applied as a half sine.
+    pub roach: f64,
+    /// Tack position, forward from the aft perpendicular, m.
+    pub tack_at: f64,
+    /// Tack height above the water, m - the boom for a main, the deck for a jib.
+    ///
+    /// Above the *water*, matching the datum `aero`'s centre-of-effort heights use,
+    /// so that both models put their forces on the same arm.
+    pub tack_above_water: f64,
+    /// Chord angle at the foot, degrees, with the boom fully out and fully in.
+    pub angle: (f64, f64),
+    /// Head twist, degrees, with the leech slack and fully tensioned.
+    pub twist: (f64, f64),
+    /// Camber ratio at the foot, with the outhaul off and hard on.
+    pub camber: (f64, f64),
+    /// Head camber as a fraction of the foot's — the sail's own taper.
+    pub head_camber: f64,
+    /// Draft position, with the luff slack and hard on.
+    pub draft: (f64, f64),
+    /// Mean incidence at which this sail begins to separate, degrees.
+    ///
+    /// A property of the cloth with no closed form. The literature's anchors are
+    /// about 17° for a twist-free rigid model and 20° for a twisting full-scale
+    /// sail.
+    pub stall: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]

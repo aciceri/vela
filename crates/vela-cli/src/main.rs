@@ -18,6 +18,7 @@ use vela_core::boat::HullSpec;
 use vela_core::cummins::{FluidMemory, MemoryOptions, TransformOptions};
 use vela_core::dsyhs::{hull_resistance, HullParameters};
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
+use vela_core::flying::Controls as SailTrim;
 use vela_core::geometry::Point;
 use vela_core::hydrostatics::{solve_flotation, FlotationOptions};
 use vela_core::lewis::{area_coefficient_bounds, station_geometry, LewisForm};
@@ -578,10 +579,19 @@ fn fastest_at(sim: &mut Sim, reference_length: f64, start: &EquilibriumOptions) 
 
         for (flat, reef) in power_path() {
             let trim = Trim::full(span).with_flat(flat).with_reef(reef);
+            // Both models depower along one path. `flat` is Hazen's flattening
+            // factor, and the physical action a crew takes to flatten is to drop
+            // the traveller - the control that reduces the angle of attack, which
+            // is what `flat` reduces the lift by. So the geometric model reads the
+            // same sweep through the car, and `reef` scales its outline directly.
             sim.set_controls(Controls {
                 rudder_angle: 0.0,
                 sails,
                 trim,
+                shape: SailTrim {
+                    traveller: flat,
+                    ..SailTrim::HARD
+                },
             });
 
             let Ok(solution) = equilibrium::solve(sim, reference_length, start) else {

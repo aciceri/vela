@@ -57,11 +57,26 @@
 //!   because [`crate::aero`] does not locate the centre of pressure of mast and
 //!   topsides. The windage force is right; its arm understates the mast.
 
-use crate::aero::{ApparentWind, RigDimensions, SailForces, SailPlan, SailPlanError, SailSet};
+use crate::aero::{
+    ApparentWind, RigDimensions, Sail, SailForces, SailPlan, SailPlanError, SailSet,
+};
+use crate::flying::{Controls as SailTrim, Planform};
+use crate::frames::file_to_body;
+use crate::geometry::Point;
+use crate::sail::{Member, Plan};
 use crate::sim::{leeward_sign, ForceModule, StepCtx};
 use crate::telemetry::Telemetry;
 use crate::wrench::Wrench;
 use nalgebra::Vector3;
+
+/// Wake drift past which the geometric plan is refactorised, radians.
+///
+/// Four degrees, where [`crate::vlm`] measures the cost of a stale wake at under
+/// two per cent of attached lift. Rebuilding is cubic in the panel count, so the
+/// threshold is the whole trade: smaller and the loop stalls on refactorisations,
+/// larger and the forces drift. It is a constant rather than a parameter because
+/// nothing about a particular boat changes it — it is a property of the method.
+const WAKE_TOLERANCE: f64 = 4.0 * std::f64::consts::PI / 180.0;
 
 /// The aerodynamic module for one rig.
 ///
@@ -81,6 +96,17 @@ pub struct Sails {
     set: SailSet,
     /// The plan for `set`, or the reason that set cannot be sailed on this rig.
     plan: Result<SailPlan, SailPlanError>,
+    /// Flying-shape data per sail, from the boat file. Empty means this rig has
+    /// none and every sail set runs on the tabular model.
+    geometry: Vec<(Sail, Member)>,
+    /// The geometric plan in force, and the set it was built for.
+    ///
+    /// Built lazily inside [`ForceModule::step`], because it needs a wake direction
+    /// and the wake direction is the apparent wind — which the constructor cannot
+    /// know. So the first step of a run, and any step after the wind has swung more
+    /// than [`WAKE_TOLERANCE`], pays a factorisation. That cost is real and is the
+    /// reason it is bounded by a threshold rather than paid every step.
+    geometric: Option<((SailSet, SailTrim, u64), Plan)>,
     /// What the last step computed, kept for [`ForceModule::telemetry`].
     /// `None` after a step whose plan could not be built.
     last: Option<Reported>,
@@ -97,9 +123,48 @@ struct Reported {
     forces: SailForces,
     /// The athwartships force as it went onto the body `y` axis, N.
     side_force: f64,
+    /// What the geometric model contributed, if it was the model that ran.
+    geometric: Option<Geometric>,
+}
+
+/// Everything one step of the geometric path needs, in one argument.
+///
+/// A struct rather than seven parameters. The five travel together, come from the
+/// same place and are read once each - and a call site with seven positional
+/// arguments of which three are `f64` is a swap waiting to compile.
+#[derive(Debug, Clone, Copy)]
+struct Condition {
+    wind: ApparentWind,
+    trim: crate::aero::Trim,
+    shape: SailTrim,
+    density: f64,
+    /// Body frame, and where the empirical drag is applied.
+    centre_of_effort: Vector3<f64>,
+}
+
+/// The geometric model's own numbers, for telemetry.
+///
+/// Published under `aero.geometric.` alongside the shared keys, because they are
+/// the quantities that say *why* the answer differs from the tabular one — and a
+/// caller comparing the two models needs to see the mean incidence and the
+/// separated fraction, which the tabular model has no notion of.
+#[derive(Debug, Clone, Copy)]
+struct Geometric {
+    mean_incidence: f64,
+    separated_fraction: f64,
+    attached_lift_coefficient: f64,
+    wake_drift: f64,
+    sails: usize,
 }
 
 impl Sails {
+    /// Smallest reef factor the geometry is built at.
+    ///
+    /// A reef factor of zero is a sail of no size, and a lattice over it has no
+    /// normals. Clamped rather than refused, because a solver walking a power path
+    /// will ask for it and the honest answer is the smallest real sail.
+    const MINIMUM_REEF: f64 = 0.05;
+
     /// Wraps a rig.
     ///
     /// Infallible, although [`SailPlan::new`] is not: the rig alone cannot say
@@ -119,8 +184,25 @@ impl Sails {
             centre_of_effort_at: 0.0,
             set,
             plan,
+            geometry: Vec::new(),
+            geometric: None,
             last: None,
         }
+    }
+
+    /// Hands over the boat file's flying-shape data.
+    ///
+    /// With it, a sail set every entry of which has shape data runs on the
+    /// geometric model of [`crate::sail`]; a set that is not fully covered — bare
+    /// poles, or anything carrying a spinnaker — runs on the tabular one. That
+    /// fallback is per *set* rather than per boat, so a yacht can compute its
+    /// upwind forces from geometry and its downwind forces from a table, which is
+    /// where each of the two is actually the better model.
+    #[must_use]
+    pub fn with_geometry(mut self, geometry: Vec<(Sail, Member)>) -> Self {
+        self.geometry = geometry;
+        self.geometric = None;
+        self
     }
 
     /// Places the centre of effort along the hull.
@@ -173,6 +255,242 @@ impl Sails {
         }
         self.set = set;
         self.plan = SailPlan::new(&self.rig, set);
+    }
+
+    /// The members for a sail set, or `None` if any sail in it has no shape data.
+    ///
+    /// All or nothing on purpose. Half a plan from geometry and half from a table
+    /// would be two models sharing a reference area and double-counting the
+    /// interaction between the sails they each think they own.
+    fn members_for(&self, set: SailSet) -> Option<Vec<Member>> {
+        if self.geometry.is_empty() || set.is_empty() {
+            return None;
+        }
+        set.iter()
+            .map(|sail| {
+                self.geometry
+                    .iter()
+                    .find(|(which, _)| *which == sail)
+                    .map(|(_, member)| *member)
+            })
+            .collect()
+    }
+
+    /// The apparent wind as a file-frame velocity, folded onto starboard tack.
+    ///
+    /// [`crate::sail`] builds its shapes cambered to port, which is a sail on
+    /// starboard tack, so a port-tack boat is the same problem mirrored in `y`. The
+    /// fold happens here and the un-fold happens to the force, which keeps the
+    /// mirror in one place instead of putting a `±1` through the geometry.
+    fn folded_flow(wind: ApparentWind) -> Vector3<f64> {
+        let angle = wind.angle.abs();
+        // A wind *from* `angle` off the bow blows aft and to leeward.
+        Vector3::new(-angle.cos(), angle.sin(), 0.0) * wind.speed.max(0.0)
+    }
+
+    /// Rebuilds the geometric plan if the trim, the set or the wake has moved.
+    ///
+    /// # Reefing is geometry, so it is applied to the geometry
+    ///
+    /// The tabular model's reef factor scales an *area* and hands the same
+    /// coefficients back. Here it scales the sail's **outline** — luff, foot and
+    /// head chord together — because that is what shortening sail does, and a
+    /// smaller similar sail has its own lift slope, its own aspect ratio and its own
+    /// centre of effort rather than a fraction of the full sail's.
+    ///
+    /// The flattening factor is deliberately *not* read. Flattening is what an
+    /// outhaul and a traveller do, and those are in the line positions already; a
+    /// second scalar doing the same job would double-count whatever a caller set.
+    ///
+    /// Returns whether a plan is available for this set.
+    fn refresh_geometry(
+        &mut self,
+        set: SailSet,
+        wind: ApparentWind,
+        trim: SailTrim,
+        reef: f64,
+    ) -> bool {
+        let Some(members) = self.members_for(set) else {
+            self.geometric = None;
+            return false;
+        };
+        // A wake needs a direction and not a speed, so a becalmed boat can still
+        // hold a factorisation: the angle survives the speed going to zero.
+        let angle = wind.angle.abs();
+        let wake = Vector3::new(-angle.cos(), angle.sin(), 0.0);
+        let reef = reef.clamp(Self::MINIMUM_REEF, 1.0);
+
+        let stale = match &self.geometric {
+            Some((built, plan)) => {
+                *built != (set, trim, reef.to_bits()) || plan.wake_drift(wake) > WAKE_TOLERANCE
+            }
+            None => true,
+        };
+        if !stale {
+            return true;
+        }
+
+        let reefed: Option<Vec<Member>> = members
+            .iter()
+            .map(|member| {
+                let full = member.planform;
+                Planform::new(
+                    full.luff() * reef,
+                    full.foot() * reef,
+                    full.head() * reef,
+                    full.roach(),
+                )
+                .map(|planform| Member {
+                    planform,
+                    ..*member
+                })
+            })
+            .collect();
+        let Some(reefed) = reefed else {
+            self.geometric = None;
+            return false;
+        };
+
+        // One trim for every sail. A real crew trims the main and the headsail
+        // separately, and `Plan` takes a control per sail so that it can; what is
+        // missing is a place in `Controls` to say so, and inventing a split here
+        // would be inventing a trimmer's choices.
+        let controls = vec![trim; reefed.len()];
+        self.geometric =
+            Plan::new(reefed, &controls, wake).map(|plan| ((set, trim, reef.to_bits()), plan));
+        self.geometric.is_some()
+    }
+
+    /// The geometric wrench, or `None` if this set has no geometry.
+    ///
+    /// # What comes from where
+    ///
+    /// Lift and induced drag come from [`crate::sail`], out of the geometry. The
+    /// **viscous and parasitic drag do not** — a lattice has no viscosity, and the
+    /// friction of cloth and the windage of mast and topsides are real forces that
+    /// the tabular model already carries from Hazen's own coefficients. So they are
+    /// added on top, at the tabular model's own centre of effort, which is exactly
+    /// the composition §4.1 of the design describes.
+    ///
+    /// Leaving them out would have been the quiet mistake: a boat with the same
+    /// lift and less drag sails faster, and the polar would improve for a reason
+    /// that is not physics.
+    fn geometric_wrench(
+        &mut self,
+        tabular: &SailPlan,
+        set: SailSet,
+        at: Condition,
+    ) -> Option<(Wrench, SailForces, f64, Geometric)> {
+        let Condition {
+            wind,
+            trim,
+            shape,
+            density,
+            centre_of_effort,
+        } = at;
+        if !self.refresh_geometry(set, wind, shape, trim.reef) {
+            return None;
+        }
+        let (_, plan) = self.geometric.as_ref()?;
+
+        let flow = Self::folded_flow(wind);
+        let file = plan.wrench(flow, density, Point::zeros());
+
+        // Un-fold: on port tack the whole problem was mirrored in `y`, so the force
+        // mirrors back and the moment — a pseudovector — mirrors the other way.
+        let port = wind.angle < 0.0;
+        let mirror_force = |v: Vector3<f64>| {
+            if port {
+                Vector3::new(v.x, -v.y, v.z)
+            } else {
+                v
+            }
+        };
+        let mirror_moment = |v: Vector3<f64>| {
+            if port {
+                Vector3::new(-v.x, v.y, -v.z)
+            } else {
+                v
+            }
+        };
+
+        let force_body = file_to_body(mirror_force(file.force));
+        let moment_body = file_to_body(mirror_moment(file.moment));
+
+        // The empirical drag the lattice cannot see, along the wind, at the tabular
+        // model's own arm.
+        let area = tabular.nominal_area();
+        let dynamic = 0.5 * density * wind.speed * wind.speed * area;
+        let empirical = tabular.viscous_drag_coefficient(wind.angle) * trim.reef
+            + tabular.parasitic_drag_coefficient();
+        let along = if wind.speed > 0.0 {
+            flow / wind.speed
+        } else {
+            Vector3::zeros()
+        };
+        let extra = file_to_body(mirror_force(along * (empirical * dynamic)));
+        let windage = Wrench::from_force_at(extra, centre_of_effort);
+
+        // Lift and drag of the geometric part, in the wind's own axes, before the
+        // mirror — which is where "to leeward" is unambiguous.
+        let leeward = Vector3::new(along.y, -along.x, 0.0);
+        let lift = file.force.dot(&leeward);
+        let drag = file.force.dot(&along) + empirical * dynamic;
+        let scale = if dynamic > 0.0 { 1.0 / dynamic } else { 0.0 };
+
+        let heeling_force = lift * along.x.abs() - file.force.dot(&along) * along.y.abs();
+        let sails = file.sails();
+        let weight = |pick: fn(&crate::sail::Contribution) -> f64| {
+            let total: f64 = sails.iter().map(|s| s.force.norm()).sum();
+            if total <= 0.0 {
+                return sails.first().map_or(0.0, pick);
+            }
+            sails.iter().map(|s| pick(s) * s.force.norm()).sum::<f64>() / total
+        };
+
+        let forces = SailForces {
+            lift,
+            drag,
+            driving_force: force_body.x + extra.x,
+            heeling_force: heeling_force.abs(),
+            heeling_moment_about_waterline: heeling_force.abs() * (-centre_of_effort.z),
+            centre_of_effort_height: -centre_of_effort.z,
+            lift_coefficient: lift * scale,
+            viscous_drag_coefficient: tabular.viscous_drag_coefficient(wind.angle) * trim.reef,
+            induced_drag_coefficient: file.force.dot(&along) * scale,
+            parasitic_drag_coefficient: tabular.parasitic_drag_coefficient(),
+            aspect_ratio: tabular.aspect_ratio(trim.effective_span),
+            nominal_area: area,
+        };
+        let reported = Geometric {
+            mean_incidence: weight(|s| s.mean_incidence),
+            separated_fraction: weight(|s| s.separated_fraction),
+            // On the *nominal* area, like `aero.lift_coefficient`, and not on each
+            // sail's own. The only reason to publish this number is to be compared
+            // against the blended one, and two coefficients on two reference areas
+            // are not comparable however alike their names look.
+            attached_lift_coefficient: sails
+                .iter()
+                .zip(plan.members())
+                .map(|(sail, member)| sail.attached_lift_coefficient * member.planform.area())
+                .sum::<f64>()
+                / area,
+            wake_drift: plan.wake_drift(Vector3::new(
+                -wind.angle.abs().cos(),
+                wind.angle.abs().sin(),
+                0.0,
+            )),
+            sails: sails.len(),
+        };
+
+        let side_force = force_body.y + extra.y;
+
+        Some((
+            Wrench::new(force_body + extra, moment_body + windage.moment),
+            forces,
+            side_force,
+            reported,
+        ))
     }
 }
 
@@ -240,6 +558,29 @@ impl ForceModule for Sails {
         // falls away to leeward, and dropping it removes the aerodynamic
         // damping of roll altogether.
         let wind = ctx.apparent_wind_at(centre_of_effort);
+
+        // The geometric model first, when this set has shape data for every sail.
+        // It replaces the lift and the induced drag with numbers computed from the
+        // cloth's actual shape; it does not replace the empirical viscous and
+        // parasitic terms, which it adds on top. See `Sails::geometric_wrench`.
+        let condition = Condition {
+            wind,
+            trim,
+            shape: ctx.controls.shape,
+            density: air_density,
+            centre_of_effort,
+        };
+        if let Some((wrench, forces, side_force, geometric)) =
+            self.geometric_wrench(&plan, self.set, condition)
+        {
+            self.last = Some(Reported {
+                wind,
+                forces,
+                side_force,
+                geometric: Some(geometric),
+            });
+            return wrench;
+        }
         let forces = plan.forces(wind, trim, air_density);
 
         // The model reports the heeling force positive **to leeward** and knows
@@ -259,6 +600,7 @@ impl ForceModule for Sails {
             wind,
             forces,
             side_force,
+            geometric: None,
         });
 
         // Both components at the centre of effort, so the heeling moment — and
@@ -330,6 +672,28 @@ impl ForceModule for Sails {
             "aero.heeling_moment_about_waterline",
             forces.heeling_moment_about_waterline,
         );
+
+        // Which model ran, and the quantities only the geometric one has. A caller
+        // comparing the two needs to see the mean incidence and the separated
+        // fraction, because those are what say *why* the answers differ — and
+        // `attached_lift_coefficient` against `lift_coefficient` is the whole
+        // empirical content of the geometric answer, in two numbers.
+        let Some(geometric) = reported.geometric else {
+            out.set("aero.geometric.active", 0.0);
+            return;
+        };
+        out.set("aero.geometric.active", 1.0);
+        out.set("aero.geometric.sails", geometric.sails as f64);
+        out.set("aero.geometric.mean_incidence", geometric.mean_incidence);
+        out.set(
+            "aero.geometric.separated_fraction",
+            geometric.separated_fraction,
+        );
+        out.set(
+            "aero.geometric.attached_lift_coefficient",
+            geometric.attached_lift_coefficient,
+        );
+        out.set("aero.geometric.wake_drift", geometric.wake_drift);
     }
 }
 

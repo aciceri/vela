@@ -30,6 +30,7 @@
 use approx::assert_relative_eq;
 use vela_core::aero::SailSet;
 use vela_core::assembly::velocity_prediction_sim;
+use vela_core::boat::Aerodynamics;
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
 use vela_core::{BoatSpec, Controls, LoftOptions, Sim, StillWater, UniformWind};
 
@@ -582,4 +583,109 @@ fn the_helm_is_a_weak_coupling() {
         "balancing the helm changed boat speed by {:.1} %, which is not a weak coupling",
         100.0 * change
     );
+}
+
+/// The same boat, sailed on the geometric model instead of the tabular one.
+fn sailing_geometrically(wind_speed: f64, wind_angle_deg: f64) -> Sim {
+    let mut spec = boat();
+    spec.aerodynamics = Aerodynamics::Geometric;
+    let sails = SailSet::upwind();
+    let environment = StillWater::new(UniformWind::uniform(
+        wind_speed,
+        wind_angle_deg.to_radians(),
+    ));
+    velocity_prediction_sim(
+        &spec,
+        Box::new(environment),
+        Controls::close_hauled(sails),
+        &LoftOptions::default(),
+    )
+    .expect("the shipped boat has hull, parameters, appendages and rig")
+}
+
+/// The geometric model sails the boat, and differs from the tabular one by the two
+/// effects that have been identified rather than by an unexplained amount.
+///
+/// This is the end-to-end test of phase 2: a boat file's flying-shape block, through
+/// the control mapping, the coupled lattice, the stall handover, into a wrench the
+/// equilibrium solver balances. Nothing about it is a unit any longer.
+///
+/// # What it asserts, and why not a number
+///
+/// That the chain runs, that both sails are in it, that the answer is a sailing
+/// yacht, and that the *difference* from the tabular oracle stays inside a band. The
+/// band is the point: the two models disagree by 6 % on lift and 13 % on drag on
+/// this boat, and both differences are attributed —
+///
+/// - **less lift**, because the coupled solve back-winds the mainsail with the
+///   headsail's wake and the tabular model has no such term at all;
+/// - **more drag**, because the tabular model's effective span takes the deck as a
+///   partial reflection plane and a lattice with a free foot vortex does not.
+///
+/// So the band is a regression test on a known gap. It tightens when the image
+/// lattice arrives, and if it moves for any other reason something has changed that
+/// was not meant to.
+#[test]
+fn the_geometric_model_sails_and_differs_by_what_is_missing() {
+    let mut geometric = sailing_geometrically(MODERATE_WIND, 40.0);
+    let solved = solve(&mut geometric).expect("the geometric model must sail this boat");
+    let telemetry = geometric.telemetry();
+
+    // The chain ran, with both sails in one system.
+    assert_relative_eq!(
+        telemetry.get("aero.geometric.active").expect("the key"),
+        1.0
+    );
+    assert_relative_eq!(telemetry.get("aero.geometric.sails").expect("the key"), 2.0);
+
+    // And it is a sailing yacht: making way, driving forward, heeling to leeward.
+    assert!(
+        solved.speed > 1.0,
+        "the boat did not sail: {:.2}",
+        solved.speed
+    );
+    assert!(telemetry.get("aero.driving_force").expect("the key") > 0.0);
+    assert!(solved.heel.abs() > 1.0_f64.to_radians());
+
+    // The wake it was factorised for is the wake it is sailing in.
+    assert!(
+        telemetry.get("aero.geometric.wake_drift").expect("the key") <= 5.0_f64.to_radians(),
+        "the plan is being sailed at a wake it was not built for"
+    );
+
+    // Now the same condition on the oracle.
+    let mut tabular = sailing(MODERATE_WIND, 40.0, 1.0, 1.0);
+    solve(&mut tabular).expect("the tabular model must sail this boat");
+    let reference = tabular.telemetry();
+
+    let lift = telemetry.get("aero.lift_coefficient").expect("the key")
+        / reference.get("aero.lift_coefficient").expect("the key");
+    let drag = telemetry.get("aero.drag_coefficient").expect("the key")
+        / reference.get("aero.drag_coefficient").expect("the key");
+
+    assert!(
+        (0.85..1.0).contains(&lift),
+        "the geometric model gave {lift:.3} of the tabular lift; it should be below \
+         it, by the back-winding the tabular model has no term for"
+    );
+    assert!(
+        (1.0..1.25).contains(&drag),
+        "the geometric model gave {drag:.3} of the tabular drag; it should be above \
+         it, by the hull endplate the lattice has no image for"
+    );
+
+    // Below its stall onset the empirical branch contributes nothing, so the
+    // blended and attached coefficients are the same number.
+    let separated = telemetry
+        .get("aero.geometric.separated_fraction")
+        .expect("the key");
+    if separated == 0.0 {
+        assert_relative_eq!(
+            telemetry.get("aero.lift_coefficient").expect("the key"),
+            telemetry
+                .get("aero.geometric.attached_lift_coefficient")
+                .expect("the key"),
+            max_relative = 1e-12
+        );
+    }
 }

@@ -450,6 +450,140 @@ calibration is the open item of §4.3, and it is named rather than faked.
   noise on speed/direction). Abstract requirement: temporally correlated, no
   white-noise steps.
 
+### 4.5 Controls → shape: the calibration is the boat file's
+
+`flying::{Controls, Response}` closes §4.3's open item without inventing it.
+
+**Controls are normalised, 0 eased to 1 hard.** The physical alternative does not
+exist yet: a control's real input is a line tension in newtons or a car position in
+millimetres, the transfer to a shape has been measured in a handful of wind-tunnel
+campaigns whose numbers live in figures behind paywalls, and it depends on dynamic
+pressure as well as on the control, because cloth stretches. So `Response` asks a
+sail's designer to declare what each control *reaches* — two numbers a sailmaker
+knows — instead of asking the engine for a coefficient nobody has published.
+
+**Two composition rules carry the physics.**
+
+```text
+leech tension = max(sheet, vang)      boom in = sheet × traveller
+```
+
+A leech has one tension; sheet and vang are two ways of applying it and whichever
+is tighter holds it. That is *why* a boat carries both — the vang takes over the
+tension the sheet gives up. A sum would make the pair twice as powerful as either
+and would open a leech the vang has hold of.
+
+The angle needs *both*: easing the sheet lets the boom out however the car is set,
+and dropping the car lets it out however hard the sheet is in. Either at zero leaves
+the angle open — which is the classic depowering trim, car down and sheet hard, an
+open angle with a closed leech. A single sheet scalar cannot express it.
+
+**Direction checks at load, because those are what the literature gives.** An
+outhaul that adds camber, leech tension that adds twist, or luff tension that moves
+the draft aft are refused when a boat file is read rather than sailed. After that,
+trimming is *infallible*: every value is an interpolation between two already
+checked endpoints, so no control setting a simulator can reach fails. Controls out
+of range are clamped, because sliders overshoot and a control at 1.2 is not a
+physical statement whose error needs preserving.
+
+**The camber-twist coupling has a declared slot, defaulting to zero.** That is a
+complete model of a sail whose designer declares no coupling, not a placeholder; the
+sign is known from [[Zhang et al. 2025]](#bib-windsurf) and negative values are
+refused. With it declared, their paradox appears — a fuller sail making *less* lift.
+Recorded as a property of the model rather than of any sail: the coupling needed to
+flip the sign on the reference planform is about **16° of head twist across the
+camber range**, which is the number a campaign would have to confirm or refute.
+
+### 4.6 Status: the chain is wired, and it is opt-in
+
+`sail::Plan` assembles the three modules and answers the question a boat asks;
+`modules::sails` carries it behind the same `ForceModule` and the same `aero.*`
+telemetry keys as the tabular model. A boat file declares which model it wants
+(`aerodynamics: Tabular | Geometric`), and **`Tabular` is the default** — the
+tabular model is the oracle §10 validates against, and a boat that did not ask for
+the other one must not silently get it.
+
+**Two costs, deliberately visible.** Building a plan factorises: cubic in the total
+panel count, so two sails of 240 panels cost about eight times one of them rather
+than twice. Asking for a wrench solves a right-hand side, a hundred times less. So
+the expensive operation has a name that says so and the type reports when it is
+needed (`wake_drift`) rather than deciding — noticing internally that the wind moved
+and quietly refactorising would put a fifty-millisecond stall inside a sixty-hertz
+loop at a moment nobody chose.
+
+**What comes from where.** Lift and induced drag come from the geometry. The viscous
+and parasitic drag do **not**: a lattice has no viscosity, and the friction of cloth
+and the windage of mast and topsides are real forces the tabular model already
+carries from Hazen's coefficients. They are added on top — the composition §4.1
+describes. Leaving them out was the quiet mistake available here: a boat with the
+same lift and less drag sails faster, and the polar would have improved for a reason
+that is not physics.
+
+**Reefing is geometry, so it is applied to the geometry.** The tabular reef factor
+scales an area and hands the same coefficients back; here it scales the sail's
+*outline*, because a smaller similar sail has its own lift slope, its own aspect
+ratio and its own centre of effort rather than a fraction of the full sail's. The
+flattening factor is deliberately not read — flattening is what an outhaul and a
+traveller do, and those are in the line positions already.
+
+#### Measured against the oracle, on the same boat and condition
+
+| | geometric | tabular | ratio |
+|---|---|---|---|
+| `C_L` | 1.480 | 1.577 | **0.94** |
+| `C_D` | 0.324 | 0.287 | **1.13** |
+| driving force | 1116 N | 1315 N | 0.85 |
+| heeling force | 4474 N | 5784 N | 0.77 |
+
+Both differences are attributed, and that is why the model is not yet the default:
+
+- **Less lift** is the physics being *added*. The coupled solve back-winds the
+  mainsail with the headsail's wake, and the tabular model has no such term at all.
+- **More drag** is physics still *missing*. The tabular model's effective span takes
+  the deck as a partial reflection plane; a lattice with a free foot vortex does not,
+  and the absent image shows up as excess induced drag. The coupled solver can now
+  express the fix — a mirrored lattice below the waterline is an endplate computed
+  rather than tabulated — at the price of doubling the panel count.
+
+#### The second blocker, found by a failing test
+
+Switching the reference boat to the geometric model broke seven integration tests
+including the published-polar oracle. One of them was diagnostic rather than
+calibration: the two tacks came out **0.11 % apart** where the tabular model is
+symmetric to a part in a thousand.
+
+That is not a sign error. Refactorising when the wake has drifted past a threshold
+makes the force depend on the *history* of wind angles rather than only on the
+current one, so a Newton solver — which differentiates numerically — sees a step in
+the derivative and two nearly identical paths land on two nearly identical answers.
+Invisible in a time-stepping simulation, poison to an equilibrium solve.
+
+The fix is to hold the wake fixed for the duration of a solve rather than to shrink
+the threshold, and it is named rather than done. Until both blockers are closed the
+geometric model is a declared choice, exercised end to end by one integration test
+whose assertions are a *band on the difference* from the oracle — a regression test
+on a known gap, which tightens when the gap closes.
+
+#### What the boat file has to declare, and what it must not
+
+The luff and the foot are **derived from the rig** — `P` and `E` for a mainsail, the
+forestay length and `LPG` for a jib — so a file cannot declare a sail whose size
+disagrees with the one the tabular model is sailing. What it declares is the shape a
+measurement rule cannot imply: head chord, roach, camber and draft travel, twist
+travel, sheeting angles, stall angle, tack position.
+
+For the shipped YD-41 every one of those is **assumed and marked as assumed**.
+Larsson, Eliasson & Orych give the rig in IOR letters, which is a measurement rule;
+nothing in it is a flying shape. So a polar computed through that block demonstrates
+the chain and is *not* a validation against the published YD-41 polar, and the file
+says so.
+
+Spinnakers are absent by design rather than omission: their luff and foot follow
+from no IOR letter, and downwind is where the literature has coefficients rather
+than theory. A sail set the geometric model cannot fully cover falls back to the
+tabular one for that set — so a yacht computes its upwind forces from geometry and
+its downwind forces from a table, which is where each is the better model.
+
 ---
 
 ## 5. Hydrodynamics — hull
@@ -1309,7 +1443,7 @@ What the phase also produced, recorded because they are properties of the
 | Phase | Deliverable | New physics |
 |---|---|---|
 | 1 | Boat sails on flat water, playable | DSYHS hull + EKM appendages + tabular sail coefficients (Hazen/ORC-style), 6-DOF, wind shear |
-| 2 | Physical sail trim | VLM (§4.1a) + parametric flying shape (§4.3a) + downwind blending (§4.2a) — **all three built and validated**; what remains is the control→shape mapping and wiring the chain behind `aero`'s interface |
+| 2 | Physical sail trim | VLM (§4.1a) + flying shape (§4.3a) + blending (§4.2a) + control mapping (§4.5), assembled and wired behind `ForceModule` (§4.6) — **the chain sails a boat**, and is opt-in until two named gaps close: the hull endplate image, and holding the wake fixed across an equilibrium solve |
 | 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle |
 | 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation — **done for five of six modes**; surge and viscous roll damping stated as absent in §5.3j |
 

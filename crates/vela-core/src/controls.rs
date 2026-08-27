@@ -1,9 +1,11 @@
 //! What the crew can change while sailing.
 //!
-//! Only controls the force models actually consume appear here. A traveller, a
-//! backstay or a jib lead would be perfectly reasonable things for a crew to
-//! pull, but the transcribed coefficient model has no term for any of them, and
-//! a control that silently does nothing is worse than an absent one.
+//! Two aerodynamic trims live here rather than one, because two force models do.
+//! [`crate::aero`]'s tabular model reads `flat` and `reef`; the geometric model of
+//! [`crate::sail`] reads line positions. They are not translations of each other —
+//! there is no flattening factor that *means* "outhaul three quarters on" — so
+//! carrying both and letting each model read its own is the only honest
+//! arrangement. A boat runs whichever model its file has data for.
 
 use crate::aero::{EffectiveSpan, SailSet, Trim};
 
@@ -24,8 +26,10 @@ pub struct Controls {
     pub rudder_angle: f64,
     /// Which sails are set.
     pub sails: SailSet,
-    /// Flattening, reefing, and the aspect-ratio regime.
+    /// Flattening, reefing, and the aspect-ratio regime — the tabular model's trim.
     pub trim: Trim,
+    /// Line positions — the geometric model's trim.
+    pub shape: crate::flying::Controls,
 }
 
 impl Controls {
@@ -36,6 +40,10 @@ impl Controls {
             rudder_angle: 0.0,
             sails,
             trim: Trim::full(EffectiveSpan::CloseHauled),
+            // Everything on: a closed leech, a flat sail and the draft forward,
+            // which is what close-hauled *means* on the line positions as much as
+            // it means an unflattened coefficient on the tabular one.
+            shape: crate::flying::Controls::HARD,
         }
     }
 
@@ -46,6 +54,7 @@ impl Controls {
             rudder_angle: 0.0,
             sails,
             trim: Trim::full(EffectiveSpan::Eased),
+            shape: crate::flying::Controls::EASED,
         }
     }
 
@@ -60,5 +69,11 @@ impl Controls {
     #[must_use]
     pub fn with_trim(self, trim: Trim) -> Self {
         Self { trim, ..self }
+    }
+
+    /// Sets the line positions the geometric model reads.
+    #[must_use]
+    pub fn with_shape(self, shape: crate::flying::Controls) -> Self {
+        Self { shape, ..self }
     }
 }

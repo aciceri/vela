@@ -123,7 +123,7 @@ const VISCOUS_DRAG: CoefficientTable = [
 ///
 /// The discriminants are the column order of Table 8.1 and are used to index
 /// it, so they are not free to reorder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum Sail {
     Main = 0,
     Jib = 1,
