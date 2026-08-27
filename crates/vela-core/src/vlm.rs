@@ -432,7 +432,12 @@ impl Solver {
         Some(Solution {
             circulation: circulation.as_slice().to_vec(),
             forces,
-            collocation: self.collocation.clone(),
+            // Where each force *acts*, which is the bound segment it was computed
+            // on and not the collocation point the boundary condition was imposed
+            // at. The two differ by half a panel chord, and using the wrong one
+            // puts a systematic error in the moment that no lift or drag check
+            // would notice.
+            positions: self.bound.iter().map(|&(midpoint, _)| midpoint).collect(),
         })
     }
 }
@@ -442,7 +447,7 @@ impl Solver {
 pub struct Solution {
     circulation: Vec<f64>,
     forces: Vec<Vector3<f64>>,
-    collocation: Vec<Point>,
+    positions: Vec<Point>,
 }
 
 impl Solution {
@@ -458,6 +463,16 @@ impl Solution {
         &self.forces
     }
 
+    /// Where each of those forces acts: the panel's bound-segment midpoint.
+    ///
+    /// Exposed because a caller that corrects the forces — an empirical stall
+    /// blend, say — has to be able to take the moment of what it produced, and
+    /// taking it about anything else silently changes the arm.
+    #[must_use]
+    pub fn positions(&self) -> &[Point] {
+        &self.positions
+    }
+
     /// Total force on the surface.
     #[must_use]
     pub fn force(&self) -> Vector3<f64> {
@@ -468,13 +483,13 @@ impl Solution {
     ///
     /// Taken at each panel's own bound-segment midpoint, which is where the force
     /// was computed. That matters for a sail: the vertical distribution of side
-    /// force is the heeling moment, and it is the thing a coefficient model
-    /// cannot produce.
+    /// force is the heeling moment, and it is the thing a coefficient model cannot
+    /// produce.
     #[must_use]
     pub fn moment_about(&self, about: Point) -> Vector3<f64> {
         self.forces
             .iter()
-            .zip(self.collocation.iter())
+            .zip(self.positions.iter())
             .map(|(force, &at)| (at - about).cross(force))
             .sum()
     }

@@ -458,6 +458,245 @@ impl Shape {
     }
 }
 
+/// The trim controls of one sail, each normalised: 0 fully eased, 1 fully hard.
+///
+/// Normalised rather than physical because the physical alternative does not
+/// exist yet. A control's real input is a line tension in newtons or a car
+/// position in millimetres, and the transfer from either of those to a shape has
+/// been measured only in a handful of wind-tunnel campaigns whose numbers live in
+/// figures behind paywalls — and it depends on dynamic pressure as well as on the
+/// control, because cloth stretches. Declaring what a control *reaches* (see
+/// [`Response`]) asks the boat's designer for two numbers they know, instead of
+/// asking this module to invent a coefficient.
+///
+/// Values outside `[0, 1]` are clamped rather than refused. These come from
+/// sliders and solvers, which overshoot by a bit-width and would otherwise make a
+/// trim fail; and a control at 1.2 is not a physical statement whose error needs
+/// preserving.
+///
+/// Distinct from [`crate::controls::Controls`], which is the boat-level state —
+/// sail selection, rudder, and which sails are set. This is the shape of one sail.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Controls {
+    /// Mainsheet, or the headsail sheet: closes the angle *and* tensions the leech.
+    pub sheet: f64,
+    /// Traveller car, or the sheet lead: closes the angle without touching the
+    /// leech.
+    pub traveller: f64,
+    /// Vang, or the leech line: tensions the leech without closing the angle.
+    pub vang: f64,
+    /// Outhaul, or the foot tension: flattens the sail.
+    pub outhaul: f64,
+    /// Luff tension — cunningham and halyard together, since they do the same
+    /// thing to the shape: moves the draft forward.
+    pub cunningham: f64,
+}
+
+impl Controls {
+    /// Everything eased.
+    pub const EASED: Self = Self {
+        sheet: 0.0,
+        traveller: 0.0,
+        vang: 0.0,
+        outhaul: 0.0,
+        cunningham: 0.0,
+    };
+
+    /// Everything hard on.
+    pub const HARD: Self = Self {
+        sheet: 1.0,
+        traveller: 1.0,
+        vang: 1.0,
+        outhaul: 1.0,
+        cunningham: 1.0,
+    };
+
+    /// Every control clamped into its range, and any non-finite one eased.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        let fix = |value: f64| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            sheet: fix(self.sheet),
+            traveller: fix(self.traveller),
+            vang: fix(self.vang),
+            outhaul: fix(self.outhaul),
+            cunningham: fix(self.cunningham),
+        }
+    }
+
+    /// Leech tension, which is what actually sets twist.
+    ///
+    /// `max(sheet, vang)`, and the choice of `max` over a sum is the physics. A
+    /// leech has one tension; sheet and vang are two ways of applying it, and
+    /// whichever is tighter is the one holding it. That is *why* a boat carries
+    /// both — the vang takes over the leech tension the sheet gives up, which is
+    /// what lets a trimmer open the angle without letting the head twist off.
+    #[must_use]
+    pub fn leech_tension(self) -> f64 {
+        self.sheet.max(self.vang)
+    }
+
+    /// How far the boom is brought in, as a fraction of its range.
+    ///
+    /// The product of sheet and traveller, because the angle needs *both*. Easing
+    /// the sheet lets the boom out however the car is set, and dropping the car to
+    /// leeward lets it out however hard the sheet is in. So either at zero leaves
+    /// the angle open — which is exactly the classic depowering trim, traveller
+    /// down and sheet hard: an open angle with a closed leech, and this model
+    /// reproduces it because the two quantities are computed from different rules.
+    #[must_use]
+    pub fn boom_in(self) -> f64 {
+        self.sheet * self.traveller
+    }
+}
+
+/// What one sail's controls reach: the shape at each end of each control's travel.
+///
+/// This is the calibration, and it is the boat file's to declare rather than this
+/// module's to know. A sailmaker knows that a given main goes from sixteen per cent
+/// camber with the outhaul off to eight with it hard on; nothing in the published
+/// literature knows it for a sail in general.
+///
+/// Validated once, on construction. After that [`Response::shape`] is infallible:
+/// every value it produces is an interpolation between two declared endpoints that
+/// were already checked, so there is no trim setting a simulator can reach that
+/// fails. A control that could break the model would be worse than one that cannot
+/// express something.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Response {
+    angle: (f64, f64),
+    twist: (f64, f64),
+    camber: (f64, f64),
+    head_camber: f64,
+    draft: (f64, f64),
+    camber_twist: f64,
+}
+
+impl Response {
+    /// Declares a sail's control travel.
+    ///
+    /// Each pair is `(eased, hard)`:
+    ///
+    /// - `angle`: chord angle at the foot, radians, with the boom fully out and
+    ///   fully in.
+    /// - `twist`: head twist, radians, with the leech slack and fully tensioned.
+    ///   Slack must be the larger: tensioning a leech removes twist.
+    /// - `camber`: camber ratio at the foot, with the outhaul off and hard on. Off
+    ///   must be the larger: an outhaul flattens.
+    /// - `draft`: draft position, with the luff slack and hard on. Slack must be
+    ///   the larger: luff tension moves the draft forward.
+    ///
+    /// `head_camber` is the head's camber as a fraction of the foot's — a sail's
+    /// own taper, which the controls do not change. One number rather than a second
+    /// pair, because no control acts on the head's camber independently.
+    ///
+    /// Returns `None` if any value is unusable or any pair runs the wrong way. The
+    /// direction checks are the point: they are the qualitative derivatives the
+    /// literature *does* give, so a boat file with a sign error is caught at load
+    /// rather than sailed.
+    #[must_use]
+    pub fn new(
+        angle: (f64, f64),
+        twist: (f64, f64),
+        camber: (f64, f64),
+        head_camber: f64,
+        draft: (f64, f64),
+    ) -> Option<Self> {
+        let finite = [
+            angle.0,
+            angle.1,
+            twist.0,
+            twist.1,
+            camber.0,
+            camber.1,
+            head_camber,
+            draft.0,
+            draft.1,
+        ]
+        .iter()
+        .all(|value| value.is_finite());
+        if !finite
+            || twist.0 < twist.1
+            || camber.0 < camber.1
+            || draft.0 < draft.1
+            || !(0.0..=1.0).contains(&head_camber)
+        {
+            return None;
+        }
+        // Both ends of both distributions have to be sections a sail can fly, and
+        // the head's camber is scaled from the foot's so it is checked separately.
+        Profile::new(camber.0, draft.0)?;
+        Profile::new(camber.1, draft.1)?;
+        Profile::new(camber.0 * head_camber, draft.0)?;
+        Some(Self {
+            angle,
+            twist,
+            camber,
+            head_camber,
+            draft,
+            camber_twist: 0.0,
+        })
+    }
+
+    /// Declares that a fuller sail twists more, by `radians` of extra head twist at
+    /// full camber.
+    ///
+    /// The coupling [[Zhang et al. 2025]](https://arxiv.org/abs/2501.13254)
+    /// measured and this engine refuses to guess. Easing their outhaul increased
+    /// camber and twist together, and the twist won — their high-camber setting made
+    /// *less* lift, which is backwards for a section and is the whole reason the
+    /// geometry of [`Shape`] holds camber and twist apart.
+    ///
+    /// The mechanism is a slacker leech: a fuller sail has more cloth in it, so the
+    /// same sheet load leaves the head freer. The *strength* is not published for
+    /// any sail, so it defaults to zero — which is a complete model of a sail whose
+    /// designer declares no coupling, not a placeholder. Sign only is known, and
+    /// negative values are refused for that reason.
+    #[must_use]
+    pub fn with_camber_twist_coupling(self, radians: f64) -> Option<Self> {
+        if !radians.is_finite() || radians < 0.0 {
+            return None;
+        }
+        Some(Self {
+            camber_twist: radians,
+            ..self
+        })
+    }
+
+    /// The shape a planform takes at a control setting.
+    ///
+    /// Infallible by construction — see the type's own documentation.
+    #[must_use]
+    pub fn shape(&self, planform: Planform, controls: Controls) -> Shape {
+        let controls = controls.clamped();
+        let between = |range: (f64, f64), at: f64| range.0 + (range.1 - range.0) * at;
+
+        let camber = between(self.camber, controls.outhaul);
+        // Fullness above the flattest the sail goes, as a fraction of its range,
+        // which is what the coupling is declared against.
+        let fullness = if self.camber.0 > self.camber.1 {
+            (camber - self.camber.1) / (self.camber.0 - self.camber.1)
+        } else {
+            0.0
+        };
+        let twist = between(self.twist, controls.leech_tension()) + self.camber_twist * fullness;
+
+        Shape {
+            planform,
+            camber: Distribution::new(camber, camber * self.head_camber),
+            draft: Distribution::uniform(between(self.draft, controls.cunningham)),
+            twist: Distribution::new(0.0, twist),
+            trim: between(self.angle, controls.boom_in()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,5 +1393,369 @@ mod tests {
         let lattice = shape.lattice(4, 8).expect("a grid");
         assert!(lattice.reference_area() > 0.0);
         assert!(Solver::new(lattice, Vector3::new(-1.0, 0.0, 0.0)).is_some());
+    }
+
+    /// A plausible mainsail's control travel, for the mapping tests.
+    fn response() -> Response {
+        Response::new(
+            (25.0_f64.to_radians(), 4.0_f64.to_radians()),
+            (22.0_f64.to_radians(), 3.0_f64.to_radians()),
+            (0.16, 0.08),
+            0.55,
+            (0.48, 0.34),
+        )
+        .expect("a real sail's travel")
+    }
+
+    /// The declared endpoints come back exactly at the ends of the travel.
+    ///
+    /// The contract with whoever fills in a boat file: the two numbers they wrote
+    /// are the two shapes the sail actually reaches, not the ends of some internal
+    /// range the model rescales.
+    #[test]
+    fn the_declared_endpoints_are_reached_exactly() {
+        let planform = windsurf();
+        let response = response();
+
+        let eased = response.shape(planform, Controls::EASED);
+        assert_relative_eq!(
+            eased.chord_angle(0.0),
+            25.0_f64.to_radians(),
+            max_relative = 1e-14
+        );
+        assert_relative_eq!(eased.profile(0.0).camber(), 0.16, max_relative = 1e-14);
+        assert_relative_eq!(eased.profile(0.0).draft(), 0.48, max_relative = 1e-14);
+        assert_relative_eq!(
+            eased.chord_angle(1.0) - eased.chord_angle(0.0),
+            22.0_f64.to_radians(),
+            max_relative = 1e-14
+        );
+
+        let hard = response.shape(planform, Controls::HARD);
+        assert_relative_eq!(
+            hard.chord_angle(0.0),
+            4.0_f64.to_radians(),
+            max_relative = 1e-14
+        );
+        assert_relative_eq!(hard.profile(0.0).camber(), 0.08, max_relative = 1e-14);
+        assert_relative_eq!(hard.profile(0.0).draft(), 0.34, max_relative = 1e-14);
+        assert_relative_eq!(
+            hard.chord_angle(1.0) - hard.chord_angle(0.0),
+            3.0_f64.to_radians(),
+            max_relative = 1e-14
+        );
+
+        // And the head's camber is the declared fraction of the foot's, at both.
+        assert_relative_eq!(
+            eased.profile(1.0).camber() / eased.profile(0.0).camber(),
+            0.55,
+            max_relative = 1e-14
+        );
+    }
+
+    /// The leech has one tension, and the vang takes over what the sheet gives up.
+    ///
+    /// `max(sheet, vang)` rather than a sum, and this is the test that says why the
+    /// distinction is physical rather than notational: easing the sheet under a hard
+    /// vang must not let the head twist off, because the vang is still holding the
+    /// leech. A model that summed would make the pair of controls twice as powerful
+    /// as either, and easing the sheet would open a leech the vang has hold of.
+    #[test]
+    fn the_leech_has_one_tension_and_the_vang_holds_it() {
+        let hard_sheet = Controls {
+            sheet: 1.0,
+            vang: 0.0,
+            ..Controls::EASED
+        };
+        let hard_vang = Controls {
+            sheet: 0.0,
+            vang: 1.0,
+            ..Controls::EASED
+        };
+        let both = Controls {
+            sheet: 1.0,
+            vang: 1.0,
+            ..Controls::EASED
+        };
+        assert_eq!(hard_sheet.leech_tension(), 1.0);
+        assert_eq!(hard_vang.leech_tension(), 1.0);
+        // Both hard is not tighter than either: there is no more leech to tension.
+        assert_eq!(both.leech_tension(), 1.0);
+        assert_eq!(Controls::EASED.leech_tension(), 0.0);
+
+        // Easing the sheet under a hard vang leaves the twist alone.
+        let planform = windsurf();
+        let response = response();
+        let twist_of = |controls: Controls| {
+            let shape = response.shape(planform, controls);
+            shape.chord_angle(1.0) - shape.chord_angle(0.0)
+        };
+        assert_relative_eq!(
+            twist_of(hard_sheet),
+            twist_of(hard_vang),
+            max_relative = 1e-14
+        );
+        assert_relative_eq!(twist_of(both), twist_of(hard_vang), max_relative = 1e-14);
+        assert!(twist_of(Controls::EASED) > twist_of(hard_vang));
+    }
+
+    /// Traveller down with the sheet hard opens the angle and closes the leech.
+    ///
+    /// The classic depowering trim, and it comes out because the two quantities are
+    /// computed by different rules — a product for the angle, a maximum for the
+    /// leech. A single "sheet in / sheet out" scalar could not express it, which is
+    /// the reason the two controls are separate here.
+    #[test]
+    fn traveller_down_with_a_hard_sheet_opens_the_angle_and_shuts_the_leech() {
+        let planform = windsurf();
+        let response = response();
+
+        let depowered = Controls {
+            sheet: 1.0,
+            traveller: 0.0,
+            ..Controls::EASED
+        };
+        let powered = Controls {
+            sheet: 1.0,
+            traveller: 1.0,
+            ..Controls::EASED
+        };
+        let (open, closed) = (
+            response.shape(planform, depowered),
+            response.shape(planform, powered),
+        );
+
+        // The angle is wide open - as wide as with no sheet at all.
+        assert_relative_eq!(
+            open.chord_angle(0.0),
+            25.0_f64.to_radians(),
+            max_relative = 1e-14
+        );
+        assert!(closed.chord_angle(0.0) < open.chord_angle(0.0));
+        // And yet the leech is fully tensioned in both, so the twist is the same.
+        let twist = |shape: &Shape| shape.chord_angle(1.0) - shape.chord_angle(0.0);
+        assert_relative_eq!(twist(&open), twist(&closed), max_relative = 1e-14);
+        assert_relative_eq!(twist(&open), 3.0_f64.to_radians(), max_relative = 1e-14);
+    }
+
+    /// Each control moves its own parameter, monotonically and the right way.
+    ///
+    /// The qualitative derivatives are what the sail-trim literature actually
+    /// supplies, so they are what gets pinned: an outhaul flattens, luff tension
+    /// moves the draft forward, leech tension removes twist, and sheeting in closes
+    /// the angle. A boat file with a sign error is refused at load, and this is the
+    /// test that the mapping itself does not reintroduce one.
+    #[test]
+    fn every_control_moves_its_own_parameter_the_right_way() {
+        let planform = windsurf();
+        let response = response();
+        let at = |controls: Controls| response.shape(planform, controls);
+
+        let mut previous = (f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        for step in 0..=10 {
+            let value = step as f64 / 10.0;
+            let camber = at(Controls {
+                outhaul: value,
+                ..Controls::EASED
+            })
+            .profile(0.0)
+            .camber();
+            let draft = at(Controls {
+                cunningham: value,
+                ..Controls::EASED
+            })
+            .profile(0.0)
+            .draft();
+            let shape = at(Controls {
+                vang: value,
+                ..Controls::EASED
+            });
+            let twist = shape.chord_angle(1.0) - shape.chord_angle(0.0);
+            let angle = at(Controls {
+                sheet: value,
+                traveller: 1.0,
+                ..Controls::EASED
+            })
+            .chord_angle(0.0);
+
+            if step > 0 {
+                assert!(camber < previous.0, "the outhaul did not flatten");
+                assert!(
+                    draft < previous.1,
+                    "luff tension did not move the draft forward"
+                );
+                assert!(twist < previous.2, "leech tension did not remove twist");
+                assert!(angle < previous.3, "sheeting in did not close the angle");
+            }
+            previous = (camber, draft, twist, angle);
+        }
+    }
+
+    /// Controls outside their range are clamped, and a trim never fails.
+    ///
+    /// A slider or a solver will hand over 1.0000001, and a `Response` validated at
+    /// construction has no interpolation that can leave the flyable set — so
+    /// [`Response::shape`] returns a shape rather than an option. A trim setting
+    /// that could break the model would be worse than one that cannot express
+    /// something.
+    #[test]
+    fn controls_out_of_range_are_clamped_and_a_trim_never_fails() {
+        let planform = windsurf();
+        let response = response();
+        let wild = Controls {
+            sheet: 4.0,
+            traveller: -2.0,
+            vang: f64::NAN,
+            outhaul: 1e9,
+            cunningham: f64::NEG_INFINITY,
+        };
+        let clamped = wild.clamped();
+        assert_eq!(clamped.sheet, 1.0);
+        assert_eq!(clamped.traveller, 0.0);
+        assert_eq!(clamped.vang, 0.0);
+        assert_eq!(clamped.outhaul, 1.0);
+        assert_eq!(clamped.cunningham, 0.0);
+
+        // And the shape it produces is a real one that solves.
+        let shape = response.shape(planform, wild);
+        assert!(shape.profile(0.5).camber() >= 0.0);
+        let lattice = shape.lattice(6, 14).expect("a grid");
+        assert!(Solver::new(lattice, Vector3::new(-1.0, 0.0, 0.0)).is_some());
+
+        // Sweeping the whole control cube produces nothing unflyable.
+        for i in 0..3_usize.pow(5) {
+            let digit = |place: u32| ((i / 3_usize.pow(place)) % 3) as f64 / 2.0;
+            let shape = response.shape(
+                planform,
+                Controls {
+                    sheet: digit(0),
+                    traveller: digit(1),
+                    vang: digit(2),
+                    outhaul: digit(3),
+                    cunningham: digit(4),
+                },
+            );
+            let profile = shape.profile(0.7);
+            assert!(profile.camber() >= 0.0 && (0.0..1.0).contains(&profile.draft()));
+        }
+    }
+
+    /// A boat file whose control travel runs backwards is refused.
+    #[test]
+    fn a_response_with_a_sign_error_is_refused() {
+        let good = (0.16, 0.08);
+        let angle = (0.4, 0.1);
+        let twist = (0.4, 0.05);
+        let draft = (0.48, 0.34);
+        assert!(Response::new(angle, twist, good, 0.55, draft).is_some());
+        // An outhaul that adds camber.
+        assert!(Response::new(angle, twist, (0.08, 0.16), 0.55, draft).is_none());
+        // Leech tension that adds twist.
+        assert!(Response::new(angle, (0.05, 0.4), good, 0.55, draft).is_none());
+        // Luff tension that moves the draft aft.
+        assert!(Response::new(angle, twist, good, 0.55, (0.34, 0.48)).is_none());
+        // A head fuller than its foot, or a section no sail can fly.
+        assert!(Response::new(angle, twist, good, 1.4, draft).is_none());
+        assert!(Response::new(angle, twist, good, 0.55, (0.48, 0.0)).is_none());
+        assert!(Response::new(angle, twist, (0.16, -0.01), 0.55, draft).is_none());
+        assert!(Response::new(angle, twist, good, 0.55, (f64::NAN, 0.34)).is_none());
+
+        // The coupling takes a sign, not a guess.
+        let response = Response::new(angle, twist, good, 0.55, draft).expect("a real travel");
+        assert!(response.with_camber_twist_coupling(-0.1).is_none());
+        assert!(response.with_camber_twist_coupling(f64::NAN).is_none());
+        assert!(response.with_camber_twist_coupling(0.0).is_some());
+    }
+
+    /// The coupling adds twist only where the sail is full, and defaults to none.
+    #[test]
+    fn the_coupling_acts_only_on_a_full_sail() {
+        let planform = windsurf();
+        let coupled = response()
+            .with_camber_twist_coupling(12.0_f64.to_radians())
+            .expect("a declared coupling");
+        let twist_of = |response: &Response, outhaul: f64| {
+            let shape = response.shape(
+                planform,
+                Controls {
+                    outhaul,
+                    ..Controls::EASED
+                },
+            );
+            shape.chord_angle(1.0) - shape.chord_angle(0.0)
+        };
+
+        // Outhaul hard: the sail is at its flattest, so there is nothing to couple.
+        assert_relative_eq!(
+            twist_of(&coupled, 1.0),
+            twist_of(&response(), 1.0),
+            max_relative = 1e-14
+        );
+        // Outhaul off: the whole declared coupling.
+        assert_relative_eq!(
+            twist_of(&coupled, 0.0) - twist_of(&response(), 0.0),
+            12.0_f64.to_radians(),
+            max_relative = 1e-12
+        );
+        // Monotone in between, and zero by default everywhere.
+        for step in 0..=8 {
+            let outhaul = step as f64 / 8.0;
+            assert!(twist_of(&coupled, outhaul) >= twist_of(&response(), outhaul));
+        }
+    }
+
+    /// With a coupling declared, the measured paradox appears: a fuller sail makes
+    /// less lift.
+    ///
+    /// This closes the loop that [`Shape`]'s own tests deliberately left open.
+    /// Zhang et al. measured the high-camber setting producing *less* lift, which is
+    /// backwards for a section, and attributed it to the twist that came with the
+    /// camber. The geometry holds the two apart so that camber alone increases lift
+    /// there; here, with the coupling declared, the ordering reverses.
+    ///
+    /// What this test asserts is that the model can *express* the observation, not
+    /// that any particular sail has that coupling. The coupling used is an input.
+    ///
+    /// Worth recording, as a property of the model rather than of any sail: the
+    /// coupling needed to flip the sign on this planform is about sixteen degrees of
+    /// head twist across the camber range. That is large, and it is the number a
+    /// campaign would have to confirm or refute before the coupling could be
+    /// declared for a real boat.
+    #[test]
+    fn a_declared_coupling_reproduces_the_measured_paradox() {
+        let planform = windsurf();
+        let full = Controls {
+            outhaul: 0.0,
+            ..Controls::EASED
+        };
+        let flat = Controls {
+            outhaul: 1.0,
+            ..Controls::EASED
+        };
+        let lift = |response: &Response, controls: Controls| {
+            measure(&response.shape(planform, controls), 14.0, (8, 20)).0
+        };
+
+        // Uncoupled, a fuller sail makes more lift - the section's own behaviour.
+        let plain = response();
+        assert!(lift(&plain, full) > lift(&plain, flat));
+
+        // Coupled hard enough, it makes less, which is what was measured.
+        let coupled = plain
+            .with_camber_twist_coupling(18.0_f64.to_radians())
+            .expect("a declared coupling");
+        assert!(
+            lift(&coupled, full) < lift(&coupled, flat),
+            "the declared coupling did not reverse the ordering: {:.4} against {:.4}",
+            lift(&coupled, full),
+            lift(&coupled, flat)
+        );
+
+        // And a small coupling does not: the reversal needs a real amount of twist,
+        // which is what makes the magnitude a question for a campaign.
+        let slight = plain
+            .with_camber_twist_coupling(4.0_f64.to_radians())
+            .expect("a declared coupling");
+        assert!(lift(&slight, full) > lift(&slight, flat));
     }
 }
