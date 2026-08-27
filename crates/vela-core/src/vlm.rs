@@ -274,16 +274,35 @@ impl Lattice {
 /// part; [`Solver::solve`] is `O(N²)`.
 #[derive(Debug, Clone)]
 pub struct Solver {
-    lattice: Lattice,
+    /// The surfaces, in the order their panels appear.
+    ///
+    /// Several rather than one because sails interact through their circulations
+    /// and not through their forces. A headsail's downwash is what makes a
+    /// mainsail's leading edge work, and it is the *same* linear system: solving
+    /// each sail alone and adding the answers gives every sail clean air, which is
+    /// wrong in the direction that matters and by an amount nothing in the result
+    /// would reveal.
+    lattices: Vec<Lattice>,
+    /// First panel index of each surface, with the total on the end.
+    offsets: Vec<usize>,
     wake: Vector3<f64>,
     factored: nalgebra::LU<f64, nalgebra::Dyn, nalgebra::Dyn>,
-    /// Collocation point of each panel, in the lattice's own order.
+    /// Collocation point of each panel, in solver order.
     collocation: Vec<Point>,
     /// Unit normal of each panel.
     normals: Vec<Vector3<f64>>,
     /// Bound-segment midpoint and vector of each panel's leading filament, which
     /// is where Kutta-Joukowski is applied.
     bound: Vec<(Point, Vector3<f64>)>,
+    /// The panel immediately forward of each one on its own surface, if any.
+    ///
+    /// A ring's leading segment sits on the ring ahead of it, so the circulation
+    /// that survives the cancellation is the difference. Precomputing the
+    /// neighbour rather than deriving it from the index is what lets surfaces of
+    /// different resolutions share one system — the leading-edge test used to be
+    /// `index < spanwise`, which silently means "the first surface's leading edge"
+    /// once there is more than one.
+    upstream: Vec<Option<usize>>,
     /// Velocity induced at bound midpoint `row` by ring `column` at unit
     /// circulation, indexed `row * panels + column`.
     ///
@@ -302,7 +321,7 @@ pub struct Solver {
 }
 
 impl Solver {
-    /// Assembles and factorises the influence matrix.
+    /// Assembles and factorises the influence matrix for one surface.
     ///
     /// `wake` is the direction the trailing filaments leave along; it is
     /// normalised here, and a zero vector is refused. See the module
@@ -313,24 +332,58 @@ impl Solver {
     /// better reported than solved.
     #[must_use]
     pub fn new(lattice: Lattice, wake: Vector3<f64>) -> Option<Self> {
+        Self::coupled(vec![lattice], wake)
+    }
+
+    /// Assembles and factorises one influence matrix over several surfaces.
+    ///
+    /// The surfaces share a linear system, so each one's boundary condition sees
+    /// every other one's vorticity — which is the only way a slot effect or a
+    /// mainsail's back-winding can come out of the geometry rather than out of a
+    /// correction factor.
+    ///
+    /// The cost is cubic in the *total* panel count: two sails of 240 panels each
+    /// factorise in roughly eight times what one of them takes, not twice. That is
+    /// the price of the coupling and it is paid on a trim change, not per frame.
+    ///
+    /// Returns `None` for an empty list, a degenerate wake, or any surface with a
+    /// collapsed panel.
+    #[must_use]
+    pub fn coupled(lattices: Vec<Lattice>, wake: Vector3<f64>) -> Option<Self> {
         let norm = wake.norm();
-        if !norm.is_finite() || norm < 1e-12 {
+        if lattices.is_empty() || !norm.is_finite() || norm < 1e-12 {
             return None;
         }
         let wake = wake / norm;
-        let panels = lattice.panels();
-        let spanwise = lattice.spanwise;
+
+        let mut offsets = Vec::with_capacity(lattices.len() + 1);
+        let mut total = 0;
+        for lattice in &lattices {
+            offsets.push(total);
+            total += lattice.panels();
+        }
+        offsets.push(total);
+        let panels = total;
 
         let mut collocation = Vec::with_capacity(panels);
         let mut normals = Vec::with_capacity(panels);
         let mut bound = Vec::with_capacity(panels);
-        for i in 0..lattice.chordwise {
-            for j in 0..spanwise {
-                collocation.push(lattice.collocation(i, j));
-                normals.push(lattice.normal(i, j));
-                let a = lattice.ring_corner(i, j);
-                let b = lattice.ring_corner(i, j + 1);
-                bound.push(((a + b) * 0.5, b - a));
+        let mut upstream = Vec::with_capacity(panels);
+        for (surface, lattice) in lattices.iter().enumerate() {
+            let spanwise = lattice.spanwise;
+            for i in 0..lattice.chordwise {
+                for j in 0..spanwise {
+                    collocation.push(lattice.collocation(i, j));
+                    normals.push(lattice.normal(i, j));
+                    let a = lattice.ring_corner(i, j);
+                    let b = lattice.ring_corner(i, j + 1);
+                    bound.push(((a + b) * 0.5, b - a));
+                    upstream.push(if i == 0 {
+                        None
+                    } else {
+                        Some(offsets[surface] + (i - 1) * spanwise + j)
+                    });
+                }
             }
         }
         // A panel of zero area has no normal, and `normalize` hands back a vector
@@ -347,14 +400,16 @@ impl Solver {
 
         let mut influence = DMatrix::zeros(panels, panels);
         let mut bound_influence = vec![Vector3::zeros(); panels * panels];
-        for i in 0..lattice.chordwise {
-            for j in 0..spanwise {
-                let column = i * spanwise + j;
-                for row in 0..panels {
-                    let at_collocation = lattice.ring_velocity(i, j, collocation[row], wake);
-                    influence[(row, column)] = at_collocation.dot(&normals[row]);
-                    bound_influence[row * panels + column] =
-                        lattice.ring_velocity(i, j, bound[row].0, wake);
+        for (surface, lattice) in lattices.iter().enumerate() {
+            for i in 0..lattice.chordwise {
+                for j in 0..lattice.spanwise {
+                    let column = offsets[surface] + i * lattice.spanwise + j;
+                    for row in 0..panels {
+                        let at_collocation = lattice.ring_velocity(i, j, collocation[row], wake);
+                        influence[(row, column)] = at_collocation.dot(&normals[row]);
+                        bound_influence[row * panels + column] =
+                            lattice.ring_velocity(i, j, bound[row].0, wake);
+                    }
                 }
             }
         }
@@ -366,20 +421,35 @@ impl Solver {
         factored.solve(&DVector::zeros(panels))?;
 
         Some(Self {
-            lattice,
+            lattices,
+            offsets,
             wake,
             factored,
             collocation,
             normals,
             bound,
+            upstream,
             bound_influence,
         })
     }
 
-    /// The lattice this solver was built for.
+    /// The surfaces this solver was built for.
+    #[must_use]
+    pub fn lattices(&self) -> &[Lattice] {
+        &self.lattices
+    }
+
+    /// The first surface, which is the only one for a solver built by
+    /// [`Solver::new`].
     #[must_use]
     pub fn lattice(&self) -> &Lattice {
-        &self.lattice
+        &self.lattices[0]
+    }
+
+    /// Total panel count, which is the order of the linear system.
+    #[must_use]
+    pub fn panels(&self) -> usize {
+        self.offsets[self.offsets.len() - 1]
     }
 
     /// The wake direction baked into the factorisation.
@@ -398,7 +468,7 @@ impl Solver {
     /// [`Solver::new`] has already ruled out for a well-formed lattice.
     #[must_use]
     pub fn solve(&self, onset: impl Fn(Point) -> Vector3<f64>, density: f64) -> Option<Solution> {
-        let panels = self.lattice.panels();
+        let panels = self.panels();
         let mut rhs = DVector::zeros(panels);
         let onset_at_collocation: Vec<Vector3<f64>> =
             self.collocation.iter().map(|&at| onset(at)).collect();
@@ -412,7 +482,6 @@ impl Solver {
         // what is left after they cancel is the difference. The velocity is the
         // total one — onset plus everything the lattice induces — which is what
         // makes this yield induced drag and not only lift.
-        let spanwise = self.lattice.spanwise;
         let mut forces = Vec::with_capacity(panels);
         for index in 0..panels {
             let (midpoint, segment) = self.bound[index];
@@ -421,11 +490,8 @@ impl Solver {
             for (influence, &strength) in row.iter().zip(circulation.iter()) {
                 velocity += influence * strength;
             }
-            let net = if index < spanwise {
-                circulation[index]
-            } else {
-                circulation[index] - circulation[index - spanwise]
-            };
+            let net =
+                circulation[index] - self.upstream[index].map_or(0.0, |ahead| circulation[ahead]);
             forces.push(velocity.cross(&segment) * (density * net));
         }
 
@@ -438,6 +504,7 @@ impl Solver {
             // puts a systematic error in the moment that no lift or drag check
             // would notice.
             positions: self.bound.iter().map(|&(midpoint, _)| midpoint).collect(),
+            offsets: self.offsets.clone(),
         })
     }
 }
@@ -448,16 +515,17 @@ pub struct Solution {
     circulation: Vec<f64>,
     forces: Vec<Vector3<f64>>,
     positions: Vec<Point>,
+    offsets: Vec<usize>,
 }
 
 impl Solution {
-    /// Circulation of every ring, in lattice order.
+    /// Circulation of every ring, in solver order.
     #[must_use]
     pub fn circulation(&self) -> &[f64] {
         &self.circulation
     }
 
-    /// Force on every panel, in lattice order and in the geometry's frame.
+    /// Force on every panel, in solver order and in the geometry's frame.
     #[must_use]
     pub fn forces(&self) -> &[Vector3<f64>] {
         &self.forces
@@ -473,7 +541,45 @@ impl Solution {
         &self.positions
     }
 
-    /// Total force on the surface.
+    /// How many surfaces shared the system.
+    #[must_use]
+    pub fn surfaces(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    /// The panel index range belonging to one surface.
+    ///
+    /// The whole reason a coupled solve is worth having: the sails share a linear
+    /// system, so the *answer* has to come back attributable — a trimmer needs to
+    /// know which sail is making the force, and the two act at different places.
+    #[must_use]
+    pub fn range(&self, surface: usize) -> Option<std::ops::Range<usize>> {
+        if surface + 1 >= self.offsets.len() {
+            return None;
+        }
+        Some(self.offsets[surface]..self.offsets[surface + 1])
+    }
+
+    /// Total force on one surface.
+    #[must_use]
+    pub fn force_on(&self, surface: usize) -> Option<Vector3<f64>> {
+        Some(self.forces[self.range(surface)?].iter().sum())
+    }
+
+    /// Total moment of one surface about a point.
+    #[must_use]
+    pub fn moment_on(&self, surface: usize, about: Point) -> Option<Vector3<f64>> {
+        let range = self.range(surface)?;
+        Some(
+            self.forces[range.clone()]
+                .iter()
+                .zip(self.positions[range].iter())
+                .map(|(force, &at)| (at - about).cross(force))
+                .sum(),
+        )
+    }
+
+    /// Total force on every surface together.
     #[must_use]
     pub fn force(&self) -> Vector3<f64> {
         self.forces.iter().sum()
@@ -882,5 +988,201 @@ mod tests {
             (sheared - uniform).norm() / uniform.norm() > 1e-3,
             "shear changed nothing, which cannot be right"
         );
+    }
+
+    /// A flat rectangular plate of unit chord, leading edge at `(at_x, at_y)`.
+    fn plate_at(at_x: f64, at_y: f64, span: f64) -> Lattice {
+        Lattice::from_shape(6, 24, |xi, eta| {
+            Point::new(at_x + xi, at_y + (eta - 0.5) * span, 0.0)
+        })
+        .expect("a positive grid")
+    }
+
+    /// Total and per-surface lift of a coupled solve at incidence.
+    fn coupled_lift(solver: &Solver, degrees: f64) -> (f64, Vec<f64>) {
+        let alpha = degrees.to_radians();
+        let flow = Vector3::new(SPEED * alpha.cos(), 0.0, SPEED * alpha.sin());
+        let across = Vector3::new(-alpha.sin(), 0.0, alpha.cos());
+        let solution = solver
+            .solve(|_| flow, AIR)
+            .expect("a coupled system solves");
+        let per = (0..solution.surfaces())
+            .map(|s| {
+                solution
+                    .force_on(s)
+                    .expect("a surface in range")
+                    .dot(&across)
+            })
+            .collect();
+        (solution.force().dot(&across), per)
+    }
+
+    /// One surface through the coupled path is the single-surface path, bit for bit.
+    ///
+    /// [`Solver::new`] delegates, so this is the guarantee that generalising to
+    /// several surfaces did not perturb the one case every other test in this module
+    /// and every validation in `flying` depends on.
+    #[test]
+    fn one_surface_coupled_is_the_single_surface_path() {
+        let plate = plate_at(0.0, 0.0, 8.0);
+        let alone = Solver::new(plate.clone(), Vector3::x()).expect("well formed");
+        let coupled = Solver::coupled(vec![plate], Vector3::x()).expect("well formed");
+        assert_eq!(alone.panels(), coupled.panels());
+        assert_eq!(coupled.lattices().len(), 1);
+        assert_eq!(
+            coupled_lift(&alone, 5.0).0.to_bits(),
+            coupled_lift(&coupled, 5.0).0.to_bits()
+        );
+    }
+
+    /// Side by side, two surfaces stop interacting as the gap grows.
+    ///
+    /// The convergence check, and it has to be this arrangement rather than the
+    /// tandem one: separating two surfaces *across* the flow genuinely removes the
+    /// interaction, and the answer must approach the sum of two independent solves.
+    ///
+    /// Close together they make *more* lift than the sum, not less, which is the
+    /// right direction — two plates abreast behave as one longer span, and a longer
+    /// span at the same area is a higher aspect ratio.
+    #[test]
+    fn side_by_side_surfaces_stop_interacting_as_they_separate() {
+        let span = 8.0;
+        let mut previous = f64::INFINITY;
+        for gap in [1.0_f64, 2.0, 8.0, 40.0] {
+            let (a, b) = (
+                plate_at(0.0, -0.5 * (span + gap), span),
+                plate_at(0.0, 0.5 * (span + gap), span),
+            );
+            let coupled =
+                Solver::coupled(vec![a.clone(), b.clone()], Vector3::x()).expect("well formed");
+            let total = coupled_lift(&coupled, 5.0).0;
+            let independent = coupled_lift(&Solver::new(a, Vector3::x()).expect("ok"), 5.0).0
+                + coupled_lift(&Solver::new(b, Vector3::x()).expect("ok"), 5.0).0;
+
+            let excess = total / independent - 1.0;
+            assert!(excess > 0.0, "two plates abreast lost lift at gap {gap}");
+            assert!(
+                excess < previous,
+                "the interaction is not decaying: {excess:.4}"
+            );
+            previous = excess;
+        }
+        assert!(
+            previous < 0.002,
+            "forty spans apart the plates still interacted by {:.2} %",
+            100.0 * previous
+        );
+    }
+
+    /// In tandem, the downstream surface loses and the upstream one gains — and the
+    /// two effects have different reaches.
+    ///
+    /// This is the arrangement a sail plan is in, and the asymmetry is the signature
+    /// worth pinning. The upstream surface gains from the downstream one's *bound*
+    /// vorticity, whose influence falls off with distance — 14 % at one and a half
+    /// chords, 0.03 % at forty. The downstream surface sits in the upstream one's
+    /// *wake*, which is semi-infinite and flat, so its downwash does not decay at
+    /// all: the rear plate is still down to 63 % of its lift forty chords back.
+    ///
+    /// That is not a defect. A wing forty chords behind another is genuinely in its
+    /// downwash, which is why aircraft avoid each other's wake, and it is why a
+    /// mainsail behind a headsail is back-winded rather than merely disturbed. It
+    /// *is* the inviscid limit — a real wake diffuses and rolls up — and that is the
+    /// module's own stated boundary.
+    #[test]
+    fn a_tandem_pair_gains_in_front_and_loses_behind() {
+        let span = 8.0;
+        let mut previous_gain = f64::INFINITY;
+        let mut totals = Vec::new();
+        for gap in [1.5_f64, 3.0, 10.0, 40.0] {
+            let (front, rear) = (plate_at(0.0, 0.0, span), plate_at(gap, 0.0, span));
+            let coupled = Solver::coupled(vec![front.clone(), rear.clone()], Vector3::x())
+                .expect("well formed");
+            let (total, per) = coupled_lift(&coupled, 5.0);
+            let alone_front = coupled_lift(&Solver::new(front, Vector3::x()).expect("ok"), 5.0).0;
+            let alone_rear = coupled_lift(&Solver::new(rear, Vector3::x()).expect("ok"), 5.0).0;
+
+            let gain = per[0] / alone_front - 1.0;
+            let loss = 1.0 - per[1] / alone_rear;
+            assert!(gain > 0.0, "the front plate lost lift at gap {gap}");
+            assert!(
+                loss > 0.3,
+                "the rear plate barely noticed the wake at gap {gap}"
+            );
+            assert!(
+                gain < previous_gain,
+                "the upwash is not decaying: {gain:.4}"
+            );
+            previous_gain = gain;
+            totals.push(total / (alone_front + alone_rear));
+        }
+        // The upwash has all but gone by forty chords...
+        assert!(previous_gain < 0.001);
+        // ...and the downwash has not: the pair is still a fifth down on the sum.
+        assert!(
+            (0.78..0.85).contains(totals.last().expect("a sample")),
+            "the tandem pair converged to the independent sum, which a flat wake \
+             cannot do: {totals:?}"
+        );
+    }
+
+    /// Every panel belongs to exactly one surface, and the parts add to the whole.
+    ///
+    /// The bookkeeping that makes a coupled answer usable: the sails share a system
+    /// and the forces have to come back attributable, because a trimmer needs to
+    /// know which sail is making the force and the two act at different places.
+    #[test]
+    fn the_surfaces_partition_the_panels_and_sum_to_the_whole() {
+        let solver = Solver::coupled(
+            vec![
+                plate_at(0.0, 0.0, 8.0),
+                Lattice::from_shape(3, 10, |xi, eta| {
+                    Point::new(2.0 + 0.5 * xi, (eta - 0.5) * 4.0, 0.3)
+                })
+                .expect("a positive grid"),
+            ],
+            Vector3::x(),
+        )
+        .expect("well formed");
+        // Different resolutions on purpose: the telescoping of ring circulations is
+        // per surface, and a shared stride would silently mix them.
+        assert_eq!(solver.panels(), 6 * 24 + 3 * 10);
+
+        let alpha = 6.0_f64.to_radians();
+        let flow = Vector3::new(SPEED * alpha.cos(), 0.0, SPEED * alpha.sin());
+        let solution = solver.solve(|_| flow, AIR).expect("solves");
+
+        assert_eq!(solution.surfaces(), 2);
+        assert_eq!(solution.range(0), Some(0..144));
+        assert_eq!(solution.range(1), Some(144..174));
+        assert!(solution.range(2).is_none());
+        assert!(solution.force_on(2).is_none());
+
+        let parts: Vector3<f64> = (0..2)
+            .map(|s| solution.force_on(s).expect("in range"))
+            .sum();
+        for k in 0..3 {
+            assert_relative_eq!(parts[k], solution.force()[k], max_relative = 1e-12);
+        }
+        let about = Point::new(0.4, -1.2, 0.7);
+        let moments: Vector3<f64> = (0..2)
+            .map(|s| solution.moment_on(s, about).expect("in range"))
+            .sum();
+        for k in 0..3 {
+            assert_relative_eq!(
+                moments[k],
+                solution.moment_about(about)[k],
+                max_relative = 1e-12
+            );
+        }
+    }
+
+    /// A coupled solver with nothing in it is refused.
+    #[test]
+    fn an_empty_coupled_solver_is_refused() {
+        assert!(Solver::coupled(vec![], Vector3::x()).is_none());
+        // And one degenerate surface refuses the whole system rather than part of it.
+        let collapsed = Lattice::from_shape(2, 2, |_, _| Point::zeros()).expect("grid");
+        assert!(Solver::coupled(vec![plate_at(0.0, 0.0, 4.0), collapsed], Vector3::x()).is_none());
     }
 }
