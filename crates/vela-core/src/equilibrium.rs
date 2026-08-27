@@ -454,7 +454,7 @@ fn limited(step: Vector4<f64>) -> Vector4<f64> {
 /// to. Reaching it is reported rather than clamped silently: a boat that needs
 /// more than thirty degrees of rudder to hold its course is telling you
 /// something about its balance, not about its helm.
-const MAX_HELM: f64 = 0.52;
+pub const MAX_HELM: f64 = 0.52;
 
 /// Rudder angle the secant is opened with, radians.
 ///

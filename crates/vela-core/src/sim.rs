@@ -252,7 +252,21 @@ impl StepCtx<'_> {
 }
 
 /// One superposed contribution to the total force on the boat.
-pub trait ForceModule {
+///
+/// # Why `Send + Sync`
+///
+/// A [`Sim`] holds its modules and its environment as trait objects, so those
+/// bounds are what make the simulation itself movable between threads — and a
+/// simulation that is not is a simulation a frontend cannot own. Bevy requires
+/// it of a resource, a host running several boats at once requires it, and a
+/// worker thread requires it.
+///
+/// It costs nothing real: a force module is a transcription of coefficients plus
+/// some cached state, and everything in this crate satisfies the bound without
+/// trying. It is stated rather than left to inference so that a module which
+/// reached for a `Rc` or a raw pointer fails at its definition instead of at
+/// some distant call site.
+pub trait ForceModule: Send + Sync {
     /// Stable identifier, used in telemetry keys and error messages.
     fn name(&self) -> &'static str;
 

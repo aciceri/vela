@@ -958,3 +958,31 @@ fn motion_of(
         worst_heel,
     }
 }
+
+/// An assembled simulation must be movable between threads.
+///
+/// It holds its force modules and its environment as trait objects, so this is a
+/// property of those bounds and not of the concrete types — which is exactly why
+/// it is worth pinning. A frontend owns a `Sim` inside a Bevy resource, a host
+/// running a fleet owns one per boat, and a worker thread owns one to keep a
+/// polar off the main thread. All three need this, and all three would fail to
+/// compile in a different crate with an error pointing at the wrong place.
+///
+/// Written as a compile-time check rather than a runtime one: if this file
+/// compiles, the property holds.
+#[test]
+fn a_simulation_can_be_sent_between_threads() {
+    fn portable<T: Send + Sync>() {}
+    portable::<Sim>();
+
+    // And the assembled article, not just the type: a `Box<dyn Environment>`
+    // built from a seaway is the case that actually has to satisfy it.
+    let sim = sailing(MODERATE_WIND, 40.0, 1.0, 1.0);
+    let moved = std::thread::spawn(move || sim.captive())
+        .join()
+        .expect("the thread");
+    assert!(
+        !moved.surge,
+        "the velocity prediction rig leaves surge free"
+    );
+}
