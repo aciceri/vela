@@ -106,6 +106,33 @@ every transient (tacks, gusts, waves). It enters through the strip-theory
 coefficients (§5.3) as the constant infinite-frequency added mass matrix, with the
 frequency-dependent remainder handled by the radiation memory term.
 
+### 3a. Built: the added mass is transported, and one term is left out on purpose
+
+The inertial terms `C(ν) ν` are Fossen's for the **whole** mass matrix, added
+mass included: `p = M₁₁ v + M₁₂ ω`, `h = M₂₁ v + M₂₂ ω`, and the body feels
+`ω × p` in translation and `v × M₁₂ ω + ω × h` in rotation. Until the review
+that found it they were built from the rigid mass alone, and a body with a
+heavy heave added mass tumbling in free flight lost 146 % of its world momentum
+in ten seconds. The energy tests could not see it, because any skew `C`
+conserves `½ νᵀ M ν`; the test that can is on momentum, and it holds to the
+integrator's own first-order residual (1.1e-3 at 480 Hz).
+
+The one term deliberately absent is `v × M₁₁ v`: the **Munk moment** of a body
+translating steadily through a fluid with anisotropic added mass. It is zero for
+the rigid part and not for the added part, and it is left out for two reasons
+that are one reason. The added mass here is strip theory's — the canoe body
+alone, at infinite frequency, with no surge entry — which is the right matrix
+for radiation and the wrong one for steady flow, where the free-surface condition
+is the other limit and the keel carries most of the sway added mass. And the
+hull and foil forces come from tank regressions fitted to heeled hulls at leeway,
+whose measured totals already contain whatever Munk moment the real flow has.
+Measured at the solved upwind condition it would have been 2 kN·m in roll,
+11 kN·m in pitch and 1 kN·m in yaw: three quarters of a degree of heel and 1.3 %
+of speed away from the velocity prediction the polar was validated against. So
+everything that depends on a rate is in, the steady translational moment is the
+empirical models', and the cost — energy conserved only to `ω · (v × A₁₁ v)`,
+which vanishes at steady sailing — is stated on the function.
+
 ---
 
 ## 4. Aerodynamics
@@ -608,7 +635,13 @@ are checked against the DSYHS envelope; out-of-range hulls are refused by this
 model (they route to the generic pipeline once it exists). Regression
 polynomials extrapolate silently and catastrophically — refusing is a feature.
 
-### 5.2 Generic resistance pipeline (phase 3)
+### 5.2 Generic resistance pipeline (phase 3) — **plan, not code**
+
+Nothing in this section is built. The runtime resistance is §5.1's DSYHS, gated
+at assembly on the series' envelope (a hull outside it loads and does not sail),
+and the pipeline below is the design that would replace it. It is kept as
+written because it is still the plan; the status is stated here so that no
+reader takes the table for a description.
 
 Resistance decomposition, one method per physical component:
 
@@ -1410,11 +1443,15 @@ that a long run and the solver check each other is kept, and it is a test.
 
 #### What a seaway exposes next
 
-A boat with a fixed rudder has **no course stability**: the helm is solved to
-balance yaw at one state, and the moment it trims or a wave hits it the balance
-moves, with nothing steering. In a calm that costs nearly 40 % of the boat speed
-over a minute. `vela-cli seaway` therefore holds the heading the way a towing tank
-holds a model, and `--free-helm` releases it.
+A boat with a fixed rudder had **next to no course stability**, and half of
+that was a bug: the rudder was fed the keel's local inflow, so under a yaw rate
+it saw a tenth of the angle it was at and the one foil meant to damp yaw did
+not (§5.4a; the yaw rate halved when it was given its own sample). What is left
+is the helm being solved to balance yaw at one state: the moment the boat trims
+or a wave hits it the balance moves, with nothing steering. In a calm that still
+costs a third of the boat speed over a minute, most of it the free trim (§5.5a).
+`vela-cli seaway` therefore holds the heading the way a towing tank holds a
+model, and `--free-helm` releases it.
 
 The dominant error in waves is **§5.4's missing foil stall**, and it is worse than
 a missing clamp. The appendage lift is linear in angle of attack, and the angle at
@@ -1444,6 +1481,16 @@ says so when the run has left the envelope. Until a stall model lands, seaway
 - Future hooks, out of v1 scope: TMA shallow-water correction; local
   wave-particle patches for boat wake interaction
   [[Hybrid ocean 2025]](#bib-hybrid).
+
+**Built, against the above:** a Pierson-Moskowitz (ITTC/ISSC) spectrum with
+Mitsuyasu's directional spreading by single summation — sixty components,
+each with its own bearing — evaluated as a direct sum on the CPU and re-evaluated
+by the same formula in the vertex shader (§5.3h, `the_synthesis_convention_is_
+pinned`). No JONSWAP, no Horvath, no FFT: a direct sum of sixty terms is a
+microsecond per query and shares its realisation with the renderer by
+construction, which the FFT height field would not, so the FFT is deferred
+until a component count makes it cheaper rather than adopted because the plan
+said so. "One surface, two consumers" is the part that held.
 
 ---
 
@@ -1545,9 +1592,13 @@ resonance. That is the next real piece of physics, not a number to tune.
 
 ## 8. Numerical libraries (constraints, not bindings)
 
-- `nalgebra` for linear algebra types; `faer` for the dense LU of the AIC
-  (pure Rust, no system BLAS — wasm-safe).
-- `rustfft` for spectral synthesis (wasm-clean).
+- `nalgebra` for linear algebra types and for the dense LU of the AIC and the
+  equilibrium Jacobian. `faer` was named here for the LU and has not been
+  needed: three hundred panels factorise in 15 ms on `nalgebra` (§4.1a), and
+  the frame budget is elsewhere.
+- `rustfft` was named here for spectral synthesis and is not used: the sea is a
+  direct sum (§6). Both stay on the allowed list of `engine-design.md` §1 for
+  the day either earns its place.
 - No `ndarray` unless a concrete need appears; no adaptive ODE crate (§3).
 - Determinism: fixed `dt` + no platform intrinsics in the physics path keeps
   native and wasm trajectories comparable for regression testing (within FP
@@ -1664,7 +1715,7 @@ What the phase also produced, recorded because they are properties of the
 |---|---|---|
 | 1 | Boat sails on flat water, playable | DSYHS hull + EKM appendages + tabular sail coefficients (Hazen/ORC-style), 6-DOF, wind shear |
 | 2 | Physical sail trim | VLM (§4.1a) + flying shape (§4.3a) + blending (§4.2a) + control mapping (§4.5), assembled and wired behind `ForceModule` (§4.6) — **the chain sails a boat**, and is opt-in until two named gaps close: the hull endplate image, and holding the wake fixed across an equilibrium solve |
-| 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle |
+| 3 | Any hull geometry | Michell + ITTC + Savitsky pipeline; DSYHS demoted to test oracle — **not started**; the DSYHS is the runtime and is gated on its envelope at assembly (§5.1, §5.2) |
 | 4 | Seaway | FFT waves, mesh-clip FK, strip theory + Cummins radiation — **a boat sails in waves** (`sailing_sim`, §5.5a), and the long run now agrees with the solver; surge radiation and viscous roll damping absent (§5.3j), diffraction absent, and §5.4's missing foil stall is the dominant error in a seaway |
 
 Rationale: phase 1 produces a testable sailing boat in weeks; every later phase

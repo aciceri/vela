@@ -159,9 +159,13 @@
         rudder_at: 0.85,
         mast_at: 6.301,
     ),
+    // Mass from the book's particulars. Roll gyradius rx = 0.40 BMAX, the
+    // middle of the 0.35-0.45 published for a rigged sailing yacht; it was 1.25
+    // (0.30 BMAX) here as in the form study, and moved for the same reason --
+    // see boats/yd41-form-study.ron. ry and rz are 0.24-0.25 Lwl.
     mass: (
         displacement_kg: 5900.0,
         cog: (x: 5.27, y: 0.0, z: 0.12),
-        gyradii: (rx: 1.25, ry: 2.90, rz: 2.95),
+        gyradii: (rx: 1.65, ry: 2.90, rz: 2.95),
     ),
 )

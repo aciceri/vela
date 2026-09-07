@@ -18,7 +18,10 @@ vela-core  <--  vela-cli      (headless: polars, batch runs, validation vs oracl
 
 ### `vela-core` — the engine
 
-- Pure Rust. Allowed deps: `nalgebra`, `faer`, `rustfft`, `serde`, `ron`/`serde_json`.
+- Pure Rust. Allowed deps: `nalgebra`, `serde`, `ron`/`serde_json`, and if
+  they earn their place `faer` and `rustfft` — neither has yet: the vortex
+  lattice and the equilibrium solve run on `nalgebra`'s LU, and the sea is a
+  direct sum over sixty components (functional analysis §5.3h), not an FFT.
   **Forbidden deps: Bevy, wgpu, winit, anything windowing/rendering/audio.**
   Enforced structurally (separate crate), not by convention.
 - No wall clock, no filesystem access in the simulation path: boats load from
@@ -194,7 +197,9 @@ overrides: (                                 // every field optional; empty in m
 
 The `overrides` block is the forward-compatibility slot from the functional
 analysis (§9): any pipeline stage can be replaced by externally computed data
-(offline CFD, tank tests, future ML surrogates) without schema changes.
+(offline CFD, tank tests, future ML surrogates) without schema changes. **Not
+built**: the schema does not carry it yet, and adding it is the schema change
+it was reserved to avoid making later — it goes in with the first consumer.
 
 ### 2.7 Load-time validation (loader responsibilities)
 
@@ -222,7 +227,7 @@ coupled phenomena live inside one module. This is the key decision — the naive
 | `HullResistance` | friction + wave-making + planing blend (DSYHS in phase 1) | one scalar pipeline over shared hull state (Fn, heel, wetted area) |
 | `LateralSystem` | keel + rudder + hull side-force share, incl. keel→rudder downwash, induced drag, yaw moment | downwash couples keel circulation to rudder inflow; CLR emerges only from the joint solution |
 | `BuoyancyFK` | mesh clip vs wave surface, hydrostatic + Froude-Krylov pressure integration | one traversal of the submerged triangle set |
-| `Radiation` | fluid-memory state-space + roll damping correction | owns internal ODE states |
+| `Radiation` | fluid-memory state-space, both the vertical pair and the lateral triple | owns internal ODE states. **No viscous roll damping**: the module is potential-flow radiation only, and the correction the roll mode needs is recorded as absent in the functional analysis (§5.3j) |
 
 Gravity is not a module; it belongs to the integrator (constant, exact).
 
@@ -384,34 +389,39 @@ than what the convention is called.
 ### Captive degrees of freedom
 
 `Captive` restrains chosen modes, exactly as a towing-tank dynamometer
-restrains a model, and the assembled simulation runs with **trim and yaw held**.
+restrains a model. The velocity-prediction assembly runs with **trim and yaw
+held**; the sailing assembly with a `layout` block runs all six free.
 
-This is a data gap made structural, not a shortcut. The boat format carries no
-longitudinal position for keel, rudder or mast — published particulars do not
-include them — so every lateral and aerodynamic force acts at `x = 0` and
-produces no yaw moment. Integrating those modes would integrate an
-identically-zero moment where the real one is not zero, and the boat would
-settle to a heading and a trim that look like results and are artefacts. What
-remains free — surge, sway, heave, roll — is exactly the balance a classical
-velocity prediction solves, and needs no longitudinal information at all.
+The yaw restraint was a data gap made structural, and the gap has since closed:
+`LayoutSpec` carries the longitudinal positions of keel, rudder and mast,
+`vela-cli balance` derives them from the lead the source recommends, and
+`solve_with_helm` balances the yaw moment with the rudder. A boat file without
+a `layout` still gets yaw held, because every lateral and aerodynamic force
+would act at `x = 0` and integrate an identically-zero moment into a heading
+that looks like a result and is an artefact.
+
+Trim is still held in the velocity prediction, for a reason that is a force
+model's and not the format's: no resistance component has a published line of
+action, so nothing balances the steady trim moment of a hull under way. The
+free-trim sailing assembly settles to a trim of its own that is a few tenths
+of a degree and a third of the speed away from the velocity prediction, and
+the functional analysis (§5.4a, §5.5a) records the gap as the next force-model
+item rather than a restraint to keep.
 
 The restraint absorbs force without hiding it: the residual moment stays
 visible in `last_wrench` and in the telemetry, which is what a captive
-measurement is for. Lifting the restriction is a schema change plus sourced
-positions, not a change to any force model.
+measurement is for.
 
 ### Steady sailing is solved, not waited for
 
 `equilibrium::solve` drives the four free degrees of freedom to zero with a
-Newton iteration over `Sim::applied_wrench`. It exists because **there is no
-hydrodynamic damping in heave or roll yet**: buoyancy restores, nothing
-dissipates, and an undamped oscillator never settles. A time-domain run
-therefore cannot converge until radiation damping lands, and adding a damping
-coefficient nobody measured would put a fabricated number underneath every
-predicted speed.
-
-When damping arrives, a long run must settle to what this solver returns, which
-makes each a check on the other.
+Newton iteration over `Sim::applied_wrench`. It was written when **there was
+no hydrodynamic damping in heave or roll**, so that a time-domain run could not
+settle; radiation damping has since landed, a long run does settle, and the
+two agree to a tenth of a per cent — `the_time_domain_reaches_the_solved_
+condition` is the sharpest single check in the crate and exists because both
+routes exist. The solver stays because it is cheap, exact and the way a polar
+is produced.
 
 Three properties of the force models had to be respected to make it converge,
 and each was found by measurement rather than by reading the code:
@@ -470,10 +480,13 @@ sees, not in the coefficients.
    golden-tested.
 10. Convention-sensitive kinematics (heel, trim, leeway, apparent wind) are
     derived once on `StepCtx`; modules are forbidden their own definitions.
-11. `Captive` restrains trim and yaw, because the boat format has no
-    longitudinal positions. The restraint absorbs force without hiding it.
-12. Steady sailing is solved by Newton over the free modes, not reached by
-    integration, until radiation damping exists.
+11. `Captive` restrains yaw only for a boat file without a `layout`, and trim
+    in the velocity prediction because no resistance component has a line of
+    action — **superseded in part**: the format now carries longitudinal
+    positions and the sailing assembly runs all six free; see §4a.
+12. Steady sailing is solved by Newton over the free modes — **the "until
+    radiation damping exists" has been met**: the time-domain run settles to
+    the solved condition and the two check each other; see §4a.
 13. Heel enters the sail forces through the apparent wind in the heeled plane
     (Fig 8.22), not through the coefficients.
 
