@@ -1065,7 +1065,7 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
     // because that resolves the memory out to a few tens of seconds, which is
     // longer than any of it lasts.
     let grid: Vec<f64> = (1..=150).map(|i| 30.0 * f64::from(i) / 150.0).collect();
-    if let Some((spectrum, _, _)) = strip::vertical_spectra(
+    if let Some(((spectrum, _, _), _)) = strip::vertical_spectra(
         &strips,
         &grid,
         SEA_WATER_DENSITY,

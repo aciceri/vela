@@ -132,6 +132,59 @@ fn a_boat_carries_memory_in_sway_roll_and_yaw() {
     );
 }
 
+/// What the load-time chain found out reaches the telemetry, per set.
+///
+/// The clamp count, the energy and reciprocity residuals and the passivity of
+/// the fit were all computed at every load and read by nothing but a CLI
+/// report; an assembly that had clamped the bow said nothing. Now they are
+/// published beside the fit they fed, so a test — or a HUD — can ask whether
+/// the water the boat is moving in was built on coefficients the theory owned.
+/// The values asserted are what this hull gives, and the first thing the
+/// diagnostic found is worth stating: no station is clamped and the vertical
+/// identities hold to 1e-3 over the fitted band, but the lateral band reaches
+/// about 20 rad/s — the yaw damping peaks late — and up there the multipole
+/// series is truncated enough that the energy identity is off by 2.4 %. That
+/// is the accuracy of the coefficients the lateral fit was actually fed, which
+/// nobody could see before; the bound is set at twice it so that a hull or a
+/// grid that made it worse is caught, not so that it passes.
+#[test]
+fn the_radiation_fit_publishes_what_fed_it() {
+    let (sim, _, _) = settled(quick());
+    let telemetry = sim.telemetry();
+    for set in ["vertical", "lateral"] {
+        let read = |name: &str| {
+            telemetry
+                .get(&format!("radiation.{set}.{name}"))
+                .unwrap_or_else(|| panic!("the {set} set published no {name}"))
+        };
+        assert_eq!(
+            read("clamped_stations"),
+            0.0,
+            "{set}: a station was clamped"
+        );
+        let energy = read("worst_energy_residual");
+        let bound = if set == "vertical" { 0.01 } else { 0.05 };
+        assert!(
+            energy < bound,
+            "{set} energy identity off by {energy:.3e} within the fitted band"
+        );
+        // Not zero: the lateral set's worst diagonal dips 1e-5 negative
+        // somewhere on the grid, which is the rational fit's ripple and not a
+        // model that drives the boat. A real violation is orders larger.
+        let passivity = read("passivity_violation");
+        assert!(
+            passivity < 1e-4,
+            "{set}: a diagonal memory would drive the boat by {passivity:.3e}"
+        );
+        let fit = read("worst_fit_error");
+        assert!(fit < 0.02, "{set} fit off by {fit:.3e}");
+    }
+    assert!(
+        telemetry.get("radiation.vertical.slenderness").is_some(),
+        "the vertical sweep publishes its slenderness"
+    );
+}
+
 /// A hull released from heel comes back and stops.
 ///
 /// The property the whole lateral chain exists for. Hydrostatic stiffness alone

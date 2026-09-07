@@ -201,11 +201,12 @@ pub fn vertical_spectra(
     density: f64,
     gravity: f64,
     solver: &SectionSolver,
-) -> Option<(Spectrum, Spectrum, Spectrum)> {
+) -> Option<((Spectrum, Spectrum, Spectrum), SweepQuality)> {
     let count = frequencies.len();
     let mut heave = (Vec::with_capacity(count), Vec::with_capacity(count));
     let mut coupling = (Vec::with_capacity(count), Vec::with_capacity(count));
     let mut pitch = (Vec::with_capacity(count), Vec::with_capacity(count));
+    let mut quality = SweepQuality::default();
     for &frequency in frequencies {
         let solved = heave_pitch_coefficients(strips, frequency, density, gravity, solver)?;
         heave.0.push(solved.added_mass_heave);
@@ -214,13 +215,74 @@ pub fn vertical_spectra(
         coupling.1.push(solved.damping_coupling);
         pitch.0.push(solved.added_mass_pitch);
         pitch.1.push(solved.damping_pitch);
+        quality.slenderness = solved.slenderness;
+        quality.frequencies.push(frequency);
+        quality.energy_residuals.push(solved.worst_energy_residual);
+        quality.reciprocity_residuals.push(0.0);
     }
     let grid = frequencies.to_vec();
     Some((
-        Spectrum::new(grid.clone(), heave.0, heave.1).ok()?,
-        Spectrum::new(grid.clone(), coupling.0, coupling.1).ok()?,
-        Spectrum::new(grid, pitch.0, pitch.1).ok()?,
+        (
+            Spectrum::new(grid.clone(), heave.0, heave.1).ok()?,
+            Spectrum::new(grid.clone(), coupling.0, coupling.1).ok()?,
+            Spectrum::new(grid, pitch.0, pitch.1).ok()?,
+        ),
+        quality,
     ))
+}
+
+/// What a frequency sweep found out about itself, frequency by frequency.
+///
+/// These numbers are computed at every frequency of every load and used to be
+/// read by nobody but `vela-cli radiation`: an assembly that swallowed a
+/// clamped bow or a broken energy identity said nothing. They travel with the
+/// spectra now so the radiation module can publish them, and a reader of the
+/// telemetry can tell a fit that was fed good coefficients from one that was
+/// not.
+///
+/// Kept per frequency rather than as one worst case, because the worst case
+/// over a grid that reaches 30 rad/s is a number about the grid's tail and not
+/// about the boat: the identity is a *relative* residual against a damping
+/// that has died to a fiftieth of its peak up there, and the multipole series
+/// is truncated — 27 % at 30 rad/s on the YD-41 against 1e-5 at 4 rad/s. What
+/// matters is the band the memory fit consumed, and
+/// [`SweepQuality::worst_energy_residual_below`] answers for that band.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SweepQuality {
+    /// [`HeavePitch::slenderness`], which does not depend on frequency. Zero
+    /// for a lateral sweep, which does not compute it.
+    pub slenderness: f64,
+    /// The grid, rad/s.
+    pub frequencies: Vec<f64>,
+    /// [`HeavePitch::worst_energy_residual`] or
+    /// [`LateralModes::worst_energy_residual`] at each grid frequency.
+    pub energy_residuals: Vec<f64>,
+    /// [`LateralModes::worst_reciprocity_residual`] at each grid frequency.
+    /// Zero for a vertical sweep, which has no cross-mode identity to check.
+    pub reciprocity_residuals: Vec<f64>,
+}
+
+impl SweepQuality {
+    /// Worst energy residual at or below `ceiling` rad/s.
+    #[must_use]
+    pub fn worst_energy_residual_below(&self, ceiling: f64) -> f64 {
+        Self::worst_below(&self.frequencies, &self.energy_residuals, ceiling)
+    }
+
+    /// Worst reciprocity residual at or below `ceiling` rad/s.
+    #[must_use]
+    pub fn worst_reciprocity_residual_below(&self, ceiling: f64) -> f64 {
+        Self::worst_below(&self.frequencies, &self.reciprocity_residuals, ceiling)
+    }
+
+    fn worst_below(frequencies: &[f64], residuals: &[f64], ceiling: f64) -> f64 {
+        frequencies
+            .iter()
+            .zip(residuals)
+            .filter(|(frequency, _)| **frequency <= ceiling)
+            .map(|(_, residual)| residual.abs())
+            .fold(0.0, f64::max)
+    }
 }
 
 /// Hull sway, roll and yaw coefficients at one frequency, about the body origin.
@@ -471,10 +533,11 @@ pub fn lateral_spectra(
     density: f64,
     gravity: f64,
     solver: &SectionSolver,
-) -> Option<[Spectrum; 6]> {
+) -> Option<([Spectrum; 6], SweepQuality)> {
     let count = frequencies.len();
     let mut added_mass: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::with_capacity(count));
     let mut damping: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::with_capacity(count));
+    let mut quality = SweepQuality::default();
     for &frequency in frequencies {
         let solved = lateral_coefficients(
             strips,
@@ -506,6 +569,11 @@ pub fn lateral_spectra(
         for (index, column) in damping.iter_mut().enumerate() {
             column.push(b[index]);
         }
+        quality.frequencies.push(frequency);
+        quality.energy_residuals.push(solved.worst_energy_residual);
+        quality
+            .reciprocity_residuals
+            .push(solved.worst_reciprocity_residual);
     }
 
     let grid = frequencies.to_vec();
@@ -520,7 +588,10 @@ pub fn lateral_spectra(
             .ok()?,
         );
     }
-    Some(spectra.map(|slot| slot.expect("every slot was just filled")))
+    Some((
+        spectra.map(|slot| slot.expect("every slot was just filled")),
+        quality,
+    ))
 }
 
 #[cfg(test)]
@@ -1036,7 +1107,7 @@ mod tests {
     fn the_lateral_spectra_agree_with_the_pointwise_coefficients() {
         let hull = pontoon(11, -6.0, 6.0);
         let frequencies = [0.4, 0.8, 1.6, 3.2];
-        let spectra = lateral_spectra(
+        let (spectra, _) = lateral_spectra(
             &hull,
             PONTOON_DRAFT,
             &frequencies,

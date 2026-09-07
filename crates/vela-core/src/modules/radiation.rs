@@ -235,8 +235,63 @@ pub struct Radiation {
     /// though the transfer functions are. `K_ij` and `K_ji` are fitted once and
     /// cloned into both slots, which shares the model and separates the history.
     memory: Vec<FluidMemory>,
+    /// What the sweep that fed the fit said about itself. See
+    /// [`Radiation::with_provenance`].
+    provenance: Option<Provenance>,
     /// What the last step produced, for [`ForceModule::telemetry`].
     last: Option<Wrench>,
+}
+
+/// What the load-time chain found out on the way to a fit.
+///
+/// Computed at every load and, until this existed, read by nothing but
+/// `vela-cli radiation`: a sailing assembly that had clamped a Lewis form at the
+/// bow or broken the energy identity at some frequency said nothing about it,
+/// which is exactly the error `lewis` says nobody should have to rediscover.
+/// Published in the module's telemetry instead, so that whoever reads the
+/// simulation can see the fit's inputs beside its output.
+///
+/// The residuals are the worst **within the band the fit consumed** — up to
+/// [`MemoryOptions::fit_ceiling`] times the damping peak — and not over the
+/// whole grid, because the grid's tail is a statement about the multipole
+/// series' truncation at frequencies whose damping has died, not about the
+/// coefficients the boat moves on. See `strip::SweepQuality`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Provenance {
+    /// Stations whose Lewis form had to be clamped to the mappable region.
+    pub clamped_stations: usize,
+    /// `strip::HeavePitch::slenderness`; zero for the lateral set.
+    pub slenderness: f64,
+    /// The frequency the residuals are judged up to, rad/s.
+    pub fitted_ceiling: f64,
+    /// Worst departure from the energy identity within the fitted band.
+    pub worst_energy_residual: f64,
+    /// Worst departure from reciprocity within the fitted band; zero for the
+    /// vertical set, which has no cross-mode identity.
+    pub worst_reciprocity_residual: f64,
+}
+
+impl Provenance {
+    /// Reduces a sweep's per-frequency record to the band a fit consumed.
+    ///
+    /// `ceiling` is the highest frequency the fit read; the assembly computes
+    /// it the way [`FluidMemory::fit`] does, from the same options and the same
+    /// spectra, so the number published is about the coefficients that were
+    /// actually used.
+    #[must_use]
+    pub fn within(
+        clamped_stations: usize,
+        sweep: &crate::strip::SweepQuality,
+        ceiling: f64,
+    ) -> Self {
+        Self {
+            clamped_stations,
+            slenderness: sweep.slenderness,
+            fitted_ceiling: ceiling,
+            worst_energy_residual: sweep.worst_energy_residual_below(ceiling),
+            worst_reciprocity_residual: sweep.worst_reciprocity_residual_below(ceiling),
+        }
+    }
 }
 
 impl Radiation {
@@ -273,8 +328,16 @@ impl Radiation {
         Ok(Self {
             modes: spectra.modes.clone(),
             memory,
+            provenance: None,
             last: None,
         })
+    }
+
+    /// Attaches what the sweep found out about itself, for the telemetry.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 
     /// Worst relative fit error over every model in the set.
@@ -293,6 +356,19 @@ impl Radiation {
             .iter()
             .map(FluidMemory::slowest_pole)
             .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// Worst passivity violation over the **diagonal** models of the set.
+    ///
+    /// Diagonal only, for the reason [`FluidMemory::passivity_violation`]
+    /// gives: a coupling coefficient is allowed a negative real part, a mode
+    /// taken by itself is not. Zero for a set whose water only ever damps.
+    #[must_use]
+    pub fn passivity_violation(&self) -> f64 {
+        let count = self.modes.len();
+        (0..count)
+            .map(|index| self.memory[index * count + index].passivity_violation())
+            .fold(0.0, f64::max)
     }
 
     /// Forgets the history, as if the boat had always been still.
@@ -368,10 +444,72 @@ impl ForceModule for Radiation {
             // the convolution — the sign a dynamometer would read.
             out.set(key, value);
         }
+        // Kept as they were: two sets mount side by side and the last one to
+        // publish wins these two, which is why the per-set keys below exist.
         out.set("radiation.worst_fit_error", self.worst_error());
         out.set("radiation.slowest_pole", self.slowest_pole());
+
+        // The fit and what fed it, keyed by set so that the vertical pair and
+        // the lateral triple cannot overwrite each other. A reader who finds a
+        // clamped station or an energy residual in the per cents here knows
+        // the fit was built on coefficients the theory did not fully own.
+        let keys = if self.modes.contains(&HEAVE) {
+            &VERTICAL_KEYS
+        } else {
+            &LATERAL_KEYS
+        };
+        out.set(keys.worst_fit_error, self.worst_error());
+        out.set(keys.slowest_pole, self.slowest_pole());
+        out.set(keys.passivity_violation, self.passivity_violation());
+        if let Some(provenance) = self.provenance {
+            out.set(keys.clamped_stations, provenance.clamped_stations as f64);
+            out.set(keys.fitted_ceiling, provenance.fitted_ceiling);
+            out.set(keys.worst_energy_residual, provenance.worst_energy_residual);
+            out.set(
+                keys.worst_reciprocity_residual,
+                provenance.worst_reciprocity_residual,
+            );
+            if let Some(key) = keys.slenderness {
+                out.set(key, provenance.slenderness);
+            }
+        }
     }
 }
+
+/// The per-set telemetry keys. Stable names: rename them never.
+struct SetKeys {
+    worst_fit_error: &'static str,
+    slowest_pole: &'static str,
+    passivity_violation: &'static str,
+    clamped_stations: &'static str,
+    fitted_ceiling: &'static str,
+    worst_energy_residual: &'static str,
+    worst_reciprocity_residual: &'static str,
+    /// Only the vertical sweep computes it.
+    slenderness: Option<&'static str>,
+}
+
+const VERTICAL_KEYS: SetKeys = SetKeys {
+    worst_fit_error: "radiation.vertical.worst_fit_error",
+    slowest_pole: "radiation.vertical.slowest_pole",
+    passivity_violation: "radiation.vertical.passivity_violation",
+    clamped_stations: "radiation.vertical.clamped_stations",
+    fitted_ceiling: "radiation.vertical.fitted_ceiling",
+    worst_energy_residual: "radiation.vertical.worst_energy_residual",
+    worst_reciprocity_residual: "radiation.vertical.worst_reciprocity_residual",
+    slenderness: Some("radiation.vertical.slenderness"),
+};
+
+const LATERAL_KEYS: SetKeys = SetKeys {
+    worst_fit_error: "radiation.lateral.worst_fit_error",
+    slowest_pole: "radiation.lateral.slowest_pole",
+    passivity_violation: "radiation.lateral.passivity_violation",
+    clamped_stations: "radiation.lateral.clamped_stations",
+    fitted_ceiling: "radiation.lateral.fitted_ceiling",
+    worst_energy_residual: "radiation.lateral.worst_energy_residual",
+    worst_reciprocity_residual: "radiation.lateral.worst_reciprocity_residual",
+    slenderness: None,
+};
 
 #[cfg(test)]
 mod tests {
@@ -414,7 +552,7 @@ mod tests {
         let strips = hull();
         let solver = SectionSolver::new(TasaiOptions::default());
         let grid: Vec<f64> = (1..=120).map(|i| 30.0 * f64::from(i) / 120.0).collect();
-        let (heave, coupling, pitch) =
+        let ((heave, coupling, pitch), _) =
             strip::vertical_spectra(&strips, &grid, WATER, GRAVITY, &solver)
                 .expect("a hull over a grid has spectra");
         let spectra = RadiationSpectra::vertical(heave, coupling, pitch)
@@ -623,8 +761,9 @@ mod tests {
         // The waterline the sections were cut at, which is what the roll and
         // coupling coefficients are levered about.
         let waterline = 0.45;
-        let entries = strip::lateral_spectra(&strips, waterline, &grid, WATER, GRAVITY, &solver)
-            .expect("a hull over a grid has lateral spectra");
+        let (entries, _) =
+            strip::lateral_spectra(&strips, waterline, &grid, WATER, GRAVITY, &solver)
+                .expect("a hull over a grid has lateral spectra");
         let spectra =
             RadiationSpectra::lateral(entries).expect("six spectra make a lateral triple");
         let infinite = spectra.infinite(TransformOptions::default());

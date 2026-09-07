@@ -37,7 +37,7 @@ use crate::geometry::Point;
 use crate::lewis::{station_geometry, LewisForm};
 use crate::loft::{loft_hull, LoftOptions};
 use crate::mass::MassError;
-use crate::modules::radiation::{Radiation, RadiationSpectra};
+use crate::modules::radiation::{Provenance, Radiation, RadiationSpectra};
 use crate::modules::{Buoyancy, CanoeBody, LateralSystem, Sails};
 use crate::rigid_body::RigidBody;
 use crate::sail::{Member, Options as SailOptions};
@@ -500,12 +500,22 @@ fn seakeeping(
     })
 }
 
+/// How many stations the Lewis fit had to clamp: the number `lewis` says
+/// nobody should have to rediscover, counted here so the radiation modules
+/// can publish it.
+fn clamped_stations(strips: &[Strip]) -> usize {
+    strips
+        .iter()
+        .filter(|strip| strip.form.is_some_and(|form| form.clamped))
+        .count()
+}
+
 /// Fits the vertical pair, and returns it with the mass it adds.
 fn vertical_radiation(
     setup: &Seakeeping,
     options: RadiationOptions,
 ) -> Result<(Radiation, Matrix6<f64>), AssemblyError> {
-    let (heave, coupling, pitch) = vertical_spectra(
+    let ((heave, coupling, pitch), sweep) = vertical_spectra(
         &setup.strips,
         &setup.grid,
         options.density,
@@ -513,11 +523,20 @@ fn vertical_radiation(
         &setup.solver,
     )
     .ok_or(AssemblyError::Radiation(MemoryError::Singular))?;
+    // The fit reads each spectrum up to `fit_ceiling` times its own damping
+    // peak; the band the provenance is judged on is the widest of the
+    // diagonal ones, which is the one the fit actually consumed.
+    let ceiling = options.memory.fit_ceiling * heave.peak_frequency().max(pitch.peak_frequency());
     let spectra =
         RadiationSpectra::vertical(heave, coupling, pitch).map_err(AssemblyError::Radiation)?;
     let infinite = spectra.infinite(options.transform);
-    let fitted =
-        Radiation::fit(&spectra, &infinite, options.memory).map_err(AssemblyError::Radiation)?;
+    let fitted = Radiation::fit(&spectra, &infinite, options.memory)
+        .map_err(AssemblyError::Radiation)?
+        .with_provenance(Provenance::within(
+            clamped_stations(&setup.strips),
+            &sweep,
+            ceiling,
+        ));
     Ok((fitted, infinite.matrix()))
 }
 
@@ -526,7 +545,7 @@ fn lateral_radiation(
     setup: &Seakeeping,
     options: RadiationOptions,
 ) -> Result<(Radiation, Matrix6<f64>), AssemblyError> {
-    let spectra = lateral_spectra(
+    let (spectra, sweep) = lateral_spectra(
         &setup.strips,
         setup.waterline_height,
         &setup.grid,
@@ -535,10 +554,22 @@ fn lateral_radiation(
         &setup.solver,
     )
     .ok_or(AssemblyError::Radiation(MemoryError::Singular))?;
+    // Sway, roll and yaw are entries 0, 3 and 5 of the triangle — see
+    // `lateral_spectra` for the order.
+    let ceiling = options.memory.fit_ceiling
+        * [0, 3, 5]
+            .iter()
+            .map(|&index| spectra[index].peak_frequency())
+            .fold(0.0, f64::max);
     let spectra = RadiationSpectra::lateral(spectra).map_err(AssemblyError::Radiation)?;
     let infinite = spectra.infinite(options.transform);
-    let fitted =
-        Radiation::fit(&spectra, &infinite, options.memory).map_err(AssemblyError::Radiation)?;
+    let fitted = Radiation::fit(&spectra, &infinite, options.memory)
+        .map_err(AssemblyError::Radiation)?
+        .with_provenance(Provenance::within(
+            clamped_stations(&setup.strips),
+            &sweep,
+            ceiling,
+        ));
     Ok((fitted, infinite.matrix()))
 }
 
