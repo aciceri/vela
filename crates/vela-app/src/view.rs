@@ -35,10 +35,15 @@ use crate::sim::Engine;
 
 /// Radius of the near sea, m.
 ///
-/// Two hundred metres of finely drawn water around a twelve metre boat: far
-/// enough that the edge is not the first thing a viewer sees, near enough that
-/// the vertex count stays reasonable. The far ring picks up exactly here.
-const REACH: f32 = 200.0;
+/// Six hundred metres of finely drawn water around a twelve metre boat. It
+/// was two hundred, and the edge was the first thing a viewer saw: the
+/// displacement fades to nothing at the rim (see `resolved` in
+/// `shaders/ocean.wgsl`), and a disc of moving crests inside a plane of still
+/// ones reads as a circle drawn on the sea, whatever the shading does. Three
+/// times the radius costs a fifth more rings, because the spacing is
+/// geometric, and pushes the circle to where a half-metre crest is a pixel.
+/// The far ring picks up exactly here.
+const REACH: f32 = 600.0;
 
 /// Angular segments around the near disc and the far ring alike.
 ///
@@ -53,21 +58,21 @@ const SEGMENTS: u32 = 160;
 
 /// Rings of vertices across the near disc, from [`CORE`] out to [`REACH`].
 ///
-/// Together with [`SEGMENTS`] this is the near sea's vertex budget: a hundred
-/// and sixty rings of a hundred and sixty is 25,601 vertices with the centre,
-/// the same budget as the 161-by-161 square grid it replaced. That budget was
-/// measured rather than guessed — every vertex evaluates the whole
-/// sixty-component wave sum, and a 257-square was running eight million
-/// transcendentals a frame for detail in water that is faded flat anyway (see
-/// `resolved` in `shaders/ocean.wgsl`).
+/// Together with [`SEGMENTS`] this is the near sea's vertex budget: two
+/// hundred rings of a hundred and sixty is 32,001 vertices with the centre,
+/// a quarter over the 161-by-161 square grid it replaced for three times the
+/// radius. That budget is measured rather than guessed — every vertex
+/// evaluates the whole sixty-component wave sum, and a 257-square was running
+/// eight million transcendentals a frame for detail in water that is faded flat
+/// anyway.
 ///
 /// The spacing is geometric, each ring a fixed ratio further out than the last
-/// — 3.4 per cent here — so a cell grows in proportion to its radius: a metre
-/// across at thirty metres, three and a half at a hundred, six and a half at the
-/// rim. That is what keeps a cell roughly constant in *screen* space for a
-/// camera looking down at a plane, and it is why the near water is smooth where
-/// a uniform grid of the same budget was a visible mesh of 2.5 m facets against
-/// a shortest wave of 3.5 m.
+/// — 3.3 per cent here — so a cell grows in proportion to its radius: a metre
+/// across at thirty metres, three and a half at a hundred, twenty at the rim.
+/// That is what keeps a cell roughly constant in *screen* space for a camera
+/// looking down at a plane, and it is why the near water is smooth where a
+/// uniform grid of the same budget was a visible mesh of 2.5 m facets against a
+/// shortest wave of 3.5 m.
 ///
 /// A square grid graded the same way was tried first and is worth recording as
 /// the wrong shape: grading separably along each axis produces cells that are
@@ -75,7 +80,7 @@ const SEGMENTS: u32 = 160;
 /// and along the axes through the boat they degenerate to slivers three
 /// centimetres by five metres. A disc has one radial direction and grades along
 /// it alone.
-const RINGS: u32 = 160;
+const RINGS: u32 = 200;
 
 /// Radius of the innermost ring of the near disc, m.
 ///
@@ -99,13 +104,15 @@ const HORIZON: f32 = 8_000.0;
 
 /// Concentric rings across the far sea.
 ///
-/// Forty-eight bands over a fortyfold change in radius, which is where the
-/// geometric spacing in [`horizon_ring`] lands: each band about eight per cent
-/// wider than the one inside it. The whole ring is then under a third of the
-/// near disc's vertices, which is the point — uniform spacing fine enough for
-/// the inner rim would need thousands of rings, and every band past a kilometre
-/// would draw triangles smaller than a pixel.
-const HORIZON_RINGS: u32 = 48;
+/// Sixty-four bands over a thirteenfold change in radius, each about four per
+/// cent wider than the one inside it: twenty-five metres at the inner rim,
+/// which is what lets the far ring keep *shading* the swell for a while after
+/// it has stopped displacing it — see `shaded` in `shaders/ocean.wgsl`. The
+/// whole ring is still a third of the near disc's vertices, which is the
+/// point: uniform spacing fine enough for the inner rim would need thousands
+/// of rings, and every band past a kilometre would draw triangles smaller than
+/// a pixel.
+const HORIZON_RINGS: u32 = 64;
 
 /// Far bound of the chase camera's frustum, m.
 ///
@@ -231,10 +238,10 @@ fn near_disc(core: f32, outer: f32, segments: u32, rings: u32) -> Mesh {
 
 /// A flat annulus from `inner` to `outer`, for the ocean shader to displace.
 ///
-/// The near disc stops at two hundred metres, and beyond it there was
+/// The near disc stops at six hundred metres, and beyond it there was
 /// background: an edge that reads as a wall rather than as distance. This is the
 /// water that carries the eye from there to the horizon, and it can afford to be
-/// very coarse, because everything it draws is at least two hundred metres away
+/// very coarse, because everything it draws is at least six hundred metres away
 /// and the short waves it fails to resolve are waves nobody at that range can
 /// see.
 ///
@@ -404,14 +411,20 @@ pub fn spawn(
     ));
 }
 
-/// Pushes the engine's clock into the ocean material.
+/// Pushes the engine's clock and the boat's motion into the ocean material.
 ///
-/// The engine's time, not the render clock: see `crate::ocean`. This is the only
-/// per-frame traffic between the physics and the water, and it is one float.
+/// The engine's time, not the render clock: see `crate::ocean`. This and the
+/// boat's position and velocity are the whole per-frame traffic between the
+/// physics and the water — five floats — and the water computes everything
+/// else, the wake included, from them.
 pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>>) {
     let time = engine.sim.time();
+    let state = engine.sim.state();
+    let stern = frame::to_render(state.position);
+    let velocity = frame::to_render(state.world_velocity());
     for (_, material) in oceans.iter_mut() {
         material.set_time(time);
+        material.set_motion(stern, velocity);
     }
 }
 

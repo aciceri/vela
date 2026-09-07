@@ -16,21 +16,29 @@
 //! hard over in about two seconds on a boat this size, and a mainsheet through
 //! its full travel in about three.
 //!
-//! The rudder returns to its *balanced* angle when neither key is held — not to
-//! amidships. A sailing boat is not balanced with the rudder centred: the sails'
-//! side force acts forward of the lateral plane's centre, the hull carries a
-//! standing yaw moment against it, and holding a straight course takes a
-//! permanent angle of weather helm. `Engine::balanced_helm` is the angle the
-//! equilibrium solve found, so returning there is returning to the trim the boat
-//! was released in, and the boat sails itself with nobody touching anything.
+//! # The helmsman
 //!
-//! Returning to zero instead — which this file did first — releases a perfectly
-//! trimmed boat with its helm in the wrong place. It luffs up within seconds and
-//! stops, and the fault reads as a physics problem when it is a frontend one.
-//! §5.5a is still true and still the reason a helm has to return anywhere at all:
-//! with a fixed rudder there is no course stability, so a helm left wherever the
-//! player abandoned it walks the boat into a slow uncommanded turn. Returning to
-//! the balanced angle is the smallest honest stand-in for a helmsman.
+//! When neither steering key is held, a helmsman steers the boat to a
+//! **course** — the heading it was on when the keys were last released — with
+//! a proportional-plus-rate law on the rudder about the balanced angle. Not
+//! back to the balanced angle itself, which is what this file did second, and
+//! not to amidships, which is what it did first.
+//!
+//! Both earlier versions failed for the reason §5.5a states: a boat with a
+//! fixed rudder has no course stability. Amidships releases a trimmed boat with
+//! the helm in the wrong place and it luffs up in seconds. The balanced angle
+//! is the equilibrium solve's, found with trim held and in flat water; released
+//! with trim free into a seaway the yaw balance moves at once, and the boat
+//! luffed head to wind inside fifteen seconds, stopped, then bore away to a
+//! broad reach and back — a viewer read a boat that "does not move against the
+//! sea", and was right. Every real boat has someone on the wheel doing what
+//! this does: holding the course with small corrections, at the rate a wheel
+//! turns. The gains are a helmsman's, not a tuned controller's — a degree of
+//! rudder per degree off course, and three seconds' worth of yaw rate to keep
+//! it from hunting — and the balanced angle is the trim the corrections sit
+//! on, so in flat water the rudder rests exactly where the solve put it.
+//!
+//! Steering by hand takes over completely and sets a new course on release.
 
 use bevy::prelude::*;
 use vela_core::equilibrium::MAX_HELM;
@@ -42,15 +50,42 @@ use crate::sim::Engine;
 /// Hard over in a little under two seconds, which is about what a wheel takes.
 const HELM_RATE: f64 = 0.30;
 
-/// How fast the helm returns to centre when nobody is steering.
+/// Rudder per radian of heading error, rad/rad.
 ///
-/// Slower than the steering rate, so that a correction is not immediately undone.
-const CENTRING_RATE: f64 = 0.12;
+/// Three degrees of helm per degree off course. One was tried first and was
+/// not enough: in half a metre of sea the boat crept seven degrees to windward
+/// in ten seconds against a helmsman who never got past a third of the rudder
+/// he had, because the wave-driven yaw rate was eating the rest (below).
+const COURSE_GAIN: f64 = 3.0;
+
+/// Rudder per radian per second of yaw rate, s.
+///
+/// A second and a half's worth. This is what keeps the course from hunting,
+/// and the boat's yaw damping was measured (§5.4a) small enough that it is
+/// needed; but in a seaway the yaw rate is mostly the waves' — a twentieth of
+/// a radian a second either way at a six second period — and three seconds'
+/// worth of it, which was the first value, had the helmsman chasing the swell
+/// with nine degrees of rudder instead of holding the course.
+const RATE_GAIN: f64 = 1.5;
+
+/// Rudder per radian-second of accumulated heading error, rad/(rad s).
+///
+/// The slow part of a helmsman: the standing offset between the balanced helm
+/// the solve found — trim held, flat water — and the helm the free boat in a
+/// seaway actually needs is learned rather than known, at a rate that takes
+/// tens of seconds to absorb a few degrees and cannot wind up past
+/// [`BIAS_LIMIT`].
+const BIAS_GAIN: f64 = 0.15;
+
+/// The most the learned offset can be, rad: fifteen degrees, which is more
+/// than the difference between the two balances has ever measured.
+const BIAS_LIMIT: f64 = 0.26;
 
 /// Fraction of a line's travel per second, held.
 const SHEET_RATE: f64 = 0.35;
 
-/// Applies the keyboard to the engine's controls.
+/// Applies the keyboard to the engine's controls, and the helmsman when the
+/// keyboard is not steering.
 pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMut<Engine>) {
     let dt = time.delta_secs() as f64;
     let mut controls = *engine.sim.controls();
@@ -67,18 +102,38 @@ pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMu
         steering -= 1.0;
     }
 
+    let state = engine.sim.state();
+    let heading = state.attitude.euler_angles().2;
+    let yaw_rate = state.angular_velocity.z;
+
     if steering == 0.0 {
-        // Towards the balanced helm, never past it: a decay would leave a
-        // residual offset forever and a step could overshoot into the other tack.
-        let balanced = engine.balanced_helm;
-        let error = balanced - controls.rudder_angle;
-        let step = CENTRING_RATE * dt;
-        controls.rudder_angle = if error.abs() <= step {
-            balanced
+        // The course is the heading the keys were last released on; the first
+        // frame sets it to the heading the boat was released on.
+        let course = *engine.course.get_or_insert(heading);
+        // Wrapped, so that a course across north is a small error and not a
+        // full turn the wrong way.
+        let error = (course - heading + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
+        engine.helm_bias =
+            (engine.helm_bias + BIAS_GAIN * error * dt).clamp(-BIAS_LIMIT, BIAS_LIMIT);
+        // Yaw is positive bow-to-starboard and a positive rudder turns the bow
+        // to port, so the heading error and its accumulation enter with a
+        // minus and the rate with a plus: all three oppose the way the bow is
+        // going.
+        let wanted = (engine.balanced_helm - COURSE_GAIN * error - engine.helm_bias
+            + RATE_GAIN * yaw_rate)
+            .clamp(-MAX_HELM, MAX_HELM);
+        // At the rate a wheel turns, not instantly.
+        let step = HELM_RATE * dt;
+        let gap = wanted - controls.rudder_angle;
+        controls.rudder_angle = if gap.abs() <= step {
+            wanted
         } else {
-            controls.rudder_angle + step * error.signum()
+            controls.rudder_angle + step * gap.signum()
         };
     } else {
+        engine.course = None;
+        engine.helm_bias = 0.0;
         controls.rudder_angle =
             (controls.rudder_angle + steering * HELM_RATE * dt).clamp(-MAX_HELM, MAX_HELM);
     }

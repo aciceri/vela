@@ -59,6 +59,11 @@ struct SeaUniform {
     /// Direction towards the sun, `.w` unused. From `sky::SUN`, so the highlight
     /// and the light on the boat cannot disagree.
     sun: vec4<f32>,
+    /// The boat's stern and its velocity over the ground, in the render plane:
+    /// `(x, z)` of the body origin — which sits on the aft perpendicular — and
+    /// `(vx, vz)` of its horizontal world velocity, m/s. What the wake is drawn
+    /// from; see `wake`.
+    motion: vec4<f32>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> sea: SeaUniform;
@@ -110,14 +115,29 @@ fn surface(plane: vec2<f32>) -> vec3<f32> {
 /// tens of metres across samples a twenty metre wave as noise, and the result is
 /// a band of flicker at the horizon that is entirely a sampling artefact.
 ///
-/// So the displacement is faded out over the outer part of the ring and the
+/// So the displacement is faded out over the outer third of the disc and the
 /// surface goes flat, which is also what a real sea does to the eye: past a
 /// kilometre or so, wave faces are below the angular resolution of anything and
-/// the sea is a plane with a texture. The shading keeps working there because it
-/// depends on the normal, which stays up, and the Fresnel term, which at grazing
-/// incidence is nearly one — a distant sea is a mirror, and that is correct.
+/// the sea is a plane with a texture.
 fn resolved(distance: f32) -> f32 {
-    return 1.0 - smoothstep(130.0, 200.0, distance);
+    return 1.0 - smoothstep(400.0, 600.0, distance);
+}
+
+/// How much of the analytic slope survives at a given distance.
+///
+/// Separate from `resolved`, and further out, and the reason is what the sea
+/// looked like when the two were one: a disc of shaded, moving crests inside a
+/// plane of flat ones, with a visible circle where the shading stopped. The
+/// shading only needs a *normal*, and a normal does not need the geometry to
+/// move — the far ring's twenty-five metre cells cannot displace a wave without
+/// flicker, but they can carry its slope for a while yet, because a normal that
+/// aliases shades a plane a little wrong rather than tearing it. So the slope
+/// runs out a kilometre and a half further than the displacement, over a band
+/// wide enough that no edge is drawn, and the Fresnel term takes over from
+/// there: at grazing incidence it is nearly one, a distant sea is a mirror, and
+/// that is correct.
+fn shaded(distance: f32) -> f32 {
+    return 1.0 - smoothstep(600.0, 2000.0, distance);
 }
 
 @vertex
@@ -140,10 +160,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let base = mesh_position_local_to_world(world_from_local, vec4<f32>(vertex.position, 1.0));
     let plane = base.xz;
 
-    // The level-of-detail fade, on the other hand, *is* a local question: it asks
-    // how far this vertex is from the middle of the window, because that is what
-    // decides how coarsely the mesh samples there.
-    let evaluated = surface(plane) * resolved(length(vertex.position.xz));
+    // The level-of-detail fades, on the other hand, *are* a local question: they
+    // ask how far this vertex is from the middle of the window, because that is
+    // what decides how coarsely the mesh samples there.
+    let distance = length(vertex.position.xz);
+    let wave = surface(plane);
+    let evaluated = vec3<f32>(wave.x * resolved(distance), wave.yz * shaded(distance));
 
     let world = vec3<f32>(base.x, base.y + evaluated.x, base.z);
 
@@ -256,10 +278,10 @@ fn ripple_slope(at: vec2<f32>) -> vec2<f32> {
 ///
 /// The obvious thing is to fade this out with range, and that was the first
 /// attempt: beyond a hundred metres a ripple is below a pixel, and asking for it
-/// there is asking for aliasing. But the displacement fades out by two hundred
+/// there is asking for aliasing. But the displacement fades out by six hundred
 /// metres too — a mesh with metre-scale triangles cannot carry a twenty metre wave
 /// without shimmering — so fading both left the sea a *perfectly flat mirror* from
-/// two hundred metres to the haze. That is most of the screen, and it is the
+/// there to the haze. That is most of the screen, and it is the
 /// strange smooth band a viewer notices immediately: water does not stop having
 /// texture because it is far away.
 ///
@@ -334,6 +356,62 @@ fn foam(detail: vec2<f32>, steepness: f32, elevation: f32, significant_height: f
     let sharp = smoothstep(0.13, 0.38, steepness);
     let mottle = 0.45 + 12.0 * length(detail);
     return clamp(crest * sharp * mottle, 0.0, 1.0);
+}
+
+/// Foam coverage of the boat's wake in `[0, 1]`.
+///
+/// This is what tells the eye the boat is moving. A hull with no trail sits on
+/// the water like a decal, and a viewer reads it as stationary even when the
+/// crests are going past at ten metres a second — which was the complaint that
+/// put this here. The wake is the one thing in the scene that is *about* the
+/// boat's motion relative to the water, so it carries the whole sense of it.
+///
+/// Not a model of the wake. The hull's turbulent wake is a band of aerated water
+/// left behind the transom that widens by entrainment and fades as the bubbles
+/// rise; both are drawn as the simplest thing that behaves that way — a width
+/// growing linearly with the age of the water, a strength decaying
+/// exponentially with it — and the age is the distance astern divided by the
+/// boat's speed, along the direction it is actually going over the ground.
+/// That direction includes leeway, which is right: the wake lies along the
+/// track, not the centreline, and the angle between them is visible from a
+/// chase camera as it should be. A turning boat leaves a straight wake here,
+/// because the uniform carries one velocity and no history; at the rates a
+/// yacht turns and the length a wake persists that is a few metres of error at
+/// the far end of the trail.
+///
+/// Gated on speed, so that a boat at rest leaves nothing, and broken up by the
+/// same ripple slope the whitecaps use so the trail is streaked rather than
+/// painted.
+fn wake(plane: vec2<f32>, detail: vec2<f32>) -> f32 {
+    let velocity = sea.motion.zw;
+    let speed = length(velocity);
+    if (speed < 0.2) {
+        return 0.0;
+    }
+    let track = velocity / speed;
+    let offset = plane - sea.motion.xy;
+    // Behind the stern is negative along the track.
+    let along = dot(offset, track);
+    if (along > 0.5) {
+        return 0.0;
+    }
+    let across = abs(offset.x * track.y - offset.y * track.x);
+    let age = -along / speed;
+    // Half a transom's width at the stern, widening by entrainment at a tenth
+    // of a metre a second — a turbulent wake spreads slowly — and mostly gone
+    // in five seconds, which at five knots is a boat length of clear trail and
+    // a faint one for a few more. The first version widened three times as
+    // fast and lasted twice as long, and drew a white searchlight beam astern
+    // that no boat has ever left; the second still read as a road at five
+    // knots, because a streak the eye follows along its length needs to be
+    // gone sooner than one it looks across.
+    let half_width = 0.9 + 0.1 * age;
+    let strength = 0.55 * exp(-age / 5.0) * smoothstep(0.2, 1.0, speed);
+    let inside = 1.0 - smoothstep(0.5 * half_width, half_width, across);
+    // Never solid: a wake is aerated water, not paint, and even at the transom
+    // most of what shows is streaks.
+    let mottle = min(0.5 + 6.0 * length(detail), 1.0);
+    return strength * inside * mottle;
 }
 
 @fragment
@@ -416,9 +494,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     colour = colour - sea.shallow * wrapped * 0.22 * (1.0 - fresnel) * (1.0 - lit);
 
     // Foam sits on top of everything: it is a surface of bubbles, not a property
-    // of the water under it, and it neither reflects the sky nor transmits.
+    // of the water under it, and it neither reflects the sky nor transmits. The
+    // wake is foam too, and the two combine as coverage rather than adding, so
+    // a whitecap crossing the trail is not brighter than white.
     let whitecap = foam(detail, in.steepness, in.elevation, significant_height);
-    colour = mix(colour, vec3<f32>(0.92, 0.95, 0.97), whitecap * 0.9);
+    let trail = wake(plane, detail);
+    let bubbles = max(whitecap, trail);
+    colour = mix(colour, vec3<f32>(0.92, 0.95, 0.97), bubbles * 0.9);
 
     // Aerial perspective, blended towards the sky *at the horizon* rather than
     // along the view ray.

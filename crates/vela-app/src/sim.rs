@@ -45,29 +45,41 @@ pub const STEP: f64 = 1.0 / 200.0;
 const SPEC: &str = include_str!("../../../boats/yd41-form-study.ron");
 
 /// True wind the boat is released into: m/s, and degrees off the bow.
-const WIND_SPEED: f64 = 6.0;
-const WIND_ANGLE: f64 = 45.0;
+///
+/// The working breeze the test suite sails and the published polar is checked
+/// in. It was six metres a second at forty-five degrees, and in that the keel
+/// is past its stall — lift coefficient over two against a foil's 1.2, the
+/// gap §5.4 of the functional analysis names — so the balanced helm sat at
+/// its limit and the boat luffed along at under a knot, which a viewer read
+/// as a boat that did not move against the sea. A knot less of wind and the
+/// boat sails: helm at eighteen degrees, five knots, and the crests come past.
+const WIND_SPEED: f64 = 5.0;
+const WIND_ANGLE: f64 = 40.0;
 
 /// The sea the boat is released into.
 ///
-/// A metre at six seconds: a moderate sea for a forty-footer, and the condition
-/// every seakeeping number quoted in `docs/functional-analysis.md` was measured
-/// at.
+/// Half a metre at six seconds: a slight sea for a forty-footer. It was a metre
+/// — the condition every seakeeping number in `docs/functional-analysis.md` is
+/// measured at — and in a metre of sea this boat does not stay sailing. §5.4's
+/// missing foil stall is why: the appendage lift is linear in angle of attack,
+/// the angle at the keel includes the roll rate times its arm, and as the waves
+/// slow the boat that ratio grows without bound — a keel lift coefficient of
+/// 3.4 was read off the HUD twenty seconds after release, where a real foil
+/// stalls near 1.2, with the boat down to a knot and the induced drag it was
+/// charged pinning it there. The functional analysis says it in as many words:
+/// seaway *motions* are usable and the seaway *speed loss* is not. Half a metre
+/// keeps the roll rate where the linear model holds and the boat at the five
+/// knots it was released at, which is the picture the frontend exists to show.
 ///
-/// It was briefly raised to a metre and a half, to make the water look like it
-/// had weather in it. `examples/motion_scale` is why it came back down: at that
-/// height the boat swings seventeen degrees of trim and nearly three metres of
-/// sinkage against a hull only 1.84 m deep, which is roughly twice a real
-/// forty-footer's response. The natural periods are right — heave 2.2 s, pitch
-/// 2.1 s, both inside the published band — so this is not a scale error but an
-/// amplitude one, and §5.4 already names its two causes: no diffraction, so the
-/// Froude-Krylov excitation is over-predicted at wavelengths near the hull's own,
-/// and no viscous damping, so nothing limits the response where the spectrum
-/// overlaps the pitch resonance.
-///
-/// Choosing the sea to flatter the model would have been the wrong lever, and
-/// choosing it to stay inside what the model is measured at is the right one.
-const WAVE_HEIGHT: f64 = 1.0;
+/// It was also once a metre and a half, to make the water look like it had
+/// weather in it, and `examples/motion_scale` is why it came down from there:
+/// seventeen degrees of trim and nearly three metres of sinkage against a hull
+/// 1.84 m deep, twice a real forty-footer's response — the amplitude error of
+/// no diffraction and no viscous damping, which §5.4 also names. Choosing the
+/// sea to flatter the model would be the wrong lever; choosing it to stay
+/// inside what the model can do is the right one, and the number goes back up
+/// when the stall model lands.
+const WAVE_HEIGHT: f64 = 0.5;
 const WAVE_PERIOD: f64 = 6.0;
 
 /// The simulation, and the mesh it was built from.
@@ -110,14 +122,18 @@ pub struct Engine {
     /// with the rudder centred — the sails' side force acts forward of the
     /// lateral plane's centre and the hull carries a permanent yaw moment against
     /// it, so a straight course needs a standing angle of weather helm. The
-    /// equilibrium solve computes it, and this is where the answer is kept so the
-    /// frontend can return the helm *there* when nobody is steering.
-    ///
-    /// Centring on zero instead, which is what this file did first, releases a
-    /// perfectly trimmed boat with its rudder in the wrong place: it luffs up
-    /// within seconds and stops. That looked like a physics problem and was a
-    /// frontend one.
+    /// equilibrium solve computes it, and this is where the answer is kept: it
+    /// is the trim the helmsman's corrections sit on. See `crate::helm`.
     pub balanced_helm: f64,
+    /// The heading the helmsman is holding, radians, `None` while a hand is on
+    /// the wheel. Set to the heading the keys are released on — and on the
+    /// first frame, to the heading the boat was released on.
+    pub course: Option<f64>,
+    /// The helmsman's learned offset from the balanced helm, radians: the
+    /// slow integral of the heading error, which absorbs the difference
+    /// between the balance the solve found and the one the free boat has.
+    /// Reset whenever a hand takes the wheel.
+    pub helm_bias: f64,
 }
 
 impl Engine {
@@ -158,6 +174,12 @@ impl Engine {
         let helm = equilibrium::solve_with_helm(&mut vpp, parameters.waterline_length, &start)
             .map_err(|error| format!("the boat will not sail: {error}"))?;
         let solved = helm.equilibrium;
+        info!(
+            "released at TWS {WIND_SPEED} m/s, TWA {WIND_ANGLE} deg: speed {:.2} m/s, heel {:.1} deg, helm {:.1} deg",
+            solved.speed,
+            solved.heel.to_degrees(),
+            helm.rudder_angle.to_degrees()
+        );
 
         let sea = Seaway2D::new(
             wind,
@@ -189,6 +211,8 @@ impl Engine {
             spec,
             sea: Some(realisation),
             balanced_helm: helm.rudder_angle,
+            course: None,
+            helm_bias: 0.0,
         })
     }
 }

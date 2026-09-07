@@ -123,6 +123,12 @@ pub struct SeaUniform {
     /// the sun lighting the boat is the kind of wrongness that is obvious on
     /// screen and invisible in the code.
     pub sun: Vec4,
+    /// The boat's stern and its velocity over the ground in the render plane:
+    /// `(x, z)` of the body origin, `(vx, vz)` of the horizontal world velocity,
+    /// m and m/s. What the wake is drawn from — see `wake` in the shader. Zero
+    /// until [`OceanMaterial::set_motion`] has been called, which draws no
+    /// wake, and that is the right picture of a boat that has not moved yet.
+    pub motion: Vec4,
 }
 
 /// The ocean surface material.
@@ -182,6 +188,7 @@ impl OceanMaterial {
                 deep: Vec3::new(0.004, 0.022, 0.045),
                 shallow: Vec3::new(0.055, 0.200, 0.180),
                 sun: crate::sky::SUN.normalize().extend(0.0),
+                motion: Vec4::ZERO,
             },
             waves,
         }
@@ -198,6 +205,17 @@ impl OceanMaterial {
     /// physics and the picture agree by.
     pub fn set_time(&mut self, time: f64) {
         self.sea.time = time as f32;
+    }
+
+    /// Tells the water where the boat is and how fast it is going over the
+    /// ground, so the wake is drawn from the stern along the track.
+    ///
+    /// Render-plane coordinates: `stern` is the body origin, which the engine
+    /// puts on the aft perpendicular, and `velocity` the horizontal part of the
+    /// world velocity. Both come through `frame::to_render`, so the wake cannot
+    /// lie on the mirror image of the track.
+    pub fn set_motion(&mut self, stern: Vec3, velocity: Vec3) {
+        self.sea.motion = Vec4::new(stern.x, stern.z, velocity.x, velocity.z);
     }
 }
 
