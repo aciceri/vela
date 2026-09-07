@@ -246,6 +246,11 @@ fn the_roll_mode_is_a_yacht_s_and_does_not_depend_on_amplitude() {
 /// and only through it.
 #[test]
 fn a_beam_sea_rolls_the_boat_and_a_calm_does_not() {
+    // A regular 3 s wave, 14 m long, 0.8 m high: near the roll period, and
+    // longer than the beam. It was a 1.4 s, 3.1 m wave — shorter than the
+    // beam — while `components: 1` put the component mid-band instead of at
+    // the peak, and the test passed on it because 0.8 m of anything abeam
+    // rolls a boat more than a degree.
     let sea = SeaState {
         significant_height: 0.8,
         peak_period: 3.0,

@@ -51,9 +51,9 @@ use std::f64::consts::PI;
 /// frontend this is shared with calls something else a component, and a type
 /// that means two things across a boundary is a bug waiting for a busy day.
 ///
-/// A realisation is long-crested, so every wave shares one direction; it is
-/// carried per wave anyway rather than alongside, because that is the form the
-/// synthesis below reads and a directional spectrum would need it.
+/// Each wave carries its own direction: a realisation is short-crested, with
+/// the directions drawn from the spreading function in [`Seaway::new`], and a
+/// `spreading` of zero gives every wave the mean heading.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Wave {
     /// Amplitude, m.
@@ -87,6 +87,12 @@ pub struct SeaState {
     /// More is smoother in time but no more accurate in any particular instant.
     /// Sixty is enough that the surface does not visibly repeat over a few
     /// minutes, which is the only thing a low count actually costs.
+    ///
+    /// **One is a regular wave**, not a one-band spectrum: a single sinusoid at
+    /// `peak_period` on `heading`, with amplitude `H_s / (2√2)` so that it
+    /// carries the same variance a spectrum of that height would. This is the
+    /// case a response amplitude operator is measured in, and the tests use it
+    /// for that.
     pub components: usize,
     /// Seed for the random phases.
     ///
@@ -290,7 +296,30 @@ impl Seaway {
     #[must_use]
     pub fn new(state: SeaState, gravity: f64) -> Self {
         let mut components = Vec::with_capacity(state.components);
-        if state.components > 0 && state.peak_period > 0.0 && state.significant_height > 0.0 {
+        if state.components == 1 && state.peak_period > 0.0 && state.significant_height > 0.0 {
+            // A single component is a **regular wave**, and it sits at the
+            // peak. Discretising a spectrum into one band would put it at the
+            // band's midpoint instead — `2.125 ω_p` for the band below — which
+            // is a wave with half the period and a fifth of the length of the
+            // one asked for. That is what this constructor did once, and every
+            // regular-wave test in the crate ran on a wave it had not named.
+            //
+            // The amplitude carries the whole variance: `a²/2 = m₀ = (H_s/4)²`,
+            // so `a = H_s / (2√2)`, and `realised_height()` returns `H_s` as it
+            // does for every other component count. The direction is the mean
+            // heading with no spread: a regular wave has one direction by
+            // definition, and the spreading function has nothing to draw from.
+            let frequency = 2.0 * PI / state.peak_period;
+            let (sine, cosine) = state.heading.sin_cos();
+            components.push(Wave {
+                amplitude: state.significant_height / (2.0 * 2.0_f64.sqrt()),
+                wavenumber: frequency * frequency / gravity,
+                frequency,
+                phase: Phases::new(state.seed).next(),
+                direction: (cosine, sine),
+            });
+        } else if state.components > 1 && state.peak_period > 0.0 && state.significant_height > 0.0
+        {
             let peak = 2.0 * PI / state.peak_period;
             let lowest = 0.25 * peak;
             let highest = 4.0 * peak;
@@ -653,6 +682,40 @@ mod tests {
             -here,
             epsilon = 1e-9
         );
+    }
+
+    /// A one-component sea is the wave it names: `peak_period` and `H_s`.
+    ///
+    /// This is the test that was missing when a single component sat at the
+    /// midpoint of the spectrum's band, `2.125 ω_p`, and every regular-wave test
+    /// in the crate ran on a wave half the period and a fifth the length of the
+    /// one in its docstring. They passed, because they read the amplitude back
+    /// from the realisation and the period never entered an assertion. This one
+    /// asserts the period, the height and the heading directly.
+    #[test]
+    fn a_single_component_is_a_regular_wave_at_the_peak() {
+        let state = SeaState {
+            components: 1,
+            peak_period: 6.0,
+            significant_height: 2.0,
+            heading: 0.3,
+            spreading: 10.0,
+            ..SeaState::default()
+        };
+        let sea = Seaway::new(state, GRAVITY);
+        let wave = sea.components[0];
+
+        assert_relative_eq!(2.0 * PI / wave.frequency, 6.0, max_relative = 1e-12);
+        // The whole variance in one sinusoid: `a²/2 = (H_s/4)²`.
+        assert_relative_eq!(
+            wave.amplitude,
+            2.0 / (2.0 * 2.0_f64.sqrt()),
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(sea.realised_height(), 2.0, max_relative = 1e-12);
+        // On the mean heading, regardless of the spreading asked for.
+        assert_relative_eq!(wave.direction.0, 0.3_f64.cos(), max_relative = 1e-12);
+        assert_relative_eq!(wave.direction.1, 0.3_f64.sin(), max_relative = 1e-12);
     }
 
     /// The dynamic pressure dies away with depth, at the rate theory says.

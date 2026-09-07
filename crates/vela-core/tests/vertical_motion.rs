@@ -220,16 +220,20 @@ fn the_pipeline_is_insensitive_to_its_own_grid() {
 /// means a term is wrong somewhere: too little response and the excitation is
 /// being lost, too much and it is being double-counted.
 ///
-/// 150 m is thirteen times this waterline, which for a linear wave is a fourteen
-/// second period, and it is deliberately long: the interesting regime — waves of
-/// the hull's own length, where the response peaks and then dies — is where the
+/// 600 m is fifty times this waterline, which for a linear wave is a 19.6 s
+/// period, and it is deliberately long: the interesting regime — waves of the
+/// hull's own length, where the response peaks and then dies — is where the
 /// model is *predicting* rather than obeying a limit, and a limit is what makes a
-/// test.
+/// test. Thirteen waterlines would not be enough, because pitch has its own
+/// natural period of 1.75 s and heave 2.0 s, and the quasi-static limit wants to
+/// be far below both.
+///
+/// Until `components: 1` meant a regular wave at the peak, this test ran on a
+/// 133 m wave while saying 600: the one-band discretisation put the component
+/// at `2.125 ω_p`. It passed anyway, because the amplitude is read back from the
+/// realisation and the period never entered an assertion.
 #[test]
 fn a_hull_rides_a_wave_much_longer_than_itself() {
-    // A 600 m wave: thirteen times this waterline is not enough, because pitch
-    // has its own natural period of 1.75 s and heave 2.0 s, and the quasi-static
-    // limit wants to be far below both. Six hundred metres is a 19.6 s period.
     let wavelength = 600.0_f64;
     let period = (2.0 * std::f64::consts::PI * wavelength / 9.81).sqrt();
     let state = SeaState {
@@ -368,10 +372,20 @@ fn a_seaway_moves_the_boat_and_a_calm_does_not() {
 /// predicted.
 ///
 /// So the ratio is not a testable quantity. This is: hold the hull at the pose
-/// the wave implies — sunk by the elevation, trimmed by the slope — and the net
-/// wrench must go to zero as the wave lengthens. No ratio of vanishing
-/// quantities, and it tests the thing that matters, which is that the excitation
-/// and the restoring are the same integral seen from two sides.
+/// the wave implies — the rigid displacement following the plane the wave locally
+/// is, sunk by the elevation at the body origin and pitched by the slope about
+/// it — and the net wrench must go to zero as the wave lengthens. No ratio of
+/// vanishing quantities, and it tests the thing that matters, which is that the
+/// excitation and the restoring are the same integral seen from two sides.
+///
+/// Two things about this test were wrong once and are recorded because both
+/// masked each other. It sank the hull by the elevation at amidships and pitched
+/// it about the origin six metres away, which is not a rigid following of the
+/// plane but one off by the slope times six metres; and it ran on waves a fifth
+/// the length it named, at a phase that happened to sit near a crest where the
+/// slope was small enough not to matter. Put the wave where it says and the old
+/// pose left a residual that *grew* with the pitch correction; put the pose
+/// right and the residual drops forty-fold at every length.
 #[test]
 fn the_wave_following_pose_becomes_an_equilibrium_in_long_waves() {
     let (mut calm, _) = settled(quick());
@@ -399,19 +413,28 @@ fn the_wave_following_pose_becomes_an_equilibrium_in_long_waves() {
             quick(),
         );
 
-        // A quarter period off the crest, where the slope is largest.
+        // A quarter period off the crest, where the slope is largest. The hold
+        // lands on that instant exactly: a step that overshoots it by up to its
+        // own length would evaluate the sea a fraction of a period late, and in
+        // a long wave that is a heave force that has nothing to do with the pose.
         let time = 0.25 * period;
         let hold = |sim: &mut Sim, at: &vela_core::state::BodyState| {
             while sim.time() < time {
-                sim.step(0.05);
+                sim.step((time - sim.time()).min(0.05));
                 sim.set_state(at.clone());
             }
         };
 
-        let amidships = 5.95;
-        let elevation = sea.elevation(amidships, 0.0, time);
-        let slope = (sea.elevation(amidships + 1.0, 0.0, time)
-            - sea.elevation(amidships - 1.0, 0.0, time))
+        // The pose is a rigid displacement following the plane the long wave
+        // is locally: sunk by the elevation *at the body origin* and pitched by
+        // the slope *about* it. Sinking by the elevation at one point and
+        // rotating about another is not that pose — it is off by the slope times
+        // the distance between them, which is first order in the very quantity
+        // the test says should vanish.
+        let here = (rest.position.x, rest.position.y);
+        let elevation = sea.elevation(here.0, here.1, time);
+        let slope = (sea.elevation(here.0 + 1.0, here.1, time)
+            - sea.elevation(here.0 - 1.0, here.1, time))
             / 2.0;
 
         let mut at_rest = rest.clone();
@@ -429,9 +452,12 @@ fn the_wave_following_pose_becomes_an_equilibrium_in_long_waves() {
         hold(&mut sim, &following);
         let balanced = norm(&sim.applied_wrench(0.05));
 
+        // Measured: 44x at 600 m and 41x at 2400 m, against a floor of about
+        // 0.15 that does not move with the wavelength — the second-order
+        // hydrostatics of two centimetres of sinking, not the wave.
         let reduction = unbalanced / balanced.max(1e-12);
         assert!(
-            reduction > 10.0,
+            reduction > 20.0,
             "at {wavelength} m the wave-following pose left {balanced:.3} of \
              {unbalanced:.3}, a reduction of only {reduction:.1}x"
         );

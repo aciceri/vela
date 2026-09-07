@@ -1026,7 +1026,10 @@ Two mistakes in the *test* had to be found first, and both are worth recording.
 from midships, where a fraction of a degree of pitch swamps the heave, and
 measuring there showed a response half again too large that was entirely the arm.
 And 150 m is not a long wave for this boat: heave and pitch have natural periods
-of 2.0 s and 1.75 s, and the quasi-static limit wants to be far below both.
+of 2.0 s and 1.75 s, and the quasi-static limit wants to be far below both. (A
+third, found later: until `components: 1` meant a regular wave at the peak, the
+"600 m" wave was 133 m. The test passed on it, and passes now on the wave it
+names; see the table below.)
 
 #### Resolved: pitch is 4.6 times the wave slope, and that is arithmetic
 
@@ -1063,19 +1066,37 @@ heave accuracy.
 #### What replaced it
 
 A test with no vanishing denominator: hold the hull at the pose the wave implies —
-sunk by the elevation, trimmed by the slope — and require the net wrench to
-collapse. It does, and the way it collapses is the evidence:
+the rigid displacement following the plane the long wave locally is, sunk by the
+elevation at the body origin and pitched by the slope about it — and require the
+net wrench to collapse. It does:
 
 | wavelength | `kL` | residual wrench falls by |
 |---|---|---|
-| 150 m | 0.50 | 0.6× (worse) |
-| 600 m | 0.125 | 19× |
-| 2400 m | 0.031 | 552× |
+| 133 m | 0.56 | 20× |
+| 300 m | 0.25 | 39× |
+| 600 m | 0.125 | 44× |
+| 2400 m | 0.031 | 41× |
+| 4800 m | 0.016 | 40× |
 
-The wave-following pose becomes an equilibrium as `kL → 0`, quadratically, and at
-`kL = 0.5` it is not one at all — exactly as the long-wave approximation says. That
-tests what actually matters: the excitation and the restoring are the same
-pressure integral seen from two sides.
+The unbalanced wrench converges on the heave force of two centimetres of sinking
+and the balanced one on a floor near 0.15 kN-equivalent that does not move with
+wavelength — the second-order hydrostatics of that sinking, not the wave. So the
+reduction saturates at forty rather than growing without bound, which is what a
+test with a fixed-amplitude wave and a real waterplane should show.
+
+**The table this replaces was wrong twice over**, and the review that found it is
+recorded here so nobody rediscovers it. It read 0.6×, 19× and 552× at 150, 600 and
+2400 m. First, `components: 1` did not put the wave at `peak_period`: the one-band
+discretisation put it at the band's midpoint, `2.125 ω_p`, so every row ran on a
+wave a fifth the length it named — the "600 m" row was 133 m, `kL = 0.56`. Second,
+the pose was not the wave-following pose: it sank the hull by the elevation at
+amidships and pitched it about the origin six metres away, an error first order
+in the slope. The two masked each other, because the mislabelled wave happened to
+sit near a crest at the sampled instant, where the slope was small. Put the wave
+where it says and the old pose's residual *grew* with the pitch correction; put
+the pose right and the residual drops forty-fold at every length. A single
+component is now a regular wave at the peak by construction, with a test that
+says so.
 
 The heave deviation itself scales as `kL` — 11.6 % at `kL = 0.5`, 0.8 % at
 `kL = 0.004` — which is the finite-length physics the long-wave limit drops rather
