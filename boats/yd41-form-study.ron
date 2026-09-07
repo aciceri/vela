@@ -482,9 +482,10 @@
     // The roll gyradius *was* wrong. At 1.25 m it was 0.30 of the beam, against
     // 0.35 to 0.45 published for a sailing yacht's dry boat with its rig; 1.65 m is
     // 0.40, the middle. It enters the dynamics and not the flotation, so it moves
-    // the roll period to 3.30 s without touching a single steady-sailing number --
-    // which is exactly why it survived the experiment that the centre of gravity
-    // did not.
+    // the roll period from 2.09 to 2.49 s without touching a single steady-sailing
+    // number -- which is exactly why it survived the experiment that the centre of
+    // gravity did not. (3.30 s was the figure with both changes; with the centre
+    // of gravity restored the stiffness is back, and so is most of the frequency.)
     mass: (
         displacement_kg: 6221.0,
         cog: (x: 5.4509, y: 0.0, z: 0.2),
