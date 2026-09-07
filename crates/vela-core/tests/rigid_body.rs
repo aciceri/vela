@@ -412,3 +412,78 @@ fn restraining_one_mode_leaves_the_others_on_their_own_mass() {
     assert_relative_eq!(held.linear.z, expected, max_relative = 1e-12);
     assert_relative_eq!(held.angular.y, 0.0, epsilon = 1e-12);
 }
+
+/// Free motion of a body **with added mass** conserves the momentum of the
+/// whole mass matrix, in the world frame.
+///
+/// This is the test for `C_A(ν) ν`, and it has to be momentum rather than
+/// energy: kinetic energy is `½ νᵀ M ν`, and *any* skew Coriolis matrix
+/// conserves it — the rigid-only `C_RB` included — so an energy test passes
+/// on the wrong terms. Momentum does not. The body-frame momentum `p = M ν`
+/// is a world-frame constant of torque-free motion only if it is transported
+/// by `ṗ = -ω × p` with the *full* `M`; built from the rigid mass alone, the
+/// added part of `p` is left behind as the body turns, and with an added mass
+/// that is heavy in heave and nothing in surge the world momentum wandered by
+/// **146 %** in ten seconds. With the full terms it is 1.1e-3.
+///
+/// The bound is where it is because the residual is the integrator's, not the
+/// terms': it is first order in the step (2.2e-3, 1.1e-3, 5.5e-4, 2.8e-4 at
+/// 240, 480, 960 and 1920 Hz) and a rigid body translating while it tumbles
+/// shows the same order at half the size. The semi-implicit scheme transports
+/// angular momentum to 1e-8 and linear momentum to first order, and nothing in
+/// this file had a linear velocity to notice that before.
+#[test]
+fn free_motion_with_added_mass_conserves_the_full_momentum() {
+    let body = coupled_body();
+    let state = BodyState {
+        velocity: Vector3::new(0.0, 0.0, 1.5),
+        angular_velocity: Vector3::new(0.6, 0.4, 0.3),
+        ..BodyState::default()
+    };
+    let momentum_world = |state: &BodyState| {
+        let nu = nalgebra::Vector6::new(
+            state.velocity.x,
+            state.velocity.y,
+            state.velocity.z,
+            state.angular_velocity.x,
+            state.angular_velocity.y,
+            state.angular_velocity.z,
+        );
+        let p = body.mass_matrix() * nu;
+        state.to_world(Vector3::new(p[0], p[1], p[2]))
+    };
+
+    let initial = momentum_world(&state);
+    let final_state = free_flight(&body, state, 10.0, 1.0 / 480.0);
+    let drift = (momentum_world(&final_state) - initial).norm() / initial.norm();
+
+    assert!(drift < 2e-3, "world momentum drifted by {drift}");
+}
+
+/// Moving the centre of gravity keeps the added mass.
+///
+/// The added mass is a property of the hull in the water and is registered
+/// about the body origin, which does not move when the crew does. An earlier
+/// `set_cog` rebuilt the body from its own mass and silently dropped it — no
+/// caller had moved a centre of gravity yet, which is why nothing noticed.
+#[test]
+fn moving_the_centre_of_gravity_keeps_the_added_mass() {
+    let mut body = coupled_body();
+    let added_before = body.mass_matrix() - body.mass_properties().generalized();
+
+    body.set_cog(Vector3::new(0.3, 0.0, -0.4))
+        .expect("a moved centre of gravity is still a valid body");
+    let added_after = body.mass_matrix() - body.mass_properties().generalized();
+
+    // What is left once the rigid part is taken out is the added mass, and it
+    // must be the same matrix before and after: `A₃₅ = -40000` included.
+    assert_relative_eq!(added_after, added_before, epsilon = 1e-9);
+    assert_relative_eq!(added_after[(2, 4)], -40_000.0, max_relative = 1e-12);
+    // And the rigid part did move: the heave–pitch entry of `-m S(r)` is
+    // `-m r_x`, which is zero for a centred body and not for this one.
+    assert_relative_eq!(
+        body.mass_properties().generalized()[(2, 4)],
+        -6000.0 * 0.3,
+        max_relative = 1e-12
+    );
+}

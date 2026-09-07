@@ -23,8 +23,8 @@
 //! the boat's own mass — enters exactly here, as a constant matrix summed into
 //! the left-hand side before factorization. Treating it as a force instead
 //! would require the acceleration being solved for, and is the classic source
-//! of instability in marine simulators. The registration point exists in the
-//! equation from the start; the coefficients arrive with the radiation model.
+//! of instability in marine simulators. [`RigidBody::add_added_mass`] is the
+//! registration point; `modules::radiation` supplies the coefficients.
 //!
 //! # Integrator
 //!
@@ -83,6 +83,11 @@ pub struct Acceleration {
 #[derive(Debug, Clone)]
 pub struct RigidBody {
     mass: MassProperties,
+    /// The hydrodynamic added mass registered so far, kept apart from the
+    /// body's own so that a moving centre of gravity can rebuild the sum
+    /// rather than lose it. Zero until [`RigidBody::add_added_mass`].
+    added: Matrix6<f64>,
+    /// `mass.generalized() + added`.
     mass_matrix: Matrix6<f64>,
     /// Cholesky of the **restrained** mass matrix, which equals `mass_matrix`
     /// when nothing is held. See [`RigidBody::restrain`].
@@ -114,6 +119,7 @@ impl RigidBody {
         let factorization = mass_matrix.cholesky().ok_or(MassError::InvalidInertia)?;
         Ok(Self {
             mass,
+            added: Matrix6::zeros(),
             mass_matrix,
             factorization,
             held: [false; 6],
@@ -133,15 +139,22 @@ impl RigidBody {
 
     /// Moves the centre of gravity and refactorizes the mass matrix.
     ///
+    /// The added mass survives the move: it is a property of the hull in the
+    /// water, not of where the crew is sitting, and it is registered about the
+    /// body origin, which does not move. An earlier version rebuilt the body
+    /// from its own mass alone and silently dropped it.
+    ///
     /// # Errors
     ///
     /// As [`RigidBody::new`].
     pub fn set_cog(&mut self, cog: Vector3<f64>) -> Result<(), MassError> {
         let mut mass = self.mass.clone();
         mass.set_cog(cog);
-        let held = self.held;
-        *self = Self::with_gravity(mass, self.gravity)?;
-        self.restrain(held);
+        let combined = mass.generalized() + self.added;
+        combined.cholesky().ok_or(MassError::InvalidInertia)?;
+        self.mass = mass;
+        self.mass_matrix = combined;
+        self.restrain(self.held);
         Ok(())
     }
 
@@ -223,6 +236,7 @@ impl RigidBody {
         // physical error whether or not the modes it corrupts happen to be held,
         // and a restraint that hid it would let a bad fit through.
         combined.cholesky().ok_or(MassError::InvalidInertia)?;
+        self.added += added;
         self.mass_matrix = combined;
         self.restrain(self.held);
         Ok(())
@@ -243,16 +257,62 @@ impl RigidBody {
     /// Velocity-dependent inertial terms — the `C(ν) ν` of the equations of
     /// motion — as a generalized vector to be subtracted from the applied
     /// wrench.
+    ///
+    /// Built from the **whole** mass matrix, added mass included, in Fossen's
+    /// parametrisation for a symmetric `M = [[M₁₁, M₁₂], [M₂₁, M₂₂]]`:
+    ///
+    /// ```text
+    /// p = M₁₁ v + M₁₂ ω          (momentum)
+    /// h = M₂₁ v + M₂₂ ω          (angular momentum about the origin)
+    /// C(ν) ν = ( ω × p ,  v × p + ω × h )
+    /// ```
+    ///
+    /// With `M` the rigid body's own this is exactly the classical `ω × m v_g`
+    /// centripetal and `ω × I ω` gyroscopic terms — the two forms agree by the
+    /// Jacobi identity, and the conservation tests are the check. With added
+    /// mass in `M` it is what transports the fluid's momentum with the body: an
+    /// earlier version built `C` from the rigid mass alone, and a body with a
+    /// heavy heave added mass tumbling in free flight lost 146 % of its world
+    /// momentum in ten seconds.
+    ///
+    /// # The one term deliberately left out
+    ///
+    /// `v × M₁₁ v` is the **Munk moment**: the moment a body feels translating
+    /// steadily through a fluid whose added mass is anisotropic. It is zero for
+    /// the rigid part (`M₁₁ = m I`) and it is *not* zero for the added part, and
+    /// it is left out on purpose, for two reasons that are the same reason.
+    /// First, the added mass here is strip theory's: the canoe body alone, at
+    /// infinite frequency, with no surge entry at all — which is the right
+    /// matrix for radiation and the wrong one for steady flow, where the
+    /// free-surface condition is the other limit and the keel carries most of
+    /// the sway added mass. Second, the hull and foil forces come from tank
+    /// regressions fitted to heeled hulls at leeway, whose measured totals
+    /// already contain whatever Munk moment the real flow produces; adding a
+    /// potential-flow one on top would count it twice, with the wrong
+    /// coefficients. Measured on the YD-41 at the solved upwind condition, the
+    /// term would have been 2 kN·m in roll, 11 kN·m in pitch and 1 kN·m in
+    /// yaw — three quarters of a degree of heel and 1.3 % of speed away from
+    /// the velocity prediction the polar was validated against.
+    ///
+    /// So: everything that depends on a rate is here, and the steady
+    /// translational moment is the empirical models'. The cost is that the
+    /// matrix is skew only up to that term, so kinetic energy is conserved to
+    /// `ω · (v × A₁₁ v)`, which vanishes at steady sailing and is small beside
+    /// the radiation damping everywhere else.
     fn inertial_terms(&self, velocity: Vector3<f64>, omega: Vector3<f64>) -> Vector6<f64> {
-        let m = self.mass.mass();
-        let r = self.mass.cog();
+        let m = &self.mass_matrix;
+        let translational = m.fixed_view::<3, 3>(0, 0);
+        let coupling = m.fixed_view::<3, 3>(0, 3);
+        let coupling_transposed = m.fixed_view::<3, 3>(3, 0);
+        let rotational = m.fixed_view::<3, 3>(3, 3);
 
-        let cog_velocity = velocity + omega.cross(&r);
-        let centripetal = omega.cross(&cog_velocity);
-        let gyroscopic = omega.cross(&(self.mass.inertia_cog() * omega));
+        let momentum = translational * velocity + coupling * omega;
+        let angular_momentum = coupling_transposed * velocity + rotational * omega;
 
-        let linear = m * centripetal;
-        let angular = gyroscopic + m * r.cross(&centripetal);
+        let linear = omega.cross(&momentum);
+        // `v × (M₁₂ ω)` and not `v × p`: the steady `v × M₁₁ v` is the Munk
+        // moment, left to the empirical models — see above.
+        let angular = velocity.cross(&(coupling * omega)) + omega.cross(&angular_momentum);
         Vector6::new(
             linear.x, linear.y, linear.z, angular.x, angular.y, angular.z,
         )
@@ -359,8 +419,8 @@ impl RigidBody {
         state.to_world(self.mass.mass() * cog_velocity)
     }
 
-    /// The generalized mass matrix in use, for inspection and for the added-mass
-    /// contribution to come.
+    /// The generalized mass matrix in use — the body's own plus every added
+    /// mass registered — for inspection.
     #[must_use]
     pub fn mass_matrix(&self) -> &Matrix6<f64> {
         &self.mass_matrix
