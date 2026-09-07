@@ -54,6 +54,7 @@ struct SeaUniform {
     count: u32,
     time: f32,
     significant_height: f32,
+    trail_count: u32,
     deep: vec3<f32>,
     shallow: vec3<f32>,
     /// Direction towards the sun, `.w` unused. From `sky::SUN`, so the highlight
@@ -61,15 +62,23 @@ struct SeaUniform {
     sun: vec4<f32>,
     /// The boat's stern and its velocity over the ground, in the render plane:
     /// `(x, z)` of the body origin — which sits on the aft perpendicular — and
-    /// `(vx, vz)` of its horizontal world velocity, m/s. What the wake is drawn
-    /// from; see `wake`.
+    /// `(vx, vz)` of its horizontal world velocity, m/s. The newest point of the
+    /// wake, ahead of the recorded trail; see `wake`.
     motion: vec4<f32>,
 };
 
+/// One recorded point of the stern's track: `(x, z)` in the render plane, the
+/// engine's time it was passed, and a pad.
+struct TrailPoint {
+    point: vec4<f32>,
+};
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> sea: SeaUniform;
-// The length is `ocean::MAX_WAVES`, pushed as a shader def by the material's
-// `specialize`, so the array cannot be a different size from the uniform.
+// The lengths are `ocean::MAX_WAVES` and `ocean::MAX_TRAIL`, pushed as shader
+// defs by the material's `specialize`, so the arrays cannot be a different size
+// from the uniforms.
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> waves: array<ShaderWave, #{MAX_WAVES}>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> trail: array<TrailPoint, #{MAX_TRAIL}>;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -366,52 +375,84 @@ fn foam(detail: vec2<f32>, steepness: f32, elevation: f32, significant_height: f
 /// put this here. The wake is the one thing in the scene that is *about* the
 /// boat's motion relative to the water, so it carries the whole sense of it.
 ///
-/// Not a model of the wake. The hull's turbulent wake is a band of aerated water
-/// left behind the transom that widens by entrainment and fades as the bubbles
-/// rise; both are drawn as the simplest thing that behaves that way — a width
-/// growing linearly with the age of the water, a strength decaying
-/// exponentially with it — and the age is the distance astern divided by the
-/// boat's speed, along the direction it is actually going over the ground.
-/// That direction includes leeway, which is right: the wake lies along the
-/// track, not the centreline, and the angle between them is visible from a
-/// chase camera as it should be. A turning boat leaves a straight wake here,
-/// because the uniform carries one velocity and no history; at the rates a
-/// yacht turns and the length a wake persists that is a few metres of error at
-/// the far end of the trail.
+/// # It stays on the water
 ///
-/// Gated on speed, so that a boat at rest leaves nothing, and broken up by the
-/// same ripple slope the whitecaps use so the trail is streaked rather than
-/// painted.
+/// The wake is drawn along the stern's **recorded track** — the polyline the
+/// material keeps of where the transom has been and when — with one more
+/// segment from the newest recorded point to where the stern is now. The first
+/// version drew a straight band from the current position along the current
+/// velocity, and it swung with every yaw of the hull like a searchlight: a
+/// viewer saw at once that it was attached to the boat, not left behind on the
+/// sea. Water that has been passed does not move because the boat turns.
+///
+/// For a fragment, each segment is asked how far the point is across it and
+/// how far along, and the age of the water there is interpolated from the
+/// times the two ends were passed. The nearest segment wins. The loop is over
+/// every recorded point, so it is gated first on being within reach of the
+/// newest one at all, which almost all of the sea is not.
+///
+/// # What it draws
+///
+/// Not a model of the wake. The hull's turbulent wake is a band of aerated
+/// water that widens by entrainment and fades as the bubbles rise; both are the
+/// simplest thing that behaves that way — a width growing linearly with age, a
+/// strength decaying exponentially with it. The edge is not a line: a real
+/// wake's margin is ragged, so the half-width is modulated by a low-frequency
+/// slope field along the track and the coverage inside is streaked by the same
+/// ripple slope the whitecaps use. A perfect trapezoid, which is what came out
+/// before either, reads as a decal however well it is placed.
 fn wake(plane: vec2<f32>, detail: vec2<f32>) -> f32 {
-    let velocity = sea.motion.zw;
-    let speed = length(velocity);
-    if (speed < 0.2) {
+    let count = sea.trail_count;
+    let stern = sea.motion.xy;
+    let speed = length(sea.motion.zw);
+    // Nothing recorded, or nothing near: the reach is the longest a wake can
+    // be before it has faded, and the newest point is where it is strongest.
+    if (count == 0u || distance(plane, stern) > 80.0) {
         return 0.0;
     }
-    let track = velocity / speed;
-    let offset = plane - sea.motion.xy;
-    // Behind the stern is negative along the track.
-    let along = dot(offset, track);
-    if (along > 0.5) {
-        return 0.0;
+
+    var best = 0.0;
+    for (var index: u32 = 0u; index < count; index = index + 1u) {
+        let older = trail[index].point;
+        // The segment ends at the next recorded point, or at the stern itself
+        // for the newest one, which is where the wake is being made now.
+        var newer: vec4<f32>;
+        if (index + 1u < count) {
+            newer = trail[index + 1u].point;
+        } else {
+            newer = vec4<f32>(stern, sea.time, 0.0);
+        }
+        let span = newer.xy - older.xy;
+        let span_length = length(span);
+        if (span_length < 1e-3) {
+            continue;
+        }
+        let direction = span / span_length;
+        let offset = plane - older.xy;
+        let along = clamp(dot(offset, direction), 0.0, span_length);
+        // Distance to the *segment*, not to its line: measured to the line, a
+        // point ahead of the stern on the track's extension is "on" the newest
+        // segment, and the wake ran out in front of the bow.
+        let across = distance(plane, older.xy + direction * along);
+        let age = sea.time - mix(older.z, newer.z, along / span_length);
+
+        // Half a transom's width when it was made, widening by entrainment at a
+        // tenth of a metre a second, the margin ragged by a slow noise along
+        // the track — clamped, because the slope of a noise field is not
+        // bounded and unclamped it threw blobs of foam twenty metres off the
+        // track; mostly gone in five seconds, which at five knots is a boat
+        // length of clear trail and a faint one for a few more.
+        let ragged = 0.8 + 0.3 * clamp(ripple_slope(plane * 0.18).x, -1.0, 1.0);
+        let half_width = (0.9 + 0.1 * age) * ragged;
+        let strength = 0.55 * exp(-age / 5.0);
+        let inside = 1.0 - smoothstep(0.45 * half_width, half_width, across);
+        best = max(best, strength * inside);
     }
-    let across = abs(offset.x * track.y - offset.y * track.x);
-    let age = -along / speed;
-    // Half a transom's width at the stern, widening by entrainment at a tenth
-    // of a metre a second — a turbulent wake spreads slowly — and mostly gone
-    // in five seconds, which at five knots is a boat length of clear trail and
-    // a faint one for a few more. The first version widened three times as
-    // fast and lasted twice as long, and drew a white searchlight beam astern
-    // that no boat has ever left; the second still read as a road at five
-    // knots, because a streak the eye follows along its length needs to be
-    // gone sooner than one it looks across.
-    let half_width = 0.9 + 0.1 * age;
-    let strength = 0.55 * exp(-age / 5.0) * smoothstep(0.2, 1.0, speed);
-    let inside = 1.0 - smoothstep(0.5 * half_width, half_width, across);
+
     // Never solid: a wake is aerated water, not paint, and even at the transom
-    // most of what shows is streaks.
+    // most of what shows is streaks. A boat at rest leaves nothing.
     let mottle = min(0.5 + 6.0 * length(detail), 1.0);
-    return strength * inside * mottle;
+    return best * mottle * smoothstep(0.2, 1.0, speed);
 }
 
 @fragment

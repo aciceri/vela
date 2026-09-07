@@ -414,9 +414,9 @@ pub fn spawn(
 /// Pushes the engine's clock and the boat's motion into the ocean material.
 ///
 /// The engine's time, not the render clock: see `crate::ocean`. This and the
-/// boat's position and velocity are the whole per-frame traffic between the
-/// physics and the water — five floats — and the water computes everything
-/// else, the wake included, from them.
+/// stern's position and velocity are the whole per-frame traffic between the
+/// physics and the water; the material records the stern's track from them
+/// and the water computes everything else, the wake included.
 pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>>) {
     let time = engine.sim.time();
     let state = engine.sim.state();
@@ -424,7 +424,7 @@ pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>
     let velocity = frame::to_render(state.world_velocity());
     for (_, material) in oceans.iter_mut() {
         material.set_time(time);
-        material.set_motion(stern, velocity);
+        material.record(stern, velocity, time);
     }
 }
 

@@ -100,7 +100,7 @@ pub struct ShaderWave {
 /// The scalars every wave shares.
 #[derive(ShaderType, Clone, Debug)]
 pub struct SeaUniform {
-    /// How many entries of the array are real.
+    /// How many entries of the wave array are real.
     pub count: u32,
     /// The **engine's** time, s. See the module documentation.
     pub time: f32,
@@ -109,9 +109,11 @@ pub struct SeaUniform {
     /// The shader needs a scale to judge a crest against: "steep and high" is
     /// meaningless without one, and the foam threshold has to mean the same thing
     /// in a half-metre chop as in a four-metre sea. Sits here rather than being
-    /// recomputed in the shader because it is a property of the realisation, and
-    /// it packs into the same sixteen-byte slot as the two fields above it.
+    /// recomputed in the shader because it is a property of the realisation.
     pub significant_height: f32,
+    /// How many entries of the trail array are real. Packs into the same
+    /// sixteen-byte slot as the three fields above it.
+    pub trail_count: u32,
     /// Colour of deep water, linear RGB.
     pub deep: Vec3,
     /// Colour where the surface faces the sky, linear RGB.
@@ -125,10 +127,27 @@ pub struct SeaUniform {
     pub sun: Vec4,
     /// The boat's stern and its velocity over the ground in the render plane:
     /// `(x, z)` of the body origin, `(vx, vz)` of the horizontal world velocity,
-    /// m and m/s. What the wake is drawn from — see `wake` in the shader. Zero
-    /// until [`OceanMaterial::set_motion`] has been called, which draws no
-    /// wake, and that is the right picture of a boat that has not moved yet.
+    /// m and m/s. The newest point of the wake, ahead of the recorded trail —
+    /// see `wake` in the shader. Zero until [`OceanMaterial::record`] has been
+    /// called, which draws no wake, and that is the right picture of a boat that
+    /// has not moved yet.
     pub motion: Vec4,
+}
+
+/// Samples of the stern's track the shader can carry.
+///
+/// One kilobyte at sixteen bytes a sample: sixty-four points a metre or so
+/// apart is sixty metres of track, and the wake is invisible long before that.
+/// Sized through the same shader def mechanism as [`MAX_WAVES`].
+pub const MAX_TRAIL: usize = 64;
+
+/// Where the stern was, and when: one point of the wake's spine.
+///
+/// `(x, z)` in the render plane, the engine's time, and a pad — a `vec4` in
+/// WGSL, which is what keeps the array's stride at sixteen.
+#[derive(ShaderType, Clone, Copy, Default, Debug)]
+pub struct TrailPoint {
+    pub point: Vec4,
 }
 
 /// The ocean surface material.
@@ -138,6 +157,9 @@ pub struct OceanMaterial {
     pub sea: SeaUniform,
     #[uniform(1)]
     pub waves: [ShaderWave; MAX_WAVES],
+    /// The stern's track, oldest first, `sea.trail_count` entries real.
+    #[uniform(2)]
+    pub trail: [TrailPoint; MAX_TRAIL],
 }
 
 impl OceanMaterial {
@@ -185,12 +207,14 @@ impl OceanMaterial {
                 count: source.len() as u32,
                 time: time as f32,
                 significant_height: sea.state().significant_height as f32,
+                trail_count: 0,
                 deep: Vec3::new(0.004, 0.022, 0.045),
                 shallow: Vec3::new(0.055, 0.200, 0.180),
                 sun: crate::sky::SUN.normalize().extend(0.0),
                 motion: Vec4::ZERO,
             },
             waves,
+            trail: [TrailPoint::default(); MAX_TRAIL],
         }
     }
 
@@ -207,15 +231,46 @@ impl OceanMaterial {
         self.sea.time = time as f32;
     }
 
-    /// Tells the water where the boat is and how fast it is going over the
-    /// ground, so the wake is drawn from the stern along the track.
+    /// Tells the water where the stern is now, how fast it is going over the
+    /// ground, and — when it has moved far enough — adds where it was to the
+    /// trail the wake is drawn along.
+    ///
+    /// The wake has to stay on the water. Drawing it from the boat's *current*
+    /// position and velocity, which is what this did first, made a straight
+    /// band that swung with every yaw of the hull like a searchlight, and a
+    /// viewer saw at once that it was attached to the boat rather than left
+    /// behind on the sea. So the stern's track is recorded, a point every metre
+    /// of travel, oldest first, and the shader draws foam along the recorded
+    /// polyline with the age of each point taken from the clock it was recorded
+    /// at. The buffer is a queue: when it is full the oldest point falls off,
+    /// which is also the one the wake has long since faded at.
     ///
     /// Render-plane coordinates: `stern` is the body origin, which the engine
     /// puts on the aft perpendicular, and `velocity` the horizontal part of the
     /// world velocity. Both come through `frame::to_render`, so the wake cannot
     /// lie on the mirror image of the track.
-    pub fn set_motion(&mut self, stern: Vec3, velocity: Vec3) {
+    pub fn record(&mut self, stern: Vec3, velocity: Vec3, time: f64) {
+        /// Metres of travel between recorded points: fine enough that a turn
+        /// is a curve and not a corner, coarse enough that sixty-four points
+        /// outlast the wake.
+        const SPACING: f32 = 1.0;
+
         self.sea.motion = Vec4::new(stern.x, stern.z, velocity.x, velocity.z);
+        let here = Vec2::new(stern.x, stern.z);
+        let count = self.sea.trail_count as usize;
+        let newest = (count > 0).then(|| self.trail[count - 1].point.xy());
+        if newest.is_some_and(|last| last.distance(here) < SPACING) {
+            return;
+        }
+        if count == MAX_TRAIL {
+            self.trail.copy_within(1.., 0);
+        } else {
+            self.sea.trail_count += 1;
+        }
+        let slot = self.sea.trail_count as usize - 1;
+        self.trail[slot] = TrailPoint {
+            point: Vec4::new(here.x, here.y, time as f32, 0.0),
+        };
     }
 }
 
@@ -246,14 +301,15 @@ impl Material for OceanMaterial {
         embedded_shader!("shaders/ocean.wgsl")
     }
 
-    /// Sizes the shader's wave array from [`MAX_WAVES`].
+    /// Sizes the shader's wave and trail arrays from [`MAX_WAVES`] and
+    /// [`MAX_TRAIL`].
     ///
-    /// The array length is a compile-time constant in WGSL, and writing it as a
-    /// literal in the shader would leave two copies of one number that only a
-    /// mismatched picture could tell apart. A shader def pushed here reaches
-    /// `ocean.wgsl` as `#{MAX_WAVES}`, the same mechanism Bevy uses for
-    /// `MATERIAL_BIND_GROUP`, and both stages get it because both declare the
-    /// binding.
+    /// The array lengths are compile-time constants in WGSL, and writing them
+    /// as literals in the shader would leave two copies of one number that only
+    /// a mismatched picture could tell apart. Shader defs pushed here reach
+    /// `ocean.wgsl` as `#{MAX_WAVES}` and `#{MAX_TRAIL}`, the same mechanism
+    /// Bevy uses for `MATERIAL_BIND_GROUP`, and both stages get them because
+    /// both declare the bindings.
     ///
     /// No prepass override, on purpose. The prepass and shadow passes would need
     /// the same displacement as the visible pass, but neither runs for this
@@ -269,9 +325,12 @@ impl Material for OceanMaterial {
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         let waves = ShaderDefVal::UInt("MAX_WAVES".into(), MAX_WAVES as u32);
+        let trail = ShaderDefVal::UInt("MAX_TRAIL".into(), MAX_TRAIL as u32);
         descriptor.vertex.shader_defs.push(waves.clone());
+        descriptor.vertex.shader_defs.push(trail.clone());
         if let Some(fragment) = &mut descriptor.fragment {
             fragment.shader_defs.push(waves);
+            fragment.shader_defs.push(trail);
         }
         Ok(())
     }
