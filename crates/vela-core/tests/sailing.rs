@@ -321,6 +321,12 @@ fn the_lofted_hull_is_very_nearly_symmetric() {
          which is worse than the 0.8 mm this hull is known to have"
     );
     assert!(
+        offset > 1e-4,
+        "the upright centre of buoyancy is {offset} m off the centreline: the \
+         lofting asymmetry this test tracks has been fixed, so tighten the \
+         bound above and drop this one"
+    );
+    assert!(
         upright.buoyancy.force.y.abs() < 1e-6,
         "an upright symmetric hull must produce no athwartships force"
     );
@@ -329,16 +335,19 @@ fn the_lofted_hull_is_very_nearly_symmetric() {
 /// Heel spills wind out of the rig, and the correction that does it is the one
 /// the source prescribes. Without it the same boat solves to far more heel.
 ///
-/// Asserted through the apparent wind rather than through a heel angle: at a
-/// solved condition with real heel, the apparent wind angle the rig sees must
-/// differ from the one a horizontal-plane resolution would give.
+/// Asserted through the apparent wind: the rig's angle is rebuilt from the
+/// along-hull component and the athwartships one scaled by `cos φ`, so it must
+/// sit *forward* of the horizontal-plane angle by an amount that heel sets. An
+/// earlier version of this test only asked that the angle be less than the true
+/// wind's, which boat speed alone guarantees, so it passed with the correction
+/// deleted. This one recovers the horizontal-plane angle from the published
+/// pair and the heel, and asks for the gap.
 #[test]
 fn the_rig_feels_the_heeled_apparent_wind() {
     let mut sim = sailing(MODERATE_WIND, 40.0, 1.0, 1.0);
     let solution = solve(&mut sim).expect("must converge");
-
-    let angle = sim
-        .telemetry()
+    let telemetry = sim.telemetry();
+    let angle = telemetry
         .get("aero.apparent_wind.angle")
         .expect("the aero module must publish the apparent wind angle");
 
@@ -346,17 +355,25 @@ fn the_rig_feels_the_heeled_apparent_wind() {
         solution.heel.abs() > 0.1,
         "this condition must have real heel for the test to mean anything"
     );
-    // The correction scales the athwartships component by cos(heel), which
-    // always moves the apparent wind *forward*, towards the bow.
-    assert!(
-        angle.abs() > 0.0,
-        "the apparent wind must be off the bow, not dead ahead"
+    // The horizontal-plane angle, built independently from the true wind and
+    // the boat's world velocity. Yaw is held at zero in this rig, so the bow
+    // points north and starboard is east; the wind is named by where it comes
+    // from, and `UniformWind::velocity_at` negates it.
+    let true_wind = nalgebra::Vector2::new(
+        -MODERATE_WIND * 40.0_f64.to_radians().cos(),
+        -MODERATE_WIND * 40.0_f64.to_radians().sin(),
     );
+    let boat = solution.state.world_velocity().xy();
+    let from = -(true_wind - boat);
+    let horizontal = from.y.atan2(from.x);
+    let gap = horizontal.abs() - angle.abs();
     assert!(
-        angle.abs() < 40.0_f64.to_radians(),
-        "heel and boat speed must both bring the apparent wind forward of the \
-         true wind angle, got {} deg",
-        angle.to_degrees()
+        gap > 0.5_f64.to_radians(),
+        "heel must bring the apparent wind forward of the horizontal-plane angle: \
+         published {:.2} deg against {:.2} deg at {:.1} deg of heel",
+        angle.to_degrees(),
+        horizontal.to_degrees(),
+        solution.heel.to_degrees()
     );
 }
 
@@ -997,20 +1014,11 @@ fn motion_of(
 /// compile in a different crate with an error pointing at the wrong place.
 ///
 /// Written as a compile-time check rather than a runtime one: if this file
-/// compiles, the property holds.
+/// compiles, the property holds. There is nothing to run — an earlier version
+/// also spawned a thread and asserted an incidental default of the rig it had
+/// built, which tested neither the bound nor the default.
 #[test]
 fn a_simulation_can_be_sent_between_threads() {
     fn portable<T: Send + Sync>() {}
     portable::<Sim>();
-
-    // And the assembled article, not just the type: a `Box<dyn Environment>`
-    // built from a seaway is the case that actually has to satisfy it.
-    let sim = sailing(MODERATE_WIND, 40.0, 1.0, 1.0);
-    let moved = std::thread::spawn(move || sim.captive())
-        .join()
-        .expect("the thread");
-    assert!(
-        !moved.surge,
-        "the velocity prediction rig leaves surge free"
-    );
 }
