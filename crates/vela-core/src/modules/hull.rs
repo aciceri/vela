@@ -46,8 +46,9 @@
 //!   memory of the hull's own wake.
 //! - **The envelope is not checked here.** A hull outside the series' parameter
 //!   range makes these polynomials diverge; see
-//!   [`HullParameters::check_envelope`], which the boat-loading path is the
-//!   right place to call.
+//!   [`HullParameters::check_envelope`], which `assembly::sailing_modules`
+//!   calls before building this module, so that an out-of-range hull is refused
+//!   rather than sailed on an extrapolation.
 
 use crate::dsyhs::{hull_resistance, HullParameters, HullResistance as ResistanceComponents};
 use crate::sim::{ForceModule, StepCtx};

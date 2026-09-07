@@ -400,6 +400,25 @@ pub enum SpecError {
         station: usize,
     },
     Mass(MassError),
+    /// A foil dimension that makes no planform: a zero span or a zero total
+    /// chord gives zero area, and the aspect ratio of zero area is `NaN`, which
+    /// would then be every lateral force from the first step.
+    NonPositiveFoil {
+        foil: &'static str,
+        name: &'static str,
+        value: f64,
+    },
+    /// The keel's centre of buoyancy is not on the keel.
+    KeelCentreOffKeel {
+        height: f64,
+        span: f64,
+    },
+    /// A layout position is off the hull.
+    LayoutOffHull {
+        name: &'static str,
+        value: f64,
+        length: f64,
+    },
 }
 
 impl fmt::Display for SpecError {
@@ -444,6 +463,21 @@ impl fmt::Display for SpecError {
                 write!(f, "station {station} has zero extent")
             }
             Self::Mass(error) => write!(f, "{error}"),
+            Self::NonPositiveFoil { foil, name, value } => {
+                write!(f, "{foil} {name} must be positive, got {value}")
+            }
+            Self::KeelCentreOffKeel { height, span } => write!(
+                f,
+                "keel_cb_height {height} is not within the keel's span of {span}"
+            ),
+            Self::LayoutOffHull {
+                name,
+                value,
+                length,
+            } => write!(
+                f,
+                "layout {name} = {value} m is not within the hull's {length} m of stations"
+            ),
         }
     }
 }
@@ -500,6 +534,17 @@ impl BoatSpec {
         if let Some(parameters) = &self.parameters {
             parameters.validate()?;
         }
+        if let Some(appendages) = &self.appendages {
+            appendages.validate()?;
+        }
+        if let Some(layout) = &self.layout {
+            // Positions are checked against the station extent when there
+            // are stations to check against; a parameters-only boat has no
+            // hull length in the same datum, and its layout goes unchecked
+            // rather than checked against the wrong number.
+            let extent = self.hull.as_ref().map(HullSpec::length);
+            layout.validate(extent)?;
+        }
         self.mass_properties()?;
         Ok(())
     }
@@ -550,8 +595,10 @@ impl ParametersSpec {
     ///
     /// Only positivity is checked here. Whether the hull falls inside the range
     /// of models the DSYHS regressions were fitted to is a separate question
-    /// with a separate answer — see `dsyhs::HullParameters::check_envelope` —
-    /// because a hull can be perfectly real and still outside the series.
+    /// with a separate answer — `dsyhs::HullParameters::check_envelope`, which
+    /// the sailing assembly asks before it will sail the boat — because a hull
+    /// can be perfectly real and still outside the series, and a file is
+    /// allowed to describe one.
     ///
     /// # Errors
     ///
@@ -570,6 +617,101 @@ impl ParametersSpec {
         for (name, value) in checks {
             if !value.is_finite() || value <= 0.0 {
                 return Err(SpecError::NonPositiveParameter { name, value });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FoilSpec {
+    /// Rejects a planform with no area.
+    ///
+    /// A tip chord of zero is a legitimate pointed foil and is allowed; a root
+    /// chord or span of zero is not a foil. Sweep is an angle and any finite
+    /// value is a planform.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecError::NonPositiveFoil`] for the first offending value.
+    pub fn validate(&self, foil: &'static str) -> Result<(), SpecError> {
+        let checks = [
+            ("root_chord", self.root_chord, true),
+            ("tip_chord", self.tip_chord, false),
+            ("span", self.span, true),
+        ];
+        for (name, value, strict) in checks {
+            if !value.is_finite() || value < 0.0 || (strict && value == 0.0) {
+                return Err(SpecError::NonPositiveFoil { foil, name, value });
+            }
+        }
+        if !self.sweep_deg.is_finite() {
+            return Err(SpecError::NonPositiveFoil {
+                foil,
+                name: "sweep_deg",
+                value: self.sweep_deg,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl AppendagesSpec {
+    /// Rejects foils that make no planform and a keel volume that is not one.
+    ///
+    /// These are the values that would otherwise reach the force model as
+    /// `NaN` — an aspect ratio of zero area, the cube root of a negative
+    /// volume — and `NaN` in a force is every subsequent number.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecError::NonPositiveFoil`] or [`SpecError::KeelCentreOffKeel`].
+    pub fn validate(&self) -> Result<(), SpecError> {
+        self.keel.validate("keel")?;
+        self.rudder.validate("rudder")?;
+        if !self.keel_volume.is_finite() || self.keel_volume <= 0.0 {
+            return Err(SpecError::NonPositiveFoil {
+                foil: "keel",
+                name: "keel_volume",
+                value: self.keel_volume,
+            });
+        }
+        if !self.keel_cb_height.is_finite()
+            || self.keel_cb_height < 0.0
+            || self.keel_cb_height > self.keel.span
+        {
+            return Err(SpecError::KeelCentreOffKeel {
+                height: self.keel_cb_height,
+                span: self.keel.span,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl LayoutSpec {
+    /// Rejects positions that are not on the hull.
+    ///
+    /// `extent` is the length the stations span, when the file has stations;
+    /// without it only finiteness and sign are checked, because the layout's
+    /// datum is the aft perpendicular of those stations and there is no other
+    /// number in the file measured from it.
+    ///
+    /// # Errors
+    ///
+    /// [`SpecError::LayoutOffHull`] for the first position off the hull.
+    pub fn validate(&self, extent: Option<f64>) -> Result<(), SpecError> {
+        let length = extent.unwrap_or(f64::INFINITY);
+        for (name, value) in [
+            ("keel_at", self.keel_at),
+            ("rudder_at", self.rudder_at),
+            ("mast_at", self.mast_at),
+        ] {
+            if !value.is_finite() || value < 0.0 || value > length {
+                return Err(SpecError::LayoutOffHull {
+                    name,
+                    value,
+                    length,
+                });
             }
         }
         Ok(())
@@ -756,6 +898,87 @@ mod tests {
         assert!(matches!(
             BoatSpec::parse_ron(&text),
             Err(SpecError::Mass(_))
+        ));
+    }
+
+    /// The fixture with the blocks the sailing assembly reads, so that the
+    /// validators for them can be exercised by a single substitution each.
+    const WITH_FOILS: &str = r#"#![enable(implicit_some)]
+        (
+            schema_version: 1,
+            name: "test",
+            hull: (
+                stations: [
+                    (x: 0.0, points: [(y: 0.0, z: 0.0), (y: 1.0, z: 1.0)]),
+                    (x: 2.0, points: [(y: 0.0, z: 0.0), (y: 1.0, z: 1.0)]),
+                ],
+            ),
+            appendages: (
+                keel: (root_chord: 1.0, tip_chord: 0.8, span: 1.5, sweep_deg: 5.0),
+                rudder: (root_chord: 0.5, tip_chord: 0.3, span: 1.0, sweep_deg: 10.0),
+                keel_volume: 0.3,
+                keel_cb_height: 0.7,
+            ),
+            layout: (keel_at: 1.2, rudder_at: 0.2, mast_at: 1.3),
+            mass: (
+                displacement_kg: 1000.0,
+                cog: (x: 1.0, y: 0.0, z: 0.5),
+                gyradii: (rx: 0.5, ry: 1.0, rz: 1.0),
+            ),
+        )
+    "#;
+
+    /// A zero span passed validation once and reached the lift model as an
+    /// aspect ratio of `0 / 0`, which made every lateral force `NaN` from the
+    /// first step. These are the substitutions that used to load.
+    #[test]
+    fn rejects_foils_that_make_no_planform() {
+        BoatSpec::parse_ron(WITH_FOILS).expect("the fixture itself is valid");
+        for (from, to, expected) in [
+            ("span: 1.5", "span: 0.0", "keel span"),
+            ("root_chord: 0.5", "root_chord: 0.0", "rudder root_chord"),
+            ("keel_volume: 0.3", "keel_volume: -0.3", "keel keel_volume"),
+        ] {
+            let text = WITH_FOILS.replacen(from, to, 1);
+            let error = BoatSpec::parse_ron(&text).expect_err(expected);
+            assert!(
+                matches!(error, SpecError::NonPositiveFoil { .. }),
+                "{expected}: {error}"
+            );
+        }
+        // A pointed foil is a foil.
+        let pointed = WITH_FOILS.replacen("tip_chord: 0.8", "tip_chord: 0.0", 1);
+        BoatSpec::parse_ron(&pointed).expect("a zero tip chord is a legitimate planform");
+    }
+
+    #[test]
+    fn rejects_a_keel_centre_off_the_keel() {
+        let text = WITH_FOILS.replacen("keel_cb_height: 0.7", "keel_cb_height: 1.6", 1);
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::KeelCentreOffKeel { .. })
+        ));
+    }
+
+    /// The layout is measured forward from the aft perpendicular; a position
+    /// past the stations is a lever arm the hull does not have.
+    #[test]
+    fn rejects_a_layout_off_the_hull() {
+        let text = WITH_FOILS.replacen("rudder_at: 0.2", "rudder_at: -0.2", 1);
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::LayoutOffHull {
+                name: "rudder_at",
+                ..
+            })
+        ));
+        let text = WITH_FOILS.replacen("mast_at: 1.3", "mast_at: 2.5", 1);
+        assert!(matches!(
+            BoatSpec::parse_ron(&text),
+            Err(SpecError::LayoutOffHull {
+                name: "mast_at",
+                ..
+            })
         ));
     }
 

@@ -74,6 +74,11 @@ pub enum AssemblyError {
     Radiation(MemoryError),
     /// The lofted hull produced no triangles.
     DegenerateHull,
+    /// The hull form is outside the range the DSYHS regressions were fitted
+    /// to, so sailing it would run the resistance polynomials extrapolated —
+    /// which they do silently and catastrophically. The file itself is fine
+    /// and loads; it is *sailing* it on this resistance model that is refused.
+    OutsideDsyhsEnvelope(crate::dsyhs::EnvelopeError),
 }
 
 impl fmt::Display for AssemblyError {
@@ -104,6 +109,11 @@ impl fmt::Display for AssemblyError {
             Self::DegenerateHull => {
                 write!(f, "the hull offsets lofted to an empty mesh")
             }
+            Self::OutsideDsyhsEnvelope(error) => write!(
+                f,
+                "{error}; the resistance regressions would be extrapolated, which they \
+                 do silently and wrongly, so this hull cannot be sailed on them"
+            ),
         }
     }
 }
@@ -179,7 +189,9 @@ pub fn velocity_prediction_sim(
 ///
 /// # Errors
 ///
-/// [`AssemblyError`] naming the block of the boat file that is missing.
+/// [`AssemblyError`] naming the block of the boat file that is missing, or
+/// [`AssemblyError::OutsideDsyhsEnvelope`] for a hull the regressions cannot
+/// be trusted on.
 fn sailing_modules(
     spec: &BoatSpec,
     mesh: crate::geometry::TriMesh,
@@ -187,6 +199,14 @@ fn sailing_modules(
     let parameters = spec
         .hull_parameters()
         .ok_or(AssemblyError::MissingParameters)?;
+    // The gate the design promised and the hull module says belongs here:
+    // a form outside the series is refused before a single polynomial runs
+    // on it. `vela-cli hull` reports the same check as a diagnostic without
+    // refusing, which is the right split — a file is allowed to describe a
+    // hull the regressions cannot sail.
+    parameters
+        .check_envelope()
+        .map_err(AssemblyError::OutsideDsyhsEnvelope)?;
     let appendages = spec.appendages.ok_or(AssemblyError::MissingAppendages)?;
     let rig = spec.rig.ok_or(AssemblyError::MissingRig)?;
 

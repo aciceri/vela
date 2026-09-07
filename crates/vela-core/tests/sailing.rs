@@ -29,7 +29,7 @@
 
 use approx::assert_relative_eq;
 use vela_core::aero::SailSet;
-use vela_core::assembly::{sailing_sim, velocity_prediction_sim, RadiationOptions};
+use vela_core::assembly::{sailing_sim, velocity_prediction_sim, AssemblyError, RadiationOptions};
 use vela_core::boat::Aerodynamics;
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
 use vela_core::seaway::SeaState;
@@ -77,6 +77,34 @@ fn solve(sim: &mut Sim) -> Result<Equilibrium, String> {
         ..EquilibriumOptions::default()
     };
     equilibrium::solve(sim, WATERLINE_LENGTH, &options).map_err(|error| error.to_string())
+}
+
+/// A hull outside the DSYHS envelope loads but does not sail.
+///
+/// The design says refusing is a feature, because the regressions extrapolate
+/// silently; until the review that found it, nothing on the sailing path called
+/// the check, and a prismatic of 0.63 sailed on polynomials fitted to 0.52–0.60.
+/// The file is still accepted — it describes a real hull — and `vela-cli hull`
+/// still reports the same check as a diagnostic. It is the assembly that
+/// refuses, which is where the polynomials are about to run.
+#[test]
+fn a_hull_outside_the_dsyhs_envelope_loads_but_does_not_sail() {
+    let text = SPEC.replacen("prismatic: 0.5707", "prismatic: 0.63", 1);
+    let spec = BoatSpec::parse_ron(&text).expect("the file describes a real hull");
+    let environment = StillWater::new(UniformWind::uniform(MODERATE_WIND, 0.7));
+    let Err(refused) = velocity_prediction_sim(
+        &spec,
+        Box::new(environment),
+        Controls::close_hauled(SailSet::upwind()),
+        &LoftOptions::default(),
+    ) else {
+        panic!("a prismatic of 0.63 is outside the series and must be refused");
+    };
+    assert!(
+        matches!(refused, AssemblyError::OutsideDsyhsEnvelope(_)),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("Cp"), "{refused}");
 }
 
 #[test]
