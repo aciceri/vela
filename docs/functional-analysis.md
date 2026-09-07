@@ -1267,6 +1267,32 @@ Unsteady lift effects during fast maneuvers (transient circulation buildup,
 Wagner-type lag) are documented as a known simplification; quasi-steady is
 acceptable at yacht time scales [[Modeling transient lift 2019]](#bib-transient).
 
+#### 5.4a Each foil in its own flow
+
+`modules::lateral` samples the local flow at the keel and at the rudder
+separately, and `appendages::FlowState` carries both. Until the review that
+found it, the rudder was fed the keel's inflow with a comment calling the
+difference "a few per cent of a damping moment" — true when both foils sat at
+`x = 0`, false once `layout` put them 5.1 m apart. Under a yaw rate the rudder is
+swept sideways ten times harder than the keel, so a rudder on the keel's angle
+contributes a tenth of the yaw damping it should.
+
+Measured on a 90 s calm release with all six free at the balanced helm:
+
+| TWS | worst yaw rate, before | after | worst heading excursion, before | after |
+|---|---|---|---|---|
+| 4 m/s | 0.054 rad/s | 0.028 | 21.1° | 14.9° |
+| 5 m/s | 0.088 rad/s | 0.059 | 26.2° | 21.3° |
+
+The yaw rate halves. No steady number moves: at equilibrium `r = 0` and the two
+inflows coincide, so the polar, the balanced helm and every published-oracle
+comparison are unchanged — including the helm at the limit in a strong breeze,
+which is the keel stall (§5.4) and not this. What the release also shows is a
+standing offset of eight to nine degrees and a third of the speed lost between
+the velocity-prediction condition (trim held) and the free boat (trim not
+balanced): that is §5.5a's missing line of action for the resistance, unchanged
+here.
+
 ### 5.5 Buoyancy and wave excitation — mesh clipping
 
 Per frame, on the actual hull triangle mesh (2–5k triangles):

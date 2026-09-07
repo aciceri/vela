@@ -129,11 +129,11 @@ pub struct LateralSystem {
     /// and publishing zeros would be indistinguishable from a boat that really
     /// is generating no side force.
     last: Option<AppendageForces>,
-    /// The inflow the foils were given, kept so that its angle can be
-    /// published. That angle is what says whether the linear lift model was
-    /// being used inside its validity or outside it, and it is not recoverable
-    /// from the forces alone.
-    last_inflow: Option<LocalFlow>,
+    /// The inflows the keel and the rudder were given, kept so that their
+    /// angles can be published. The keel's angle is what says whether the
+    /// linear lift model was being used inside its validity or outside it, and
+    /// it is not recoverable from the forces alone.
+    last_inflow: Option<(LocalFlow, LocalFlow)>,
 }
 
 impl LateralSystem {
@@ -198,32 +198,36 @@ impl ForceModule for LateralSystem {
     }
 
     fn step(&mut self, ctx: &StepCtx<'_>) -> Wrench {
-        // The flow the KEEL is in, not the flow the body origin is in.
+        // The flow each FOIL is in, not the flow the body origin is in.
         //
-        // This is what makes roll damped. A rolling keel sweeps sideways
-        // through the water, and the angle of attack that produces is lift, and
-        // that lift is a moment opposing the roll — the dominant damping of a
-        // keelboat's roll, obtained from the transcribed lift model without a
-        // single new coefficient. Reading the flow at the origin instead leaves
-        // roll with no damping at all, while the sails have theirs, because the
-        // aerodynamic side samples the wind at its own centre of effort.
+        // This is what makes roll damped and the course stable. A rolling keel
+        // sweeps sideways through the water, and the angle of attack that
+        // produces is lift, and that lift is a moment opposing the roll — the
+        // dominant damping of a keelboat's roll, obtained from the transcribed
+        // lift model without a single new coefficient. Reading the flow at the
+        // origin instead leaves roll with no damping at all, while the sails
+        // have theirs, because the aerodynamic side samples the wind at its own
+        // centre of effort.
         //
-        // **Approximation, stated:** the rudder is given the keel's inflow,
-        // because [`appendage_forces`] takes one flow state and owns the
-        // keel-then-rudder ordering that must not be duplicated. The two foils
-        // differ only in depth — here about 0.95 m against 1.3 m — so the
-        // rudder's roll-induced inflow is overstated by roughly a third of a
-        // term that is itself a tenth of the side force. The exact form needs a
-        // per-foil inflow through that function's signature, which is a change
-        // to a validated module for a few per cent of a damping moment.
-        let inflow = ctx.local_flow_at(self.keel_at);
+        // The rudder gets its own sample for the same reason, and it matters
+        // more there. Under a yaw rate a foil abaft the centre of gravity is
+        // swept sideways in proportion to its arm; the rudder's arm is ten
+        // times the keel's, so a rudder fed the keel's inflow — which is what
+        // this module did once — sees a tenth of the angle it is actually at,
+        // and the boat has next to no course stability. That was measured as a
+        // balanced helm at the limit and a free helm that wandered; the fix was
+        // this sample and nothing else.
+        let keel_inflow = ctx.local_flow_at(self.keel_at);
+        let rudder_inflow = ctx.local_flow_at(self.rudder_at);
         let flow = FlowState {
             // Local speed rather than boat speed also reaches the keel's
             // residuary resistance, which wants boat speed. The two differ by
             // the square of a small angle — a per cent at a violent roll rate,
             // on a term worth tens of newtons.
-            speed: inflow.speed,
-            leeway: inflow.angle,
+            speed: keel_inflow.speed,
+            leeway: keel_inflow.angle,
+            rudder_speed: rudder_inflow.speed,
+            rudder_leeway: rudder_inflow.angle,
             heel: ctx.heel(),
             rudder_angle: ctx.controls.rudder_angle,
         };
@@ -240,7 +244,7 @@ impl ForceModule for LateralSystem {
             ctx.env.gravity(),
         );
         self.last = Some(forces);
-        self.last_inflow = Some(inflow);
+        self.last_inflow = Some((keel_inflow, rudder_inflow));
 
         // Positive leeway lifts to starboard, which is `+y`: the appendage
         // model and `StepCtx` share that convention, so the sign of the force
@@ -281,13 +285,17 @@ impl ForceModule for LateralSystem {
             return;
         };
 
-        // The inflow the foils were actually given. `lateral.inflow.angle` is
+        // The inflows the foils were actually given. `lateral.inflow.angle` is
         // the number that says whether the linear lift model was inside its
         // validity: a few degrees is sailing, tens of degrees is a stalled foil
         // being modelled as an unstalled one. See the module documentation.
-        if let Some(inflow) = self.last_inflow {
-            out.set("lateral.inflow.speed", inflow.speed);
-            out.set("lateral.inflow.angle", inflow.angle);
+        // The rudder's is published beside it because the two differ under a
+        // rate, and that difference is the yaw damping at work.
+        if let Some((keel, rudder)) = self.last_inflow {
+            out.set("lateral.inflow.speed", keel.speed);
+            out.set("lateral.inflow.angle", keel.angle);
+            out.set("lateral.rudder.inflow.speed", rudder.speed);
+            out.set("lateral.rudder.inflow.angle", rudder.angle);
         }
 
         out.set("lateral.keel.side_force", forces.keel_side_force);
@@ -733,25 +741,45 @@ mod tests {
         );
     }
 
-    /// A yaw rate reaches the foils too, through their longitudinal offsets,
-    /// and damps yaw for the same reason.
+    /// A yaw rate reaches the foils through their longitudinal offsets, and
+    /// damps yaw for the same reason a roll rate damps roll.
     ///
-    /// Not exercised by the assembled simulation, which places both foils at
-    /// `x = 0` because the boat format carries no longitudinal positions — but
-    /// the mechanism is here and works, so the day those positions arrive yaw
-    /// damping arrives with them rather than needing to be added.
+    /// The rudder must carry most of it. Its arm here is more than twenty times
+    /// the keel's, so under a pure yaw rate it is swept sideways twenty times
+    /// harder; a rudder fed the keel's inflow — which this module did once —
+    /// contributes a twentieth of what it should, and the assertion on the
+    /// share is what tells that regression from a working module. The keel's
+    /// small arm still gives it a small share, so the test asks for "most",
+    /// not "all".
     #[test]
-    fn a_yaw_rate_is_damped_through_the_foils_lever_arms() {
+    fn a_yaw_rate_is_damped_mostly_by_the_rudder() {
         let yawing = BodyState {
             velocity: Vector3::new(SPEED, 0.0, 0.0),
             angular_velocity: Vector3::new(0.0, 0.0, 0.3),
             ..BodyState::default()
         };
-        let (wrench, _) = run(&yawing, 0.0);
+        let (wrench, telemetry) = run(&yawing, 0.0);
         assert!(
             wrench.moment.z < 0.0,
             "a boat turning to starboard must be resisted, got {}",
             wrench.moment.z
+        );
+
+        // The rudder, abaft the origin, is swept to port by a starboard yaw
+        // rate. The flow then comes from port, which is a positive angle in the
+        // `atan2(-sway, surge)` convention, and much larger than the keel's.
+        let keel_angle = published(&telemetry, "lateral.inflow.angle");
+        let rudder_angle = published(&telemetry, "lateral.rudder.inflow.angle");
+        assert!(
+            rudder_angle > 0.0 && rudder_angle > 10.0 * keel_angle.abs(),
+            "the rudder must see the yaw rate through its own arm: keel {keel_angle}, rudder {rudder_angle}"
+        );
+
+        let keel_moment = published(&telemetry, "lateral.keel.side_force") * KEEL_AT.x;
+        let rudder_moment = published(&telemetry, "lateral.rudder.side_force") * RUDDER_AT.x;
+        assert!(
+            rudder_moment.abs() > 2.0 * keel_moment.abs(),
+            "the rudder must carry most of the yaw damping: keel {keel_moment} N.m, rudder {rudder_moment} N.m"
         );
     }
 }

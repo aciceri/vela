@@ -283,18 +283,55 @@ impl std::error::Error for FroudeEnvelopeError {}
 /// Grouped into a struct only for [`appendage_forces`], which would otherwise
 /// take nine positional arguments. The component functions below take their
 /// scalars directly so each formula can be exercised on its own.
+///
+/// # Two inflows, not one
+///
+/// The keel and the rudder are given their own local speed and angle. In steady
+/// sailing the two are the same flow — [`FlowState::uniform`] says so in one
+/// call — but under a yaw rate they are not, and the difference is the whole of
+/// the rudder's yaw damping. With the keel half a metre abaft the centre of
+/// gravity and the rudder five metres abaft it, a yaw rate `r` gives the keel a
+/// sway of about `0.5 r` and the rudder about `5 r`, opposite in sign and ten
+/// times larger. A rudder fed the keel's angle contributes nothing to course
+/// stability, which is exactly the thing a fin-keel yacht relies on its rudder
+/// for. See `modules::lateral` for where the two inflows come from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowState {
-    /// Boat speed through the water, m/s. The rudder sees
-    /// [`RUDDER_WAKE_FRACTION`] of it.
+    /// Speed of the flow at the keel, m/s. This is boat speed in steady
+    /// sailing, and reaches the keel's residuary resistance as such.
     pub speed: f64,
-    /// Leeway angle, radians (`β`). This is the keel's angle of attack.
+    /// Angle of the flow at the keel, radians (`β`): the keel's angle of
+    /// attack before downwash, which the keel has none of.
     pub leeway: f64,
+    /// Speed of the undisturbed flow at the rudder, m/s. The rudder sees
+    /// [`RUDDER_WAKE_FRACTION`] of it.
+    pub rudder_speed: f64,
+    /// Angle of the flow at the rudder, radians, before the keel's downwash
+    /// and the helm are applied.
+    pub rudder_leeway: f64,
     /// Heel angle, radians (`φ`).
     pub heel: f64,
     /// Rudder angle, radians (`δ_r`), positive in the same sense as leeway so
     /// that it adds to the rudder's angle of attack.
     pub rudder_angle: f64,
+}
+
+impl FlowState {
+    /// A flow that is the same at both foils: steady sailing, no rotation.
+    ///
+    /// This is the case every figure in the book is drawn for, and the one the
+    /// tests exercise the component formulas in.
+    #[must_use]
+    pub fn uniform(speed: f64, leeway: f64, heel: f64, rudder_angle: f64) -> Self {
+        Self {
+            speed,
+            leeway,
+            rudder_speed: speed,
+            rudder_leeway: leeway,
+            heel,
+            rudder_angle,
+        }
+    }
 }
 
 /// Appendage forces broken into the components the figures produce, N.
@@ -605,11 +642,14 @@ pub fn appendage_forces(
     gravity: f64,
 ) -> AppendageForces {
     // The rudder sits in the wake of hull and keel; every dynamic pressure it
-    // sees is built on this speed, not on boat speed.
-    let rudder_speed = RUDDER_WAKE_FRACTION * flow.speed;
+    // sees is built on this speed, not on boat speed. The speed is the flow at
+    // the rudder's own position, which differs from the keel's under a rate.
+    let rudder_speed = RUDDER_WAKE_FRACTION * flow.rudder_speed;
 
+    // The downwash is the keel's, set by the keel's own angle of attack, and
+    // it is applied to the flow the rudder is actually in.
     let downwash_angle = keel_downwash_angle(&keel.planform, flow.leeway, flow.heel);
-    let rudder_alpha = flow.leeway - downwash_angle + flow.rudder_angle;
+    let rudder_alpha = flow.rudder_leeway - downwash_angle + flow.rudder_angle;
 
     let keel_side_force = side_force(
         &keel.planform,

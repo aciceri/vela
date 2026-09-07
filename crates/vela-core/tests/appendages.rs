@@ -104,12 +104,7 @@ fn yd41_keel_with_implied_lever() -> Keel {
 /// amidships. Chosen so the rudder carries a real load from leeway alone,
 /// which is what makes the downwash tests bite.
 fn upwind() -> FlowState {
-    FlowState {
-        speed: speed(),
-        leeway: 4.0_f64.to_radians(),
-        heel: 20.0_f64.to_radians(),
-        rudder_angle: 0.0,
-    }
+    FlowState::uniform(speed(), 4.0_f64.to_radians(), 20.0_f64.to_radians(), 0.0)
 }
 
 fn upwind_forces() -> AppendageForces {
@@ -413,12 +408,12 @@ fn side_force_vanishes_at_zero_leeway_and_grows_with_it() {
             &hull,
             &keel,
             &rudder,
-            &FlowState {
-                speed: speed(),
-                leeway: leeway_degrees.to_radians(),
-                heel: 20.0_f64.to_radians(),
-                rudder_angle: 0.0,
-            },
+            &FlowState::uniform(
+                speed(),
+                leeway_degrees.to_radians(),
+                20.0_f64.to_radians(),
+                0.0,
+            ),
             DENSITY,
             GRAVITY,
         )
@@ -459,12 +454,12 @@ fn side_force_falls_off_with_heel() {
             &hull,
             &keel,
             &rudder,
-            &FlowState {
-                speed: speed(),
-                leeway: 4.0_f64.to_radians(),
-                heel: heel_degrees.to_radians(),
-                rudder_angle: 0.0,
-            },
+            &FlowState::uniform(
+                speed(),
+                4.0_f64.to_radians(),
+                heel_degrees.to_radians(),
+                0.0,
+            ),
             DENSITY,
             GRAVITY,
         )
@@ -504,12 +499,7 @@ fn induced_resistance_grows_as_the_square_of_side_force() {
             &hull,
             &keel_body,
             &rudder,
-            &FlowState {
-                speed: speed(),
-                leeway: degrees.to_radians(),
-                heel,
-                rudder_angle: 0.0,
-            },
+            &FlowState::uniform(speed(), degrees.to_radians(), heel, 0.0),
             DENSITY,
             GRAVITY,
         )
@@ -746,12 +736,7 @@ fn helm_adds_to_the_rudder_angle_of_attack() {
         &hull,
         &keel_body,
         &rudder,
-        &FlowState {
-            speed: speed(),
-            leeway,
-            heel,
-            rudder_angle: helm,
-        },
+        &FlowState::uniform(speed(), leeway, heel, helm),
         DENSITY,
         GRAVITY,
     );
