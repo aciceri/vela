@@ -473,7 +473,7 @@ impl SectionSolver {
                 let shifted = 2.0 * m as f64 + 2.0 * n as f64 - 1.0;
                 series += (order / shifted) * coefficient;
             }
-            let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
             frequency_ratio * sign * series
         };
 
@@ -713,7 +713,7 @@ impl SectionSolver {
                 let order = 2.0 * n as f64 - 1.0;
                 series += (order / (2 * m + 2 * n) as f64) * coefficient;
             }
-            let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
             frequency_ratio * sign * series
         };
 

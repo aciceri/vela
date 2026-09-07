@@ -27,7 +27,7 @@ use crate::aero::{RigDimensions, Sail, SailSet};
 use crate::appendages::{FoilPlanform, HullScalars, Keel};
 use crate::balance::SailPlan as BalanceSailPlan;
 use crate::boat::{
-    Aerodynamics, AppendagesSpec, BoatSpec, FoilSpec, RigSpec, SailShapeSpec, SpecError,
+    Aerodynamics, AppendagesSpec, BoatSpec, FoilSpec, HullSpec, RigSpec, SailShapeSpec, SpecError,
 };
 use crate::controls::Controls;
 use crate::cummins::{MemoryError, MemoryOptions, TransformOptions};
@@ -475,17 +475,9 @@ fn seakeeping(
         return Err(AssemblyError::DegenerateHull);
     }
 
-    // Sections at the design waterline. Dry stations are kept: they carry the
-    // length over which the coefficients taper to nothing.
-    let strips: Vec<Strip> = hull
-        .stations
-        .iter()
-        .map(|station| Strip {
-            x: station.x,
-            form: station_geometry(station, parameters.canoe_draft)
-                .map(|section| LewisForm::fit(&section)),
-        })
-        .collect();
+    // Sections at the design waterline, which is the one number the lateral
+    // coefficients are sensitive to; see the struct.
+    let strips = strips_of(hull, parameters.canoe_draft);
 
     Ok(Seakeeping {
         mesh,
@@ -498,6 +490,29 @@ fn seakeeping(
         ),
         waterline_height: parameters.canoe_draft,
     })
+}
+
+/// One strip per station of the hull, sectioned at `waterline_height` metres
+/// above the baseline, with the Lewis form fitted to each immersed section.
+///
+/// Dry stations are kept, with no form: they carry the length over which the
+/// coefficients taper to nothing, and dropping them would shorten the hull
+/// strip theory integrates over.
+///
+/// Public because it is the *only* way the sections should be cut. The
+/// simulation and `vela-cli radiation` both need these strips, and a report
+/// that fitted its own would be describing a hull the simulation never runs —
+/// which is the same reason [`frequency_grid`] is public.
+#[must_use]
+pub fn strips_of(hull: &HullSpec, waterline_height: f64) -> Vec<Strip> {
+    hull.stations
+        .iter()
+        .map(|station| Strip {
+            x: station.x,
+            form: station_geometry(station, waterline_height)
+                .map(|section| LewisForm::fit(&section)),
+        })
+        .collect()
 }
 
 /// How many stations the Lewis fit had to clamp: the number `lewis` says
@@ -801,7 +816,15 @@ pub fn sailing_sim(
 /// strictly increasing and strictly positive either way, which is what
 /// [`crate::cummins::Spectrum::new`] insists on; its quadrature is a trapezoid
 /// over the actual spacing, so a non-uniform grid needs nothing from it.
-fn frequency_grid(lowest: f64, top: f64, samples: usize) -> Vec<f64> {
+///
+/// Public so that a report of the memory model can be computed on the grid the
+/// simulation fits on, rather than a private copy of it: the numbers
+/// `vela-cli radiation` prints are only worth reading if they are the numbers
+/// the assembly runs. Build it from a [`RadiationOptions`] —
+/// `frequency_grid(options.lowest_frequency, options.top_frequency, options.samples)`
+/// — and the two agree by construction.
+#[must_use]
+pub fn frequency_grid(lowest: f64, top: f64, samples: usize) -> Vec<f64> {
     /// How fast the tail falls away below the first uniform step.
     const TAIL_RATIO: f64 = 1.5;
 

@@ -7,3 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 vela-core = { path = "../vela-core" }
+
+[dev-dependencies]
+serde_json.workspace = true

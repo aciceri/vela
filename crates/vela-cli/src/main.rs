@@ -12,10 +12,12 @@
 use std::process::ExitCode;
 
 use vela_core::aero::{EffectiveSpan, SailSet, Trim};
-use vela_core::assembly::{sailing_sim, velocity_prediction_sim, RadiationOptions};
+use vela_core::assembly::{
+    frequency_grid, sailing_sim, strips_of, velocity_prediction_sim, RadiationOptions,
+};
 use vela_core::balance::{Balance, ExtendedKeel, RigType, SailPlan};
-use vela_core::boat::HullSpec;
-use vela_core::cummins::{FluidMemory, MemoryOptions, TransformOptions};
+use vela_core::boat::{HullSpec, SpecError};
+use vela_core::cummins::{FluidMemory, MemoryOptions};
 use vela_core::dsyhs::{hull_resistance, HullParameters};
 use vela_core::equilibrium::{self, Equilibrium, EquilibriumOptions};
 use vela_core::flying::Controls as SailTrim;
@@ -93,9 +95,10 @@ OPTIONS:
     --seed N        Phase seed of the sea realisation (default 1)
     --free-helm     Release the heading: nothing steers, so the boat luffs up
 
-Commands needing geometry require a boat file with hull offsets; commands
-needing form parameters require the parameters block. Most boats have one or
-the other, some have both.
+Boat files are RON, or JSON when the file ends in .json. Commands needing
+geometry require a boat file with hull offsets; commands needing form
+parameters require the parameters block. Most boats have one or the other,
+some have both.
 ";
 
 struct Options {
@@ -156,7 +159,7 @@ fn run(arguments: &[String]) -> Result<String, String> {
     let options = parse_options(&arguments[2..])?;
 
     let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
-    let spec = BoatSpec::parse_ron(&text).map_err(|error| format!("{path}: {error}"))?;
+    let spec = parse_spec(path, &text).map_err(|error| format!("{path}: {error}"))?;
 
     match command.as_str() {
         "mesh" => Ok(report_mesh(&spec, &lofted(&spec, &options)?)),
@@ -241,6 +244,22 @@ fn number(raw: Option<&String>, flag: &str) -> Result<f64, String> {
     let raw = raw.ok_or_else(|| format!("{flag} needs a value"))?;
     raw.parse()
         .map_err(|_| format!("{flag} expects a number, got {raw}"))
+}
+
+/// Parses a boat file in whichever of the two formats its extension names.
+///
+/// RON is the native format and the fallback, so a file with no extension or
+/// an unfamiliar one is read as RON and fails with RON's syntax error, which
+/// is the more useful of the two when the file is neither.
+fn parse_spec(path: &str, text: &str) -> Result<BoatSpec, SpecError> {
+    if std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        BoatSpec::parse_json(text)
+    } else {
+        BoatSpec::parse_ron(text)
+    }
 }
 
 /// Lofts the hull, or explains that this boat has no geometry to loft.
@@ -767,16 +786,21 @@ fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
     };
     // With a layout the boat has yaw arms, so the helm is part of the answer:
     // the rudder angle that holds the course, and what is left of the yawing
-    // moment once it does.
-    let helm = if spec.layout.is_some() {
-        equilibrium::solve_with_helm(&mut sim, hull.waterline_length, &start).ok()
+    // moment once it does. A helm that cannot be found is then a failure of
+    // the command, not a report without a helm line: the helmless balance of
+    // a boat that *has* yaw arms is a yaw-unbalanced state, and printing it as
+    // the answer would be presenting the wrong boat.
+    let (solution, helm) = if spec.layout.is_some() {
+        let found = equilibrium::solve_with_helm(&mut sim, hull.waterline_length, &start)
+            .map_err(|error| format!("{}: {error}", spec.name))?;
+        (
+            found.equilibrium,
+            Some((found.rudder_angle, found.yaw_residual, found.helm_saturated)),
+        )
     } else {
-        None
-    };
-    let solution = match &helm {
-        Some(found) => found.equilibrium.clone(),
-        None => equilibrium::solve(&mut sim, hull.waterline_length, &start)
-            .map_err(|error| format!("{}: {error}", spec.name))?,
+        let solution = equilibrium::solve(&mut sim, hull.waterline_length, &start)
+            .map_err(|error| format!("{}: {error}", spec.name))?;
+        (solution, None)
     };
 
     let mut out = String::new();
@@ -790,7 +814,7 @@ fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
     out.push_str(&format!(
         "boat speed          {:>10.3} m/s   ({:.2} kn)\n",
         solution.speed,
-        solution.speed * 1.943_844
+        solution.speed * KNOTS_PER_METRE_PER_SECOND
     ));
     out.push_str(&format!(
         "heel                {:>10.2} deg\n",
@@ -808,16 +832,12 @@ fn report_sail(spec: &BoatSpec, options: &Options) -> Result<String, String> {
         "residual            {:>10.2e}   ({} iterations)\n\n",
         solution.residual, solution.iterations
     ));
-    if let Some(found) = &helm {
+    if let Some((rudder_angle, yaw_residual, saturated)) = helm {
         out.push_str(&format!(
             "helm                {:>10.2} deg   (yaw residual {:.1e}{})\n\n",
-            found.rudder_angle.to_degrees(),
-            found.yaw_residual,
-            if found.helm_saturated {
-                ", SATURATED"
-            } else {
-                ""
-            }
+            rudder_angle.to_degrees(),
+            yaw_residual,
+            if saturated { ", SATURATED" } else { "" }
         ));
     }
 
@@ -934,16 +954,10 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
         None => parameters(spec)?.canoe_draft,
     };
 
-    // Dry stations are kept, with no form: they carry the length over which the
-    // coefficients taper to nothing.
-    let strips: Vec<Strip> = hull
-        .stations
-        .iter()
-        .map(|station| Strip {
-            x: station.x,
-            form: station_geometry(station, waterline).map(|section| LewisForm::fit(&section)),
-        })
-        .collect();
+    // The assembly's own sectioning, so the strips here are the strips the
+    // simulation runs on — and, with `--waterline`, the same cut at a height
+    // the simulation would not use, which is what the flag is for.
+    let strips = strips_of(hull, waterline);
     let wet = strips.iter().filter(|strip| strip.form.is_some()).count();
     if wet < 2 {
         return Err(format!(
@@ -976,9 +990,17 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
         .map(LewisForm::beam)
         .fold(0.0_f64, f64::max);
 
+    // The assembly's own radiation setup, so that everything below — the
+    // sectional solver, the density, the frequency grid and the memory fit —
+    // is what `sailing_sim` runs rather than a private copy of it. A memory
+    // model fitted on a grid of the report's own would describe a simulation
+    // that never runs, which is exactly the kind of number this command exists
+    // to keep honest.
+    let radiation = RadiationOptions::default();
+
     // One solver for the whole sweep: it owns the quadrature rule, which is the
     // expensive thing to build and the same at every frequency.
-    let solver = tasai::SectionSolver::new(tasai::TasaiOptions::default());
+    let solver = tasai::SectionSolver::new(radiation.tasai);
 
     let mut slenderness = f64::INFINITY;
     let mut frequency = 0.25;
@@ -986,7 +1008,7 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
         let solved = strip::heave_pitch_coefficients(
             &strips,
             frequency,
-            SEA_WATER_DENSITY,
+            radiation.density,
             vela_core::STANDARD_GRAVITY,
             &solver,
         )
@@ -1008,115 +1030,107 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
     }
 
     // The coefficients only mean something next to the stiffness they act
-    // against, so solve the flotation and state what the heave mode does. The
-    // added mass depends on frequency and the frequency depends on the added
-    // mass, so this iterates — three passes is far more than it needs.
-    if let Ok(properties) = spec.mass_properties() {
-        if let Ok(body) = RigidBody::new(properties) {
-            let water = Water::default();
-            if let Ok(mesh) = lofted(spec, options) {
-                if let Ok(flotation) =
-                    solve_flotation(&mesh, &body, &water, &FlotationOptions::default())
-                {
-                    let stiffness = flotation
-                        .hydrostatics
-                        .heave_stiffness(&water, vela_core::STANDARD_GRAVITY);
-                    let mass = body.mass_properties().mass();
-                    let mut natural = (stiffness / mass).sqrt();
-                    let mut settled = None;
-                    for _ in 0..6 {
-                        let Some(solved) = strip::heave_pitch_coefficients(
-                            &strips,
-                            natural,
-                            SEA_WATER_DENSITY,
-                            vela_core::STANDARD_GRAVITY,
-                            &solver,
-                        ) else {
-                            break;
-                        };
-                        natural = (stiffness / (mass + solved.added_mass_heave)).sqrt();
-                        settled = Some(solved);
-                    }
-                    if let Some(solved) = settled {
-                        let virtual_mass = mass + solved.added_mass_heave;
-                        let ratio =
-                            solved.damping_heave / (2.0 * (stiffness * virtual_mass).sqrt());
-                        out.push_str(&format!(
-                            "\nHeave mode, solved at its own frequency:\n\
-                             \x20 stiffness        {stiffness:>12.0} N/m\n\
-                             \x20 mass             {mass:>12.0} kg\n\
-                             \x20 added mass       {:>12.0} kg  ({:.2} of the mass)\n\
-                             \x20 natural period   {:>12.2} s\n\
-                             \x20 damping ratio    {ratio:>12.2}\n",
-                            solved.added_mass_heave,
-                            solved.added_mass_heave / mass,
-                            std::f64::consts::TAU / natural,
-                        ));
-                    }
-                }
-            }
-        }
+    // against, so solve the flotation and state what the heave mode does. When
+    // that cannot be done the report says why, rather than leaving a reader to
+    // notice that a section is missing.
+    match heave_mode(spec, hull, options, &strips, &solver, radiation.density) {
+        Ok(mode) => out.push_str(&format!(
+            "\nHeave mode, solved at its own frequency:\n\
+             \x20 stiffness        {:>12.0} N/m\n\
+             \x20 mass             {:>12.0} kg\n\
+             \x20 added mass       {:>12.0} kg  ({:.2} of the mass)\n\
+             \x20 natural period   {:>12.2} s\n\
+             \x20 damping ratio    {:>12.2}\n",
+            mode.stiffness,
+            mode.mass,
+            mode.added_mass,
+            mode.added_mass / mode.mass,
+            std::f64::consts::TAU / mode.natural_frequency,
+            mode.damping_ratio,
+        )),
+        Err(error) => out.push_str(&format!("\nHeave mode: not solved, {error}\n")),
     }
 
-    // The memory model: what the time domain will actually evaluate.
-    //
-    // The grid reaches 30 rad/s because the transform integrates to infinity and
-    // a yacht's narrow sections are still radiating at 6. It is 150 points
-    // because that resolves the memory out to a few tens of seconds, which is
-    // longer than any of it lasts.
-    let grid: Vec<f64> = (1..=150).map(|i| 30.0 * f64::from(i) / 150.0).collect();
-    if let Some(((spectrum, _, _), _)) = strip::vertical_spectra(
+    // The memory model: what the time domain will actually evaluate, on the
+    // grid it is fitted on. See `assembly::frequency_grid` for why that grid
+    // is uniform with a geometric tail rather than log-spaced.
+    let grid = frequency_grid(
+        radiation.lowest_frequency,
+        radiation.top_frequency,
+        radiation.samples,
+    );
+    let ((heave, _, pitch), sweep) = strip::vertical_spectra(
         &strips,
         &grid,
-        SEA_WATER_DENSITY,
+        radiation.density,
         vela_core::STANDARD_GRAVITY,
         &solver,
-    ) {
-        let infinite = spectrum.infinite_added_mass(TransformOptions::default());
-        out.push_str(&format!(
-            "\nFluid memory, from {} frequencies to {:.0} rad/s:\n\
-             \x20 A_inf            {:>12.0} kg   (cross-check {:.0}, differ {:.2} % over {} frequencies)\n\
-             \x20 K(0)             {:>12.0} kg/s\n",
-            grid.len(),
-            grid[grid.len() - 1],
-            infinite.value,
-            infinite.cross_check,
-            100.0 * infinite.disagreement,
-            infinite.samples,
-            spectrum.retardation(0.0),
-        ));
-        for order in [3_usize, 4, 5] {
-            match FluidMemory::fit(
-                &spectrum,
-                infinite,
-                MemoryOptions {
-                    order,
-                    ..MemoryOptions::default()
-                },
-            ) {
-                Ok(model) => out.push_str(&format!(
-                    "\x20 order {order}          worst error {:>7.3} %, slowest pole {:>8.4} 1/s \
-                     (tau {:>6.1} s), passivity {:>8.1e}\n",
-                    100.0 * model.worst_error(),
-                    model.slowest_pole(),
-                    -1.0 / model.slowest_pole(),
-                    model.passivity_violation(),
-                )),
-                Err(error) => {
-                    out.push_str(&format!(
-                        "\x20 order {order}          no model: {error:?}\n"
-                    ));
-                }
+    )
+    .ok_or_else(|| {
+        format!(
+            "{}: a section has no solution at a frequency of the assembly grid, \
+             so there is no spectrum to fit a memory to",
+            spec.name
+        )
+    })?;
+    // The band the fit consumes, computed the way the assembly computes it:
+    // `fit_ceiling` times the damping peak, over the wider of the two diagonal
+    // spectra. The residual that matters is the worst one inside that band —
+    // the grid's tail is a statement about the multipole truncation where the
+    // damping has already died, not about the coefficients the boat moves on.
+    let ceiling = radiation.memory.fit_ceiling * heave.peak_frequency().max(pitch.peak_frequency());
+    let infinite = heave.infinite_added_mass(radiation.transform);
+    out.push_str(&format!(
+        "\nFluid memory, on the assembly grid of {} frequencies from {:.3} to {:.0} rad/s:\n\
+         \x20 A_inf            {:>12.0} kg   (cross-check {:.0}, differ {:.2} % over {} frequencies)\n\
+         \x20 K(0)             {:>12.0} kg/s\n\
+         \x20 fit band         up to {ceiling:.2} rad/s, worst energy residual within it {:.1e}\n",
+        grid.len(),
+        grid[0],
+        grid[grid.len() - 1],
+        infinite.value,
+        infinite.cross_check,
+        100.0 * infinite.disagreement,
+        infinite.samples,
+        heave.retardation(0.0),
+        sweep.worst_energy_residual_below(ceiling),
+    ));
+    for order in [3_usize, 4, 5] {
+        let tag = if order == radiation.memory.order {
+            "  <- the assembly's order"
+        } else {
+            ""
+        };
+        match FluidMemory::fit(
+            &heave,
+            infinite,
+            MemoryOptions {
+                order,
+                ..radiation.memory
+            },
+        ) {
+            Ok(model) => out.push_str(&format!(
+                "\x20 order {order}          worst error {:>7.3} %, slowest pole {:>8.4} 1/s \
+                 (tau {:>6.1} s), passivity {:>8.1e}{tag}\n",
+                100.0 * model.worst_error(),
+                model.slowest_pole(),
+                -1.0 / model.slowest_pole(),
+                model.passivity_violation(),
+            )),
+            Err(error) => {
+                out.push_str(&format!(
+                    "\x20 order {order}          no model: {error:?}{tag}\n"
+                ));
             }
         }
-        out.push_str(
-            "\nA_inf belongs in the mass matrix; the rest is a state-space model whose\n\
-             impulse response is the retardation function. The check above is\n\
-             two independent routes to A_inf agreeing: one integrates the memory in time,\n\
-             the other reads the asymptote of A(omega). They share the spectrum and\n\
-             nothing else.\n",
-        );
     }
+    out.push_str(
+        "\nA_inf belongs in the mass matrix; the rest is a state-space model whose\n\
+         impulse response is the retardation function. The check above is\n\
+         two independent routes to A_inf agreeing: one integrates the memory in time,\n\
+         the other reads the asymptote of A(omega). They share the spectrum and\n\
+         nothing else.\n",
+    );
 
     out.push_str(&format!(
         "\nCoefficients are about the body origin: heave positive down, pitch\n\
@@ -1128,16 +1142,92 @@ fn report_radiation(spec: &BoatSpec, options: &Options) -> Result<String, String
     Ok(out)
 }
 
+/// The heave mode of a floating boat, solved at its own natural frequency.
+struct HeaveMode {
+    /// Hydrostatic heave stiffness, N/m.
+    stiffness: f64,
+    /// The boat's mass, kg.
+    mass: f64,
+    /// Heave added mass at the natural frequency, kg.
+    added_mass: f64,
+    /// Natural frequency of the mode with its added mass in it, rad/s.
+    natural_frequency: f64,
+    /// Fraction of critical damping, from the radiation damping alone.
+    damping_ratio: f64,
+}
+
+/// Solves the flotation for the heave stiffness and finds the frequency the
+/// heave mode settles at.
+///
+/// The added mass depends on frequency and the frequency depends on the added
+/// mass, so this iterates — six passes is far more than the fixed point needs.
+///
+/// # Errors
+///
+/// Whichever step refused: a mass block that is not physical, a hull that
+/// cannot float its mass, or a frequency the sections had no solution at. Each
+/// is reported rather than folded into "no heave mode", because a reader of the
+/// radiation report who does not get this section wants to know which of the
+/// three the boat file got wrong.
+fn heave_mode(
+    spec: &BoatSpec,
+    hull: &HullSpec,
+    options: &Options,
+    strips: &[Strip],
+    solver: &tasai::SectionSolver,
+    density: f64,
+) -> Result<HeaveMode, String> {
+    let properties = spec
+        .mass_properties()
+        .map_err(|error| format!("mass block: {error}"))?;
+    let body = RigidBody::new(properties).map_err(|error| format!("mass block: {error}"))?;
+    let water = Water::default();
+    let mesh = loft_hull(hull, &options.loft);
+    let flotation = solve_flotation(&mesh, &body, &water, &FlotationOptions::default())
+        .map_err(|error| format!("flotation: {error}"))?;
+    let stiffness = flotation
+        .hydrostatics
+        .heave_stiffness(&water, vela_core::STANDARD_GRAVITY);
+    let mass = body.mass_properties().mass();
+
+    // Ends on a solve *at* the reported frequency, so the added mass and the
+    // period in the report belong to the same pass.
+    let coefficients_at = |omega: f64| {
+        strip::heave_pitch_coefficients(strips, omega, density, vela_core::STANDARD_GRAVITY, solver)
+            .ok_or_else(|| format!("no section solution at {omega:.3} rad/s"))
+    };
+    let mut natural_frequency = (stiffness / mass).sqrt();
+    let mut solved = coefficients_at(natural_frequency)?;
+    for _ in 0..6 {
+        natural_frequency = (stiffness / (mass + solved.added_mass_heave)).sqrt();
+        solved = coefficients_at(natural_frequency)?;
+    }
+
+    let virtual_mass = mass + solved.added_mass_heave;
+    Ok(HeaveMode {
+        stiffness,
+        mass,
+        added_mass: solved.added_mass_heave,
+        natural_frequency,
+        damping_ratio: solved.damping_heave / (2.0 * (stiffness * virtual_mass).sqrt()),
+    })
+}
+
 /// Where the rig has to sit relative to the keel, by Chapter 9.
 ///
-/// The longitudinal positions of the sails and the appendages are the one thing
-/// the boat format does not carry, which is why yaw is restrained. This command
-/// closes that gap the way the source does: it computes the centre of lateral
-/// resistance from the keel, the centre of effort from the rig, and reports what
-/// lead a given mast position gives — or where the mast goes for a wanted lead.
+/// The longitudinal positions of the keel and the mast are what a boat file's
+/// `layout` block carries, and what the yaw balance of every sailing assembly
+/// stands on. This command is how that block is written and checked, the way
+/// the source does it: it computes the centre of lateral resistance from the
+/// keel, the centre of effort from the rig, and reports what lead a given mast
+/// position gives — and where the mast would go for each lead of the
+/// recommended band, which is how a mast position is derived for a boat whose
+/// particulars publish a lead but no layout.
 ///
-/// The keel's own longitudinal position is a design decision no rule produces, so
-/// it is an input here (`--keel-at`, default midships).
+/// The keel's own longitudinal position is a design decision no rule produces,
+/// so it is an input: `--keel-at`, else the layout's `keel_at`, else midships.
+/// The mast is `--mast-at`, else the layout's `mast_at`; without either there
+/// is no position to judge, only the table of where one would go.
 fn report_balance(spec: &BoatSpec, options: &Options) -> Result<String, String> {
     let parameters = parameters(spec)?;
     let appendages = spec
@@ -1147,7 +1237,17 @@ fn report_balance(spec: &BoatSpec, options: &Options) -> Result<String, String> 
         .rig
         .ok_or_else(|| format!("{} has no rig, so it has no sail plan", spec.name))?;
 
-    let keel_at = options.keel_at.unwrap_or(0.5 * parameters.waterline_length);
+    let layout = spec.layout;
+    let (keel_at, keel_source) = match (options.keel_at, layout) {
+        (Some(keel_at), _) => (keel_at, "--keel-at"),
+        (None, Some(layout)) => (layout.keel_at, "layout"),
+        (None, None) => (0.5 * parameters.waterline_length, "midships, no layout"),
+    };
+    let mast = match (options.mast_at, layout) {
+        (Some(mast_at), _) => Some((mast_at, "--mast-at")),
+        (None, Some(layout)) => Some((layout.mast_at, "layout")),
+        (None, None) => None,
+    };
     let keel = ExtendedKeel {
         quarter_chord_at_waterline: keel_at,
         total_draft: parameters.canoe_draft + appendages.keel.span,
@@ -1177,7 +1277,7 @@ fn report_balance(spec: &BoatSpec, options: &Options) -> Result<String, String> 
     let (clr_at, clr_depth) = keel.centre_of_lateral_resistance();
     let (effort_forward, effort_height) = plan.centre_of_effort_from_mast();
     out.push_str(&format!(
-        "keel quarter chord at waterline  {keel_at:8.3} m  (input)\n\
+        "keel quarter chord at waterline  {keel_at:8.3} m  ({keel_source})\n\
          centre of lateral resistance     {clr_at:8.3} m, {clr_depth:.3} m deep\n\
          centre of effort from the mast   {effort_forward:8.3} m forward, {effort_height:.3} m up\n\
          foretriangle / mainsail area     {:8.2} / {:.2} m2\n\n",
@@ -1185,49 +1285,38 @@ fn report_balance(spec: &BoatSpec, options: &Options) -> Result<String, String> 
         plan.mainsail_area(),
     ));
 
-    match options.mast_at {
-        Some(mast_at) => {
-            let balance = Balance::from_positions(
-                &keel,
-                &plan,
-                rig_type,
-                parameters.waterline_length,
-                mast_at,
-            );
-            out.push_str(&format!(
-                "With the mast at {mast_at:.3} m:\n\
-                 \x20 centre of effort at   {:8.3} m\n\
-                 \x20 lead                  {:8.3} m = {:.2} % of LWL   {}\n",
-                balance.centre_of_effort_at,
-                balance.centre_of_effort_at - balance.lateral_resistance_at,
-                100.0 * balance.lead,
-                if balance.lead_is_recommended {
-                    "inside the recommended band"
-                } else {
-                    "OUTSIDE the recommended band"
-                }
-            ));
-        }
-        None => {
-            out.push_str(
-                "Mast position for each end of the band, and for the YD-41's published lead:\n",
-            );
-            for lead in [*band.start(), 0.022, *band.end()] {
-                let balance =
-                    Balance::from_lead(&keel, &plan, rig_type, parameters.waterline_length, lead);
-                out.push_str(&format!(
-                    "\x20 lead {:5.2} %  ->  mast at {:7.3} m, centre of effort at {:7.3} m  {}\n",
-                    100.0 * lead,
-                    balance.mast_at,
-                    balance.centre_of_effort_at,
-                    if balance.lead_is_recommended {
-                        ""
-                    } else {
-                        "(out of band)"
-                    }
-                ));
+    if let Some((mast_at, mast_source)) = mast {
+        let balance =
+            Balance::from_positions(&keel, &plan, rig_type, parameters.waterline_length, mast_at);
+        out.push_str(&format!(
+            "With the mast at {mast_at:.3} m ({mast_source}):\n\
+             \x20 centre of effort at   {:8.3} m\n\
+             \x20 lead                  {:8.3} m = {:.2} % of LWL   {}\n\n",
+            balance.centre_of_effort_at,
+            balance.centre_of_effort_at - balance.lateral_resistance_at,
+            100.0 * balance.lead,
+            if balance.lead_is_recommended {
+                "inside the recommended band"
+            } else {
+                "OUTSIDE the recommended band"
             }
-        }
+        ));
+    }
+
+    out.push_str("Mast position for each end of the band, and for the YD-41's published lead:\n");
+    for lead in [*band.start(), 0.022, *band.end()] {
+        let balance = Balance::from_lead(&keel, &plan, rig_type, parameters.waterline_length, lead);
+        out.push_str(&format!(
+            "\x20 lead {:5.2} %  ->  mast at {:7.3} m, centre of effort at {:7.3} m  {}\n",
+            100.0 * lead,
+            balance.mast_at,
+            balance.centre_of_effort_at,
+            if balance.lead_is_recommended {
+                ""
+            } else {
+                "(out of band)"
+            }
+        ));
     }
 
     out.push_str(
