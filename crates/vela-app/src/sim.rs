@@ -44,7 +44,7 @@ pub const STEP: f64 = 1.0 / 200.0;
 /// feature; a hard dependency on one would have been an architecture.
 const SPEC: &str = include_str!("../../../boats/yd41-form-study.ron");
 
-/// True wind the boat is released into, m/s and radians off the bow.
+/// True wind the boat is released into: m/s, and degrees off the bow.
 const WIND_SPEED: f64 = 6.0;
 const WIND_ANGLE: f64 = 45.0;
 

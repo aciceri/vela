@@ -13,16 +13,17 @@
 //! detail and no appendages, because none of those are things the pressure
 //! integral needs. It looks like what it is.
 //!
-//! # The rig is a stand-in and says so
+//! # The spars are the file's and the sails are the engine's
 //!
-//! Mast and sails are drawn as simple geometry placed from the boat file's rig
-//! dimensions. They are **not** the flying shape `vela_core::flying` computes:
-//! that model is only mounted when a boat asks for the geometric aerodynamics,
-//! and the reference boat asks for the tabular one, which has no shape at all —
-//! only areas and centres of effort. Drawing a sail whose camber came from
-//! nowhere would be exactly the kind of confident fiction this project avoids
-//! elsewhere, so the sails here are flat triangles at the sheeting angle the
-//! controls ask for, and nothing about their shape should be read as physics.
+//! Mast and boom are simple geometry placed from the boat file's rig
+//! dimensions. The sails are the flying shape [`vela_core::flying`] computes
+//! for the control positions the player is holding — camber, draft, twist and
+//! the sheeting angle, all from the engine's own statement of what the cloth
+//! does — and they are rebuilt whenever that statement changes. What the
+//! drawing does **not** claim is that the *forces* come from that shape: the
+//! reference boat sails on the tabular aerodynamic model, which reads areas, an
+//! aspect ratio and an angle and never asks for a shape. [`sail_mesh`] says why
+//! drawing the shape anyway is the honest way round.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::Indices;
@@ -31,6 +32,8 @@ use bevy::render::render_resource::PrimitiveTopology;
 use nalgebra::Vector3;
 use vela_core::aero::Sail;
 use vela_core::flying::Shape;
+use vela_core::frames::file_to_body;
+use vela_core::geometry::Point;
 use vela_core::TriMesh;
 
 use crate::frame;
@@ -81,6 +84,18 @@ pub fn hull_mesh(hull: &TriMesh) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
+/// Panels across a sail's chord.
+///
+/// Coarse, because the chordwise mean line is a smooth arc that eight panels
+/// already round off.
+const CHORDS: usize = 8;
+
+/// Panels up a sail's luff.
+///
+/// Finer than the chord: twist varies continuously with height and is the
+/// direction the eye reads.
+const PANELS: usize = 14;
+
 /// A sail as a cambered surface, in the render frame.
 ///
 /// # Why this is not a triangle
@@ -101,31 +116,54 @@ pub fn hull_mesh(hull: &TriMesh) -> Mesh {
 /// coefficients are measured. Drawing the truth and approximating the forces is
 /// the honest way round.
 ///
+/// # Frame, tack and datum
+///
+/// `Shape` is in the file frame — x forward, y to **port**, z up from the tack —
+/// and is built on starboard tack, its chord swung and its camber bulged to
+/// port. `vela_core::frames::file_to_body` takes the surface into the body
+/// frame and [`frame::to_render`] takes the body frame to Bevy's: two
+/// conversions, each the one its crate owns. The tack goes through the same two,
+/// so the foot cannot land on a different datum from the luff — which is what
+/// happened when the surface was converted by hand with the y axis read as
+/// starboard, and drew every sail mirrored onto the windward side.
+///
+/// `mirror` is applied to body `y` between the two conversions: `+1` leaves the
+/// sail on starboard tack, `-1` mirrors it onto port. That is the mirror
+/// `flying` says the caller owes it, rather than carry a sign through every
+/// formula in the geometry.
+///
+/// The tack is the engine's literal body point, `z` being `tack_above_water`
+/// negated: the engine applies its sail forces at heights above the water as if
+/// the body origin were on the waterline. The body origin is in fact on the
+/// baseline, forty centimetres below the design waterline on the reference
+/// boat, so the drawn foot sits about half a metre below the boom the rig
+/// letters place. Drawn rather than corrected, on purpose: a renderer that
+/// quietly offset the engine's datum would be hiding an engine error, and the
+/// gap is that error made visible.
+///
 /// Two-sided, because a sail seen from the leeward side would otherwise vanish.
 /// The two windings get opposed normals, so each face is lit as the surface it is.
-fn sail_mesh(shape: &Shape, tack: Vec3, chords: usize, panels: usize) -> Mesh {
-    // Sampled finely up the luff and coarsely across the chord: twist varies
-    // continuously with height and is the direction the eye reads, while the
-    // chordwise mean line is a smooth arc that eight panels already round off.
+fn sail_mesh(shape: &Shape, tack: Point, mirror: f64) -> Mesh {
+    let tack = file_to_body(tack);
     let station = |along: f64, up: f64| {
-        let point = shape.point(along, up);
-        // `Shape` works in the file frame — x forward, y to starboard, z up from
-        // the tack — and `frame` owns the one conversion to Bevy's axes.
-        tack + frame::to_render(Vector3::new(point.x, point.y, -point.z))
+        let body = tack + file_to_body(shape.point(along, up));
+        frame::to_render(Vector3::new(body.x, mirror * body.y, body.z))
     };
 
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
+    // Four triangles a quad: two for each face.
+    let vertices = CHORDS * PANELS * 12;
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(vertices);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(vertices);
 
-    for panel in 0..panels {
+    for panel in 0..PANELS {
         let (low, high) = (
-            panel as f64 / panels as f64,
-            (panel + 1) as f64 / panels as f64,
+            panel as f64 / PANELS as f64,
+            (panel + 1) as f64 / PANELS as f64,
         );
-        for chord in 0..chords {
+        for chord in 0..CHORDS {
             let (aft, forward) = (
-                chord as f64 / chords as f64,
-                (chord + 1) as f64 / chords as f64,
+                chord as f64 / CHORDS as f64,
+                (chord + 1) as f64 / CHORDS as f64,
             );
             let corners = [
                 station(aft, low),
@@ -140,10 +178,10 @@ fn sail_mesh(shape: &Shape, tack: Vec3, chords: usize, panels: usize) -> Mesh {
             let normal = (corners[2] - corners[0])
                 .cross(corners[3] - corners[1])
                 .normalize_or_zero();
-            for (winding, sign) in [([0, 1, 2], 1.0), ([0, 2, 3], 1.0)] {
+            for winding in [[0, 1, 2], [0, 2, 3]] {
                 for index in winding {
                     positions.push(corners[index].to_array());
-                    normals.push((normal * sign).to_array());
+                    normals.push(normal.to_array());
                 }
             }
             for winding in [[0, 2, 1], [0, 3, 2]] {
@@ -241,37 +279,41 @@ pub fn spawn(
             // drawn sail is still exactly the size the force model is sailing.
             // What it adds is the camber and twist the current control positions
             // produce, which is the difference between a sail and a sheet of
-            // plywood.
+            // plywood. `trim` keeps them that way as the controls move.
             //
             // A boat whose file carries no flying-shape block gets nothing here
             // rather than a fabricated bulge. That is the right failure: the
             // engine has no opinion about that sail's shape, and neither should
             // this.
+            let mirror = -leeward_sign(&engine);
             for (sail, tack, shape) in
                 vela_core::assembly::sail_shapes(&engine.spec, *engine.sim.controls())
             {
-                let tack = Vec3::new(tack.x as f32, rig.sheer + tack.z as f32, -(tack.y as f32));
-                let mesh = Mesh3d(meshes.add(sail_mesh(&shape, tack, 8, 14)));
-                match sail {
-                    Sail::Main => {
-                        boat.spawn((mesh, MeshMaterial3d(cloth.clone()), Mainsail));
-                    }
-                    Sail::Jib => {
-                        boat.spawn((mesh, MeshMaterial3d(cloth.clone()), Headsail));
-                    }
-                    _ => {}
-                }
+                boat.spawn((
+                    Mesh3d(meshes.add(sail_mesh(&shape, tack, mirror))),
+                    MeshMaterial3d(cloth.clone()),
+                    DrawnSail {
+                        sail,
+                        shape,
+                        mirror,
+                    },
+                ));
             }
         });
 }
 
-/// Marks the mainsail, so the helm can swing it.
+/// A drawn sail: which one, and what its mesh was last built from.
+///
+/// The mesh is a function of the flying shape and of the tack the boat is on,
+/// and of nothing else. Holding both is what lets [`trim`] rebuild it exactly
+/// when one of them changes and leave it alone otherwise.
 #[derive(Component)]
-pub struct Mainsail;
-
-/// Marks the headsail.
-#[derive(Component)]
-pub struct Headsail;
+pub struct DrawnSail {
+    sail: Sail,
+    shape: Shape,
+    /// The body-`y` mirror the mesh was built with — see [`sail_mesh`].
+    mirror: f64,
+}
 
 /// Marks the boom, which swings with the mainsail.
 #[derive(Component)]
@@ -283,14 +325,18 @@ pub struct Boom;
 /// height measured from the sheer, which is the top of the lofted hull. Nothing
 /// here is chosen to look right: if a boat file declares a rig, this draws that
 /// rig, and if the drawing looks wrong the file is wrong.
+///
+/// Heights are above the body origin, which is on the baseline — the datum the
+/// hull is drawn from — and not above the water, which is the datum the engine
+/// quotes the sails' tacks against. See [`sail_mesh`] for what that costs.
 struct Rig {
     /// Where the mast stands, render `x`, m.
     mast_at: f32,
-    /// Sheer height above the waterline, render `y`, m.
+    /// Sheer height above the baseline, render `y`, m.
     sheer: f32,
-    /// Masthead height above the waterline, m.
+    /// Masthead height above the baseline, m.
     masthead: f32,
-    /// Boom height above the waterline, m.
+    /// Boom height above the baseline, m.
     boom: f32,
     /// `P`, the mainsail hoist, m.
     main_hoist: f32,
@@ -347,53 +393,61 @@ pub fn follow(engine: Res<Engine>, mut boats: Query<&mut Transform, With<Boat>>)
     }
 }
 
-/// Exactly one of the three spars-and-sails, so that the queries are disjoint.
+/// Keeps the sails on the shape the engine is flying, and the boom under the
+/// main.
 ///
-/// Bevy refuses a system whose queries could alias the same component mutably,
-/// and three `&mut Transform` queries over overlapping sets would. Naming the
-/// filter also keeps the signature readable, which the raw tuple did not.
-type Only<T, A, B> = (With<T>, Without<A>, Without<B>);
-
-/// Swings the boom and the sails to the angle the controls ask for.
+/// The shape carries the sheeting angle itself: `Shape::chord_angle` at the foot
+/// is the trim the sheet and traveller set, through the range the boat file
+/// declares, and `sail_shapes` has already applied it. So the sails are never
+/// rotated as rigid bodies — a rotation on top of the shape sheets them twice,
+/// which is what this did first. What changes when a control moves is the shape,
+/// and the mesh is rebuilt from it then and only then: a hundred-odd quads a
+/// sail is nothing to build, but re-uploading two meshes every frame for a boat
+/// nobody is trimming would be. Which tack the boat is on is the other input,
+/// and a tack rebuilds the sails onto the new leeward side the same way.
 ///
-/// The angle is real: `flying::Controls::boom_in` is the sheet times the
-/// traveller, which is the composition the force model itself uses, and the sail
-/// swings to the same fraction of its range that the trimmer set. The sail's
-/// *shape* remains unmodelled — see the module documentation — so this is the
-/// visible part of the trim and not the whole of it.
+/// The boom is the one thing that is rotated, because it is a spar and not
+/// cloth: it lies along the foot of the main, so its angle is the main's chord
+/// angle at the foot, on whichever side the tack puts it.
 pub fn trim(
     engine: Res<Engine>,
-    mut booms: Query<&mut Transform, Only<Boom, Mainsail, Headsail>>,
-    mut mains: Query<&mut Transform, Only<Mainsail, Boom, Headsail>>,
-    mut heads: Query<&mut Transform, Only<Headsail, Boom, Mainsail>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut sails: Query<(&mut DrawnSail, &Mesh3d)>,
+    mut booms: Query<&mut Transform, With<Boom>>,
 ) {
-    let controls = engine.sim.controls();
-    let rig = Rig::from(&*engine);
-    // Fully in is on the centreline; fully out is a quarter turn. Beyond that a
-    // boom is against the shrouds, which this does not model.
-    let out = (1.0 - controls.shape.boom_in()) as f32 * std::f32::consts::FRAC_PI_4;
-    // A rotation of `θ` about render `y` takes the boom tip at `(-E, 0, 0)` to
-    // `z = E sin θ`, and render `z` is the engine's `y`, which is starboard. So
-    // `θ` carries the sign of the leeward direction on the body `y` axis, which
-    // is exactly what `leeward_sign` returns.
-    let angle = leeward_sign(&engine) * out;
+    let leeward = leeward_sign(&engine);
+    let mirror = -leeward;
+    let shapes = vela_core::assembly::sail_shapes(&engine.spec, *engine.sim.controls());
 
+    for (sail, tack, shape) in &shapes {
+        for (mut drawn, mesh) in &mut sails {
+            if drawn.sail != *sail || (drawn.shape == *shape && drawn.mirror == mirror) {
+                continue;
+            }
+            if let Some(mut existing) = meshes.get_mut(mesh) {
+                *existing = sail_mesh(shape, *tack, mirror);
+                drawn.shape = *shape;
+                drawn.mirror = mirror;
+            }
+        }
+    }
+
+    let Some((_, _, main)) = shapes.iter().find(|(sail, _, _)| *sail == Sail::Main) else {
+        return;
+    };
+    let rig = Rig::from(&*engine);
+    // A rotation of `θ` about render `y` takes the boom tip at `(-E, 0, 0)` to
+    // `z = E sin θ`, and render `z` is the engine's `y`, which is starboard. The
+    // foot's chord angle is measured to leeward, so `θ` carries the sign of the
+    // leeward direction on the body `y` axis — which is what `leeward_sign` is.
+    let rotation = Quat::from_rotation_y((leeward * main.chord_angle(0.0)) as f32);
     // The boom pivots at the mast, so the rotation is about a point the child
     // transform does not sit on: rotate, then put the midpoint back where the
     // rotation left it.
     for mut transform in &mut booms {
-        let half = 0.5 * rig.main_foot;
-        transform.rotation = Quat::from_rotation_y(angle);
+        transform.rotation = rotation;
         transform.translation = Vec3::new(rig.mast_at, rig.boom, 0.0)
-            + Quat::from_rotation_y(angle) * Vec3::new(-half, 0.0, 0.0);
-    }
-    for mut transform in &mut mains {
-        transform.rotation = Quat::from_rotation_y(angle);
-    }
-    // A headsail sheets closer than a main: it has no boom and its clew comes to
-    // a track well inboard. Two thirds is a stand-in for a sheeting-angle model.
-    for mut transform in &mut heads {
-        transform.rotation = Quat::from_rotation_y(angle * 0.66);
+            + rotation * Vec3::new(-0.5 * rig.main_foot, 0.0, 0.0);
     }
 }
 
@@ -408,13 +462,13 @@ pub fn trim(
 /// where it is published. Before the first step there is none, and a boat
 /// released close-hauled on starboard is the honest default for the one frame
 /// that needs it.
-fn leeward_sign(engine: &Engine) -> f32 {
+fn leeward_sign(engine: &Engine) -> f64 {
     let angle = engine
         .sim
         .telemetry()
         .get("aero.apparent_wind.angle")
         .unwrap_or(1.0);
-    vela_core::sim::leeward_sign(angle) as f32
+    vela_core::sim::leeward_sign(angle)
 }
 
 #[cfg(test)]

@@ -37,12 +37,17 @@
 /// constants less so, and this is four characters.
 const PI: f32 = 3.141592653589793;
 
+// Thirty-two bytes an element, and the Rust side pins that with
+// `the_wave_layout_matches_the_shader_stride`. Three scalar pads and not a
+// `vec3`, whose sixteen-byte alignment would push the element to forty-eight.
 struct ShaderWave {
     wave_vector: vec2<f32>,
     frequency: f32,
     phase: f32,
     amplitude: f32,
-    padding: vec3<f32>,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
 };
 
 struct SeaUniform {
@@ -57,7 +62,9 @@ struct SeaUniform {
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> sea: SeaUniform;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> waves: array<ShaderWave, 64>;
+// The length is `ocean::MAX_WAVES`, pushed as a shader def by the material's
+// `specialize`, so the array cannot be a different size from the uniform.
+@group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> waves: array<ShaderWave, #{MAX_WAVES}>;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -98,7 +105,7 @@ fn surface(plane: vec2<f32>) -> vec3<f32> {
 
 /// How much of the analytic displacement survives at a given distance.
 ///
-/// The grid that carries the near sea is fine enough to resolve the swell; the
+/// The disc that carries the near sea is fine enough to resolve the swell; the
 /// ring that carries it out to the horizon is not, and cannot be — a triangle
 /// tens of metres across samples a twenty metre wave as noise, and the result is
 /// a band of flicker at the horizon that is entirely a sampling artefact.
@@ -121,13 +128,12 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // *world* position and nothing else.
     //
     // This is the one line in the file that has to be right. The mesh is a window
-    // that follows the boat and snaps to its own cell size, so its local
-    // coordinates slide continuously and jump by a cell every time the snap
-    // advances. Take the phase from the local position and the whole sea is
-    // nailed to the mesh: it travels with the boat and lurches sideways by a cell
-    // width once a second — which is exactly the symptom that found this — and,
-    // worse, it is then a different sea from the one `vela_core` clips the hull
-    // against, which is the failure this module exists to prevent.
+    // that follows the boat, so its local coordinates slide continuously as the
+    // boat sails. Take the phase from the local position and the whole sea is
+    // nailed to the mesh: it travels with the boat — which is exactly the symptom
+    // that found this — and, worse, it is then a different sea from the one
+    // `vela_core` clips the hull against, which is the failure this module exists
+    // to prevent.
     //
     // Render x is north and render z is east, matching the CPU's
     // `Seaway::elevation(north, east, t)`.
@@ -226,11 +232,12 @@ fn ripple_slope(at: vec2<f32>) -> vec2<f32> {
 ///
 /// The realisation carries sixty spectral components from a quarter of the peak
 /// frequency to four times it. For a five second sea that is a shortest
-/// wavelength near three and a half metres, and the mesh samples it at one and a
-/// half — so everything below a metre is absent from the physics *and* from the
-/// geometry, and it is absent for good reasons in both. Extending the spectrum
-/// down to capillary waves would multiply the component count, and so the step
-/// cost, to model waves that a twelve metre hull integrates to nothing.
+/// wavelength near three and a half metres, and the mesh's cells are a metre
+/// across near the boat — so everything below a metre is absent from the physics
+/// *and* from the geometry, and it is absent for good reasons in both. Extending
+/// the spectrum down to capillary waves would multiply the component count, and
+/// so the step cost, to model waves that a twelve metre hull integrates to
+/// nothing.
 ///
 /// But that missing scale is most of what the eye uses to identify water. A
 /// surface with only metre-scale structure reads as painted plaster, which is

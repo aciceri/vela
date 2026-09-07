@@ -2,19 +2,21 @@
 //!
 //! # The sea is a moving window, not an ocean
 //!
-//! The surface is a finite grid that is kept centred on the boat and snapped to
-//! its own cell size. Because the elevation is a closed form of *world* position,
-//! moving the grid does not move the water: a wave crest stays where it is while
-//! the mesh slides under it. That is the whole reason the sea is shared as a
-//! realisation rather than as a height field — a height field would have to be
-//! rebuilt every time the window moved, and this does not have to be rebuilt at
-//! all.
+//! The surface is a finite disc kept centred on the boat. Because the elevation
+//! is a closed form of *world* position, moving the disc does not move the
+//! water: a wave crest stays where it is while the mesh slides under it. That is
+//! the whole reason the sea is shared as a realisation rather than as a height
+//! field — a height field would have to be rebuilt every time the window moved,
+//! and this does not have to be rebuilt at all.
 //!
-//! The snapping matters. Without it the grid's vertices would slide continuously
-//! and the surface would visibly crawl, because a coarse grid samples a wave
-//! differently depending on where its vertices land. Snapping to the cell size
-//! keeps every vertex on a fixed world lattice, so the sampling is stationary
-//! even while the window moves.
+//! What moves with the boat is the *sampling*: the vertices slide through the
+//! wave field, so the polygonal approximation of a crest shifts as the window
+//! goes by. A uniform lattice could have been snapped to its own cell size to
+//! hold the sampling still, and an earlier version was; a graded mesh has no
+//! lattice to snap to. The trade is taken with open eyes — see [`RINGS`] —
+//! because the crawl is a slow low-contrast shimmer in the middle distance,
+//! while the faceting a uniform grid produced near the boat was the first thing
+//! anyone noticed.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -31,30 +33,57 @@ use crate::frame;
 use crate::ocean::OceanMaterial;
 use crate::sim::Engine;
 
-/// Half-width of the drawn sea, m.
+/// Radius of the near sea, m.
 ///
-/// Two hundred metres of visible water around a twelve metre boat: far enough
-/// that the edge is not the first thing a viewer sees, near enough that the
-/// vertex count stays reasonable.
+/// Two hundred metres of finely drawn water around a twelve metre boat: far
+/// enough that the edge is not the first thing a viewer sees, near enough that
+/// the vertex count stays reasonable. The far ring picks up exactly here.
 const REACH: f32 = 200.0;
 
-/// Cells across the sea grid.
+/// Angular segments around the near disc and the far ring alike.
 ///
-/// 160 cells over 400 m is a 2.5 m cell. The shortest wave in the default
-/// realisation has a period near 1.5 s and so a length near 3.5 m, which this
-/// does not resolve — a deliberate trade, and worth stating plainly rather than
-/// discovering: the short waves carry little of the variance, the grid is sized
-/// for the swell that carries most of it, and the fragment stage puts the missing
-/// centimetre scale back as a normal perturbation. A viewer sees the sea the boat
-/// is riding; the boat feels all of it, because the physics samples the closed
-/// form per hull triangle and never touches this grid.
+/// One constant for both because the two meshes meet at `REACH`, and they meet
+/// cleanly only if their rims are the same polygon: the disc's outermost row
+/// and the ring's innermost are then the same vertices, computed the same way,
+/// and the seam is watertight without any overlap to fight over depth. A
+/// hundred and sixty is 2.25 degrees a segment, which at the rim is a cell just
+/// under eight metres across and at the horizon a silhouette straight enough
+/// that no facet shows.
+const SEGMENTS: u32 = 160;
+
+/// Rings of vertices across the near disc, from [`CORE`] out to [`REACH`].
 ///
-/// Down from 256, which was measured rather than guessed. Every vertex evaluates
-/// the whole sixty-component sum, so the grid alone was running eight million
-/// transcendentals a frame and the frame budget showed it. Beyond about 130 m the
-/// displacement is faded out anyway (see `resolved` in `shaders/ocean.wgsl`), so
-/// most of what the extra density bought was detail in water that is drawn flat.
-const CELLS: u32 = 160;
+/// Together with [`SEGMENTS`] this is the near sea's vertex budget: a hundred
+/// and sixty rings of a hundred and sixty is 25,601 vertices with the centre,
+/// the same budget as the 161-by-161 square grid it replaced. That budget was
+/// measured rather than guessed — every vertex evaluates the whole
+/// sixty-component wave sum, and a 257-square was running eight million
+/// transcendentals a frame for detail in water that is faded flat anyway (see
+/// `resolved` in `shaders/ocean.wgsl`).
+///
+/// The spacing is geometric, each ring a fixed ratio further out than the last
+/// — 3.4 per cent here — so a cell grows in proportion to its radius: a metre
+/// across at thirty metres, three and a half at a hundred, six and a half at the
+/// rim. That is what keeps a cell roughly constant in *screen* space for a
+/// camera looking down at a plane, and it is why the near water is smooth where
+/// a uniform grid of the same budget was a visible mesh of 2.5 m facets against
+/// a shortest wave of 3.5 m.
+///
+/// A square grid graded the same way was tried first and is worth recording as
+/// the wrong shape: grading separably along each axis produces cells that are
+/// fine in one direction and coarse in the other everywhere except the diagonal,
+/// and along the axes through the boat they degenerate to slivers three
+/// centimetres by five metres. A disc has one radial direction and grades along
+/// it alone.
+const RINGS: u32 = 160;
+
+/// Radius of the innermost ring of the near disc, m.
+///
+/// Inside it is a fan of triangles from a single vertex at the boat's origin.
+/// With the ratio above the first cells out from here are close to square —
+/// 3.4 per cent of the radius one way, 3.9 the other — and a metre puts the
+/// whole fan under the transom.
+const CORE: f32 = 1.0;
 
 /// Outer radius of the far sea, m.
 ///
@@ -68,20 +97,12 @@ const CELLS: u32 = 160;
 /// trade for one constant.
 const HORIZON: f32 = 8_000.0;
 
-/// Angular segments around the far sea.
-///
-/// The ring is a disc seen almost edge-on, so its silhouette against the sky is
-/// the only part of it a viewer really reads, and 128 segments make that
-/// silhouette a 2.8 degree polygon — straight enough that no facet shows.
-/// Doubling it would double a vertex count for nothing visible.
-const HORIZON_SEGMENTS: u32 = 128;
-
 /// Concentric rings across the far sea.
 ///
 /// Forty-eight bands over a fortyfold change in radius, which is where the
 /// geometric spacing in [`horizon_ring`] lands: each band about eight per cent
-/// wider than the one inside it. The whole ring is then under a tenth of the
-/// near grid's vertices, which is the point — uniform spacing fine enough for
+/// wider than the one inside it. The whole ring is then under a third of the
+/// near disc's vertices, which is the point — uniform spacing fine enough for
 /// the inner rim would need thousands of rings, and every band past a kilometre
 /// would draw triangles smaller than a pixel.
 const HORIZON_RINGS: u32 = 48;
@@ -122,70 +143,60 @@ pub struct Sea;
 #[derive(Component)]
 pub struct Chase;
 
-/// How sharply the sea grid's cells grow with distance from the boat.
+/// Vertices on `rings + 1` concentric rings from `inner` to `outer`, in the render
+/// plane, `segments` around each.
 ///
-/// One would be a uniform grid, and a uniform grid is what made the water look
-/// polygonal. The trouble is dimensional: 160 cells over 400 m is a 2.5 m cell,
-/// while the shortest wave the realisation carries is about 3.5 m long, so a crest
-/// was described by less than a cell and a half and came out as a zigzag. Adding
-/// cells fixes it and costs the frame budget — every vertex evaluates the whole
-/// sixty-component sum.
-///
-/// So the cells are graded instead. The same vertices, redistributed: sub-metre
-/// near the boat where a facet is a facet, tens of metres at the rim where the
-/// displacement is being faded out anyway and nothing is left to resolve. Two is
-/// cell size growing linearly with radius, which is the natural choice — it is
-/// what keeps a cell roughly constant in *screen* space for a camera looking down
-/// at a plane, the same argument the ripple detail uses.
-const GRADING: f32 = 2.0;
-
-/// Where a grid line sits along an axis, m.
-///
-/// Signed and symmetric about the boat: the grading applies outward in both
-/// directions from the middle of the window, not from one corner.
-///
-/// One property is given up here and it should be named. A uniform grid could be
-/// snapped to its own cell size, which kept every vertex on a fixed world lattice
-/// so the sampling stayed still while the window slid — see the module
-/// documentation. A graded grid has no such lattice, so its vertices move with the
-/// boat and the polygonal approximation shifts under the waves as it goes. That
-/// trade is worth taking: the crawl is a slow low-contrast shimmer in the middle
-/// distance, and the faceting it buys out was the first thing anyone noticed. It is
-/// also the trade every geometry clipmap makes, for the same reason.
-fn graded(index: u32, cells: u32, reach: f32) -> f32 {
-    // Parameter in [-1, 1] across the window.
-    let parameter = 2.0 * index as f32 / cells as f32 - 1.0;
-    parameter.abs().powf(GRADING) * parameter.signum() * reach
+/// The radial spacing is geometric: each ring sits a fixed ratio further out
+/// than the last, so that `rings` steps of it cover exactly the span asked for.
+/// Radii are computed from the power rather than accumulated, which keeps the
+/// rings where forty-eight roundings would not; and the outermost is set to
+/// `outer` outright rather than computed, because a mesh built to meet another
+/// at that radius has to land on it exactly, not to within a unit of the last
+/// place.
+fn polar_rows(inner: f32, outer: f32, segments: u32, rings: u32) -> Vec<[f32; 3]> {
+    let ratio = (outer / inner).powf(1.0 / rings as f32);
+    let arc = std::f32::consts::TAU / segments as f32;
+    let mut positions = Vec::with_capacity(((rings + 1) * segments) as usize);
+    for ring in 0..=rings {
+        let radius = if ring == rings {
+            outer
+        } else {
+            inner * ratio.powi(ring as i32)
+        };
+        for segment in 0..segments {
+            let angle = segment as f32 * arc;
+            positions.push([radius * angle.cos(), 0.0, radius * angle.sin()]);
+        }
+    }
+    positions
 }
 
-/// A flat grid in the render plane, for the ocean shader to displace.
-///
-/// Positions only: the shader computes the normal from the analytic slope, so an
-/// uploaded normal would be overwritten. No UVs either — nothing samples a
-/// texture.
-fn grid(reach: f32, cells: u32) -> Mesh {
-    let count = (cells + 1) as usize;
-    let mut positions = Vec::with_capacity(count * count);
-
-    for row in 0..=cells {
-        let north = graded(row, cells, reach);
-        for column in 0..=cells {
-            positions.push([graded(column, cells, reach), 0.0, north]);
-        }
-    }
-
-    let mut indices = Vec::with_capacity((cells * cells * 6) as usize);
-    for row in 0..cells {
-        for column in 0..cells {
-            let here = row * (cells + 1) + column;
-            let next = here + cells + 1;
+/// Two triangles per quad between consecutive rings laid out by [`polar_rows`],
+/// whose first vertex is at index `first`.
+fn polar_bands(first: u32, segments: u32, rings: u32, indices: &mut Vec<u32>) {
+    for ring in 0..rings {
+        for segment in 0..segments {
+            // The seam closes by wrapping onto the ring's first column rather
+            // than by duplicating it, so there is no pair of coincident vertices
+            // to keep in step.
+            let beside_segment = (segment + 1) % segments;
+            let here = first + ring * segments + segment;
+            let beside = first + ring * segments + beside_segment;
+            let out = first + (ring + 1) * segments + segment;
+            let out_beside = first + (ring + 1) * segments + beside_segment;
             // Wound counter-clockwise seen from above, which is what puts the
             // front face towards a camera looking down at the water.
-            indices.extend_from_slice(&[here, next, here + 1]);
-            indices.extend_from_slice(&[here + 1, next, next + 1]);
+            indices.extend_from_slice(&[here, beside, out]);
+            indices.extend_from_slice(&[out, beside, out_beside]);
         }
     }
+}
 
+/// Positions only, for the ocean shader to displace.
+///
+/// The shader computes the normal from the analytic slope, so an uploaded
+/// normal would be overwritten. No UVs either — nothing samples a texture.
+fn sea_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
@@ -194,9 +205,33 @@ fn grid(reach: f32, cells: u32) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
+/// A flat disc of radius `outer`, for the ocean shader to displace.
+///
+/// A fan from the centre to the ring at `core`, then `rings - 1` geometric bands
+/// out to the rim — the same construction as [`horizon_ring`] from a radius of
+/// zero, which is what a near sea and a far sea being one surface ought to look
+/// like in the code as well. See [`RINGS`] for why the near sea is a disc and
+/// not a square.
+fn near_disc(core: f32, outer: f32, segments: u32, rings: u32) -> Mesh {
+    let mut positions = Vec::with_capacity((1 + rings * segments) as usize);
+    positions.push([0.0, 0.0, 0.0]);
+    positions.extend(polar_rows(core, outer, segments, rings - 1));
+
+    let mut indices = Vec::with_capacity(((2 * rings - 1) * segments * 3) as usize);
+    for segment in 0..segments {
+        let beside = (segment + 1) % segments;
+        // Same orientation as the bands: centre, then the far corner, then the
+        // near one, so the fan's front face is the bands' front face.
+        indices.extend_from_slice(&[0, 1 + beside, 1 + segment]);
+    }
+    polar_bands(1, segments, rings - 1, &mut indices);
+
+    sea_mesh(positions, indices)
+}
+
 /// A flat annulus from `inner` to `outer`, for the ocean shader to displace.
 ///
-/// The near grid stops at two hundred metres, and beyond it there was
+/// The near disc stops at two hundred metres, and beyond it there was
 /// background: an edge that reads as a wall rather than as distance. This is the
 /// water that carries the eye from there to the horizon, and it can afford to be
 /// very coarse, because everything it draws is at least two hundred metres away
@@ -210,50 +245,11 @@ fn grid(reach: f32, cells: u32) -> Mesh {
 /// vertices in proportion to how much of the screen they cover, whereas uniform
 /// spacing is simultaneously too coarse at the inner rim and absurdly fine out
 /// near the horizon.
-///
-/// Positions only, like [`grid`], and for the same reason.
-pub fn horizon_ring(inner: f32, outer: f32, segments: u32, rings: u32) -> Mesh {
-    // Each ring sits a fixed ratio further out than the last, so that `rings`
-    // steps of it cover exactly the span asked for. Radii are computed from the
-    // power rather than accumulated, which keeps the outermost ring on `outer`
-    // instead of wherever forty-eight roundings drifted to.
-    let ratio = (outer / inner).powf(1.0 / rings as f32);
-    let arc = std::f32::consts::TAU / segments as f32;
-
-    let mut positions = Vec::with_capacity(((rings + 1) * segments) as usize);
-    for ring in 0..=rings {
-        let radius = inner * ratio.powi(ring as i32);
-        for segment in 0..segments {
-            let angle = segment as f32 * arc;
-            positions.push([radius * angle.cos(), 0.0, radius * angle.sin()]);
-        }
-    }
-
+fn horizon_ring(inner: f32, outer: f32, segments: u32, rings: u32) -> Mesh {
+    let positions = polar_rows(inner, outer, segments, rings);
     let mut indices = Vec::with_capacity((rings * segments * 6) as usize);
-    for ring in 0..rings {
-        for segment in 0..segments {
-            // The seam closes by wrapping onto the ring's first column rather
-            // than by duplicating it, so there is no pair of coincident vertices
-            // to keep in step.
-            let beside_segment = (segment + 1) % segments;
-            let here = ring * segments + segment;
-            let beside = ring * segments + beside_segment;
-            let out = (ring + 1) * segments + segment;
-            let out_beside = (ring + 1) * segments + beside_segment;
-            // Wound counter-clockwise seen from above, as in `grid`: the radial
-            // direction stands in for the grid's columns and the angular one for
-            // its rows, which makes this the same two triangles per quad.
-            indices.extend_from_slice(&[here, beside, out]);
-            indices.extend_from_slice(&[out, beside, out_beside]);
-        }
-    }
-
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_indices(Indices::U32(indices))
+    polar_bands(0, segments, rings, &mut indices);
+    sea_mesh(positions, indices)
 }
 
 /// Spawns the sea, the camera and the light.
@@ -271,56 +267,38 @@ pub fn spawn(
         let ocean = oceans.add(OceanMaterial::realising(sea, engine.sim.time()));
 
         commands.spawn((
-            Mesh3d(meshes.add(grid(REACH, CELLS))),
+            Mesh3d(meshes.add(near_disc(CORE, REACH, SEGMENTS, RINGS))),
             MeshMaterial3d(ocean.clone()),
             Transform::default(),
             Sea,
             // The sea casts no shadow. Nothing in this scene is under it, and
-            // leaving it a caster put both tessellations -- seventy-eight thousand
+            // leaving it a caster put both tessellations -- sixty-six thousand
             // triangles -- through the shadow pass once per cascade for an effect
             // that cannot exist. Measured: it was most of the frame.
             NotShadowCaster,
         ));
 
-        // Inner radius `REACH`, not `REACH * sqrt(2)`: the circle inscribed in
-        // the near grid's square rather than the one drawn around it. The grid's
-        // corners then overlap the ring instead of a gap opening between them,
-        // and the trade is the right way round. Overlap costs two tessellations
-        // of the same surface interpenetrating in four corner wedges, which two
-        // hundred metres away is a faint seam; a gap is a hole in the water.
+        // Inner radius `REACH` and the disc's `SEGMENTS`, so that the ring's
+        // innermost row is vertex for vertex the disc's rim: the same radius,
+        // the same angles, the same arithmetic. The seam is then closed by
+        // construction, with no gap for the sky to show through and no overlap
+        // for two tessellations to fight over depth in. The square grid this
+        // replaced overlapped the ring in four corner wedges and needed to be
+        // held a hand's breadth above it to settle the flicker; there is nothing
+        // left to settle, and the two sit at the same height.
         //
-        // Same `Sea` marker, so `follow_sea` carries this with the near grid. Its
-        // own vertex spacing is far coarser than the snap step, so the ring's
-        // sampling of the wave field is not stationary the way the grid's is —
-        // but a sixteen metre triangle drifting by a metre and a half is not
-        // something an eye can find at that range.
+        // Same `Sea` marker, so `follow_sea` carries this with the disc, and the
+        // ring's sampling of the wave field moves with the boat as the disc's
+        // does — but a sixteen metre triangle drifting is not something an eye
+        // can find at that range, and the displacement is faded out over it
+        // anyway.
         commands.spawn((
-            Mesh3d(meshes.add(horizon_ring(
-                REACH,
-                HORIZON,
-                HORIZON_SEGMENTS,
-                HORIZON_RINGS,
-            ))),
+            Mesh3d(meshes.add(horizon_ring(REACH, HORIZON, SEGMENTS, HORIZON_RINGS))),
             MeshMaterial3d(ocean),
-            // Held a hand's breadth below the near grid, and that offset is the
-            // whole fix for a real artefact.
-            //
-            // The ring's inner radius is the circle *inscribed* in the near grid's
-            // square, so the square's corners reach out to `REACH * sqrt(2)` and
-            // overlap the ring across a band two hundred metres wide. Out there
-            // both surfaces are flat -- the displacement has faded to nothing by
-            // 200 m -- so they are exactly coplanar, and two coplanar surfaces
-            // fighting over the same depth is the flicker that shows up as
-            // "something odd near the horizon".
-            //
-            // Five centimetres settles it in the near grid's favour everywhere
-            // they meet. At two hundred metres and beyond that is far under a
-            // pixel of parallax, and nothing else in the scene is within metres of
-            // the water to notice.
-            Transform::from_xyz(0.0, -0.05, 0.0),
+            Transform::default(),
             Sea,
             // The sea casts no shadow. Nothing in this scene is under it, and
-            // leaving it a caster put both tessellations -- seventy-eight thousand
+            // leaving it a caster put both tessellations -- sixty-six thousand
             // triangles -- through the shadow pass once per cascade for an effect
             // that cannot exist. Measured: it was most of the frame.
             NotShadowCaster,
@@ -394,11 +372,14 @@ pub fn spawn(
     //
     // Shadows are on, which the earlier comment here said they should not be. The
     // reasoning was that an ocean plane is a poor shadow receiver, and that is
-    // true of a *flat* one — but the surface is displaced, and the material's
-    // prepass shader displaces it identically, so the shadow map describes the
-    // water that is actually drawn. What it buys is the sails darkening the hull
-    // and the rig laying a shadow across the water, which is most of what tells a
-    // viewer the boat is in the scene rather than pasted onto it.
+    // true of a *flat* one — but the surface is displaced, and the ocean's
+    // fragment stage looks the shadow map up at the *displaced* world position
+    // (`fetch_directional_shadow` in `shaders/ocean.wgsl`), so the shadow lands
+    // on the water that is actually drawn. The sea itself is in no depth or
+    // shadow pass: the map is the boat's alone. What it buys is the sails
+    // darkening the hull and the rig laying a shadow across the water, which is
+    // most of what tells a viewer the boat is in the scene rather than pasted
+    // onto it.
     commands.spawn((
         DirectionalLight {
             illuminance: 13_000.0,
@@ -436,22 +417,20 @@ pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>
 
 /// Keeps the sea centred on the boat.
 ///
-/// Continuously, not snapped, and the change of mind is worth recording. A uniform
-/// grid could be snapped to its own cell size, which kept every vertex on a fixed
-/// world lattice so the sampling stayed still while the window slid — see the
-/// module documentation, which is still the right argument for a uniform grid.
-///
-/// The grid is graded now (see [`graded`]) and has no lattice to snap to, so
-/// snapping would only quantise the window's position into two-and-a-half-metre
-/// jumps while the sampling moved anyway: all of the lurch and none of the
-/// benefit. Following the boat exactly is both simpler and smoother.
+/// Continuously, not snapped, and the change of mind is worth recording. A
+/// uniform grid could be snapped to its own cell size, which kept every vertex
+/// on a fixed world lattice so the sampling stayed still while the window slid
+/// — the right argument for a uniform grid, and the module documentation says
+/// what it cost. A geometrically spaced disc has no lattice to snap to, so
+/// snapping would only quantise the window's position into jumps while the
+/// sampling moved anyway: all of the lurch and none of the benefit. Following
+/// the boat exactly is both simpler and smoother.
 pub fn follow_sea(engine: Res<Engine>, mut seas: Query<&mut Transform, With<Sea>>) {
     let centre = frame::to_render(engine.sim.state().position);
     for mut transform in &mut seas {
-        // Horizontal only. The two tessellations sit at different heights on
-        // purpose — see the ring's own comment — and overwriting the whole
-        // translation here would flatten them back together and bring the depth
-        // fighting with it.
+        // Horizontal only: the mean level is world `y = 0` and the boat's heave
+        // is the boat's. The two tessellations share that height, and their
+        // shared rim relies on it.
         transform.translation.x = centre.x;
         transform.translation.z = centre.z;
     }
@@ -494,26 +473,20 @@ impl Default for Orbit {
 ///
 /// Deliberately not on the arrow keys: those steer the boat, and a simulator
 /// that made looking around and steering the same gesture would be unusable.
+///
+/// Through [`Orbit::turn`] and [`Orbit::pull`], the same two entries the mouse
+/// uses, so the limits live in one place: this once carried its own copies of
+/// them with slightly different numbers, and the camera could be pulled to a
+/// distance by wheel that the keys then refused to hold.
 pub fn orbit(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut orbit: ResMut<Orbit>) {
     let dt = time.delta_secs();
-    if keys.pressed(KeyCode::KeyJ) {
-        orbit.azimuth += 1.2 * dt;
-    }
-    if keys.pressed(KeyCode::KeyL) {
-        orbit.azimuth -= 1.2 * dt;
-    }
-    if keys.pressed(KeyCode::KeyI) {
-        orbit.elevation = (orbit.elevation + 0.8 * dt).min(1.4);
-    }
-    if keys.pressed(KeyCode::KeyK) {
-        orbit.elevation = (orbit.elevation - 0.8 * dt).max(-0.2);
-    }
-    if keys.pressed(KeyCode::KeyU) {
-        orbit.distance = (orbit.distance * (1.0 - 0.9 * dt)).max(15.0);
-    }
-    if keys.pressed(KeyCode::KeyO) {
-        orbit.distance = (orbit.distance * (1.0 + 0.9 * dt)).min(400.0);
-    }
+    let held = |key: KeyCode| if keys.pressed(key) { 1.0 } else { 0.0 };
+    // Radians per second of bearing and of elevation, and a zoom rate per
+    // second, each as the difference of an opposing pair of keys.
+    let azimuth = 1.2 * dt * (held(KeyCode::KeyJ) - held(KeyCode::KeyL));
+    let elevation = 0.8 * dt * (held(KeyCode::KeyI) - held(KeyCode::KeyK));
+    orbit.turn(azimuth, elevation);
+    orbit.pull(1.0 + 0.9 * dt * (held(KeyCode::KeyO) - held(KeyCode::KeyU)));
 }
 
 impl Orbit {
@@ -630,19 +603,42 @@ pub fn chase(
 mod tests {
     use super::*;
 
-    /// The grid must be a closed lattice of quads with the vertex and index
-    /// counts that follow from the cell count.
+    /// The disc must be a closed fan and lattice of quads with the vertex and
+    /// index counts that follow from its ring and segment counts.
     ///
-    /// Cheap, and it catches the classic off-by-one where a grid of `n` cells is
-    /// built with `n` vertices per side instead of `n + 1` — which leaves a seam
-    /// a viewer sees as a crack in the water.
+    /// Cheap, and it catches the off-by-one where the bands are counted from the
+    /// centre rather than from the first ring — which either leaves a crack
+    /// around the rim or indexes past the last vertex.
     #[test]
-    fn the_grid_closes() {
-        let mesh = grid(10.0, 4);
-        assert_eq!(mesh.count_vertices(), 25);
+    fn the_disc_closes() {
+        let mesh = near_disc(1.0, 10.0, 8, 4);
+        assert_eq!(mesh.count_vertices(), 1 + 4 * 8);
         assert_eq!(
             mesh.indices().map(bevy::mesh::Indices::len),
-            Some(4 * 4 * 6)
+            Some(8 * 3 + 3 * 8 * 6)
         );
+    }
+
+    /// The far ring's innermost row must be the near disc's rim, exactly.
+    ///
+    /// Bitwise, not approximately: the two meshes sit at the same height with no
+    /// offset to hide behind, so a rim vertex a unit in the last place off the
+    /// ring's would open a hairline gap the sky shows through. Computing the rim
+    /// radius by repeated power instead of setting it is the plausible mistake,
+    /// and it fails this.
+    #[test]
+    fn the_seam_is_shared_vertex_for_vertex() {
+        let disc = near_disc(CORE, REACH, SEGMENTS, RINGS);
+        let ring = horizon_ring(REACH, HORIZON, SEGMENTS, HORIZON_RINGS);
+        let positions = |mesh: &Mesh| {
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                .and_then(bevy::mesh::VertexAttributeValues::as_float3)
+                .expect("positions")
+                .to_vec()
+        };
+        let rim = &positions(&disc)[(1 + (RINGS - 1) * SEGMENTS) as usize..];
+        let inner = &positions(&ring)[..SEGMENTS as usize];
+        assert_eq!(rim.len(), SEGMENTS as usize);
+        assert_eq!(rim, inner);
     }
 }

@@ -23,11 +23,11 @@
 //! # What is drawn and what is not
 //!
 //! The hull is the physics hull. The rig is drawn from the boat file's published
-//! IOR dimensions. The sails are flat triangles at the trimmed angle, and their
-//! *shape* is not modelled — the reference boat sails on the tabular
-//! aerodynamic model, which has no shape, only areas and centres of effort. That
-//! limitation is stated in [`boat`] rather than papered over with a plausible
-//! curve.
+//! IOR dimensions. The sails are the engine's own flying shape — camber, twist
+//! and sheeting angle from the controls the player holds, rebuilt as they move
+//! — while the *forces* come from the tabular aerodynamic model the reference
+//! boat sails on, which has no shape, only areas and centres of effort. That
+//! split is stated in [`boat`] rather than papered over.
 
 mod boat;
 mod frame;
@@ -69,14 +69,23 @@ fn main() {
         .init_resource::<view::Orbit>()
         .init_resource::<hud::FrameRate>()
         .add_systems(Startup, (boat::spawn, view::spawn, hud::spawn))
-        // Input before the fixed step, so a key held during a frame that runs
-        // several physics steps is applied to all of them rather than to the
-        // next frame's.
-        .add_systems(Update, helm::steer)
-        // Everything that reads the engine runs after it has stepped. Ordering
-        // is stated rather than left to insertion order: a HUD that read the
-        // pose before the step would be one frame stale, which is invisible and
-        // wrong.
+        // Input before the fixed step. `Update` runs *after* `RunFixedMainLoop`
+        // in Bevy's main schedule, so a `helm::steer` placed there would write
+        // the controls after every physics step of the frame had already read
+        // them: a key pressed in this frame would reach the engine in the next.
+        // `BeforeFixedMainLoop` is the slot Bevy provides for exactly this — a
+        // variable-rate system whose output the fixed step consumes — and it
+        // puts a key held during a frame that runs several steps into all of
+        // them rather than into none.
+        .add_systems(
+            RunFixedMainLoop,
+            helm::steer.in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+        )
+        // Everything that reads the engine runs after it has stepped, which
+        // `Update` guarantees by its place in the main schedule: no ordering
+        // edge is needed against the step or the helm. What is stated is the
+        // one edge that *is* an ordering within `Update` — the camera follows
+        // the boat's drawn pose, below.
         .add_systems(
             Update,
             (
@@ -85,8 +94,7 @@ fn main() {
                 view::advance_sea,
                 view::follow_sea,
                 hud::update,
-            )
-                .after(helm::steer),
+            ),
         )
         // The camera follows the boat's drawn pose, so it must run after it.
         .add_systems(

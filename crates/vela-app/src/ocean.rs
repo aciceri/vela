@@ -33,10 +33,11 @@
 //!
 //! Storage buffers would take the wave count at runtime and are the tidier tool.
 //! They do not exist under WebGL2, which is the browser target this frontend is
-//! for, so the waves travel as a fixed-length uniform array padded to WGSL's
-//! 16-byte stride. [`MAX_WAVES`] is the cap that follows, and a realisation
-//! carrying more is refused loudly rather than silently truncated — a sea drawn
-//! from the first 64 of 96 waves is a different sea.
+//! for, so the waves travel as a fixed-length uniform array whose element
+//! stride is a multiple of WGSL's sixteen bytes. [`MAX_WAVES`] is the cap that
+//! follows, and a realisation carrying more is refused loudly rather than
+//! silently truncated — a sea drawn from the first 64 of 96 waves is a different
+//! sea.
 //!
 //! # Why the shader is embedded
 //!
@@ -49,10 +50,14 @@
 //! The cost is no hot reload, which for a shader that transcribes a pinned
 //! contract is not a cost.
 
-use bevy::asset::{embedded_asset, embedded_path, AssetPath};
+use bevy::asset::embedded_asset;
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderType};
-use bevy::shader::ShaderRef;
+use bevy::render::render_resource::{
+    AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+};
+use bevy::shader::{ShaderDefVal, ShaderRef};
 use vela_core::seaway::Seaway;
 
 /// Waves the shader can carry.
@@ -60,18 +65,23 @@ use vela_core::seaway::Seaway;
 /// Sized by WebGL2's guaranteed 16 KiB uniform binding: 64 waves at 32 bytes is
 /// 2 KiB, comfortably inside it. `SeaState::components` defaults to 60, so the
 /// default sea fits and there is room to raise it a little without a redesign.
+///
+/// The WGSL array is sized from this constant through a shader def — see
+/// [`Material::specialize`] — so there is one number, not two that have to agree.
 pub const MAX_WAVES: usize = 64;
 
 /// One linear wave, in the layout WGSL wants.
 ///
 /// `vela_core::seaway::Wave` carries the same five numbers in `f64` with the
-/// direction as a tuple. This is that, narrowed to `f32` and padded: WGSL's
-/// std140 rules give every element of a uniform array a 16-byte aligned stride,
-/// and a struct that does not respect it silently mismatches the Rust side
-/// element by element — the failure is a sea that looks plausible and is not the
-/// one the boat is floating on.
+/// direction as a tuple. This is that, narrowed to `f32` and padded out to 32
+/// bytes: a uniform array's stride must be a multiple of 16, and the five
+/// payload floats plus the two-float alignment of the vector come to 24. Three
+/// scalar pads rather than a `Vec3`, which was what this had first — a `vec3` is
+/// 16-aligned in WGSL and `encase` follows suit, so that "padding" started at
+/// offset 32 and made the element 48 bytes, while the shader read it at 32. The
+/// picture was still a sea, and not the one the boat was floating on, which is
+/// the failure `the_wave_layout_matches_the_shader_stride` now pins.
 #[derive(ShaderType, Clone, Copy, Default, Debug)]
-#[repr(C)]
 pub struct ShaderWave {
     /// Wave vector `k d`, rad/m, in the render plane as `(north, east)`.
     pub wave_vector: Vec2,
@@ -81,8 +91,10 @@ pub struct ShaderWave {
     pub phase: f32,
     /// Amplitude, m.
     pub amplitude: f32,
-    /// Padding to the 16-byte stride. Never read.
-    pub padding: Vec3,
+    /// Padding to the 32-byte stride. Never read.
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
 }
 
 /// The scalars every wave shares.
@@ -151,7 +163,9 @@ impl OceanMaterial {
                 frequency: wave.frequency as f32,
                 phase: wave.phase as f32,
                 amplitude: wave.amplitude as f32,
-                padding: Vec3::ZERO,
+                pad0: 0.0,
+                pad1: 0.0,
+                pad2: 0.0,
             };
         }
 
@@ -176,24 +190,34 @@ impl OceanMaterial {
     /// Advances the sea's clock without rebuilding the waves.
     ///
     /// The waves are a property of the realisation and never change; only the
-    /// time does. Rewriting the array every frame would work and would upload
-    /// two kilobytes for no reason.
+    /// time does. This is not an upload optimisation and should not be read as
+    /// one: touching the asset at all marks it modified, and Bevy then rebuilds
+    /// the whole bind group — both uniforms, waves included — so the traffic is
+    /// the same whether one float or the whole array is written. What it keeps is
+    /// the statement that the realisation is fixed, which is the contract the
+    /// physics and the picture agree by.
     pub fn set_time(&mut self, time: f64) {
         self.sea.time = time as f32;
     }
 }
 
-/// One of this module's embedded shaders, as an asset path.
+/// An embedded shader of this crate, as an asset path.
 ///
-/// `embedded_path!` gives the path the `embedded_asset!` in [`OceanPlugin`]
+/// `embedded_path!` gives the path the `embedded_asset!` in the owning plugin
 /// registered it under; the `embedded` source has to be named explicitly because
 /// the default source is the filesystem. This is the same two-step
-/// `StandardMaterial` uses for its own shader.
+/// `StandardMaterial` uses for its own shader, and it is a macro rather than a
+/// function because `embedded_path!` reads `file!()` at its call site. Shared
+/// with [`crate::sky`] so the two materials cannot spell the path differently.
 macro_rules! embedded_shader {
     ($file:literal) => {
-        ShaderRef::Path(AssetPath::from_path_buf(embedded_path!($file)).with_source("embedded"))
+        ::bevy::shader::ShaderRef::Path(
+            ::bevy::asset::AssetPath::from_path_buf(::bevy::asset::embedded_path!($file))
+                .with_source("embedded"),
+        )
     };
 }
+pub(crate) use embedded_shader;
 
 impl Material for OceanMaterial {
     fn vertex_shader() -> ShaderRef {
@@ -204,14 +228,34 @@ impl Material for OceanMaterial {
         embedded_shader!("shaders/ocean.wgsl")
     }
 
-    /// The depth and shadow passes need the same displacement as the visible one.
+    /// Sizes the shader's wave array from [`MAX_WAVES`].
     ///
-    /// Without this override they get Bevy's default, which draws the flat grid:
-    /// the boat's shadow would then land on a plane at the mean water level while
-    /// the water it is supposed to fall on is a metre higher or lower. See
-    /// `shaders/ocean_prepass.wgsl`.
-    fn prepass_vertex_shader() -> ShaderRef {
-        embedded_shader!("shaders/ocean_prepass.wgsl")
+    /// The array length is a compile-time constant in WGSL, and writing it as a
+    /// literal in the shader would leave two copies of one number that only a
+    /// mismatched picture could tell apart. A shader def pushed here reaches
+    /// `ocean.wgsl` as `#{MAX_WAVES}`, the same mechanism Bevy uses for
+    /// `MATERIAL_BIND_GROUP`, and both stages get it because both declare the
+    /// binding.
+    ///
+    /// No prepass override, on purpose. The prepass and shadow passes would need
+    /// the same displacement as the visible pass, but neither runs for this
+    /// material: the camera carries no `DepthPrepass`, and both sea meshes are
+    /// `NotShadowCaster`. The boat's shadow still lands on the displaced water,
+    /// because the shadow map is the boat's own and the fragment stage samples it
+    /// at the displaced position — see `fetch_directional_shadow` in
+    /// `ocean.wgsl`. Nothing about the sea has to be rasterised for that.
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        let waves = ShaderDefVal::UInt("MAX_WAVES".into(), MAX_WAVES as u32);
+        descriptor.vertex.shader_defs.push(waves.clone());
+        if let Some(fragment) = &mut descriptor.fragment {
+            fragment.shader_defs.push(waves);
+        }
+        Ok(())
     }
 
     /// Opaque, and therefore depth-writing.
@@ -225,17 +269,16 @@ impl Material for OceanMaterial {
     }
 }
 
-/// Registers the ocean material and its shaders.
+/// Registers the ocean material and its shader.
 ///
-/// All together on purpose: a material whose shader was not embedded fails at
-/// the first frame with a missing-asset error, and the lines belong in one place
-/// so that cannot happen.
+/// Together on purpose: a material whose shader was not embedded fails at the
+/// first frame with a missing-asset error, and the lines belong in one place so
+/// that cannot happen.
 pub struct OceanPlugin;
 
 impl Plugin for OceanPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/ocean.wgsl");
-        embedded_asset!(app, "shaders/ocean_prepass.wgsl");
         app.add_plugins(MaterialPlugin::<OceanMaterial>::default());
     }
 }
@@ -301,13 +344,20 @@ mod tests {
 
     /// The Rust struct must occupy the stride the WGSL array assumes.
     ///
-    /// If this ever fails, the uniform is being read element by element at the
-    /// wrong offset and the drawn sea has nothing to do with the computed one.
-    /// Cheaper to assert here than to recognise on screen.
+    /// Asked of `encase`, which is what actually lays the uniform out, rather
+    /// than of `size_of`: the Rust size of a struct says nothing about its GPU
+    /// size, and the previous version of this test passed at 32 bytes while the
+    /// uniform was being written at 48. If this ever fails, the uniform is being
+    /// read element by element at the wrong offset and the drawn sea has nothing
+    /// to do with the computed one. Cheaper to assert here than to recognise on
+    /// screen.
     #[test]
     fn the_wave_layout_matches_the_shader_stride() {
-        assert_eq!(std::mem::size_of::<ShaderWave>(), 32);
-        assert_eq!(std::mem::align_of::<ShaderWave>() % 4, 0);
+        assert_eq!(<ShaderWave as ShaderType>::min_size().get(), 32);
+        assert_eq!(
+            <[ShaderWave; MAX_WAVES] as ShaderType>::min_size().get(),
+            32 * MAX_WAVES as u64
+        );
     }
 
     /// A realisation too large to draw is refused rather than truncated.

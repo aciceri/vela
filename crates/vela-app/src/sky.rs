@@ -25,6 +25,7 @@ use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::load_shader_library;
 use bevy::shader::ShaderRef;
 
+use crate::ocean::embedded_shader;
 use crate::view::Chase;
 
 /// Direction *towards* the sun, in the render frame, normalised on use.
@@ -105,9 +106,10 @@ impl SkyMaterial {
     }
 }
 
-/// The embedded WGSL, as an asset path.
+/// The embedded WGSL, as an asset path — the same way [`crate::ocean`] names
+/// its own, so that neither spells the `embedded://` path by hand.
 fn shader() -> ShaderRef {
-    "embedded://vela_app/shaders/sky.wgsl".into()
+    embedded_shader!("shaders/sky.wgsl")
 }
 
 impl Material for SkyMaterial {
