@@ -35,6 +35,8 @@ features = [
   "ui_bevy_render",
   "bevy_winit",
   "default_font",
+  # The boat model's textures are JPEG; see `boat`.
+  "jpeg",
   "std",
 ]
 

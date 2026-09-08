@@ -1,31 +1,45 @@
-//! The boat: the physics hull, drawn, and the rig above it.
+//! The boat: a visual model worn over the physics hull, and the rig above it.
 //!
-//! # There is one hull
+//! # Two hulls, and which one is true
 //!
-//! The mesh rendered here is the mesh `modules::Buoyancy` integrates pressure
-//! over — lofted from the boat file's station offsets by `vela_core::loft`, not a
-//! visual model that happens to resemble it. The boat format carries no visual
-//! mesh on purpose: two hulls that could drift apart is a bug with no symptom
-//! until the waterline is somewhere the picture disagrees with.
+//! The hull the physics integrates pressure over is lofted from the boat file's
+//! station offsets by `vela_core::loft`; it is watertight, has a flat deck lid,
+//! no coachroof and no appendages, because the pressure integral needs none of
+//! those. It used to be the hull drawn, on the principle that two hulls could
+//! drift apart with no symptom until the waterline disagreed with the picture.
+//! It looked like what it was, and a viewer said so.
 //!
-//! What that costs is honesty rather than beauty. The physics hull is a
-//! watertight lofted surface with a flat deck lid and no coachroof, no sheerline
-//! detail and no appendages, because none of those are things the pressure
-//! integral needs. It looks like what it is.
+//! What is drawn now is a textured model — `models/sailboat.glb`, "Sailboat"
+//! by Sergei (sergeif) on Sketchfab, CC BY 4.0 — prepared in Blender into the
+//! render frame at the physics hull's length: aft perpendicular at `x = 0`,
+//! stem at the lofted hull's length, canoe body on the baseline, and its own
+//! sheer within six centimetres of the lofted one. The rest of its shape is the
+//! model's, not the file's: its keel is shallower than the physics' and its
+//! beam a few centimetres narrower. Those are the errors accepted, and they
+//! are stated here rather than hidden because the principle above was right:
+//! the physics hull is still the only one that decides where the waterline
+//! is, and the model is a skin that fits it at the stations that matter.
 //!
-//! # The spars are the file's and the sails are the engine's
+//! The model was stripped of its sails and rigging and split into three
+//! meshes — hull, mast, boom — because the spars have to follow the *rig*
+//! dimensions of the boat file, not the model's: the mast mesh is a unit-high
+//! spar at the origin, scaled to the file's masthead; the boom a unit-long spar
+//! pointing aft from the gooseneck, scaled to `E` and swung by the sheeting
+//! angle like the box it replaced. The glb is embedded in the binary for the
+//! reason the shaders are: nothing to fetch, nothing to fail.
 //!
-//! Mast and boom are simple geometry placed from the boat file's rig
-//! dimensions. The sails are the flying shape [`vela_core::flying`] computes
-//! for the control positions the player is holding — camber, draft, twist and
-//! the sheeting angle, all from the engine's own statement of what the cloth
-//! does — and they are rebuilt whenever that statement changes. What the
-//! drawing does **not** claim is that the *forces* come from that shape: the
-//! reference boat sails on the tabular aerodynamic model, which reads areas, an
-//! aspect ratio and an angle and never asks for a shape. [`sail_mesh`] says why
+//! # The sails are the engine's
+//!
+//! The sails are the flying shape [`vela_core::flying`] computes for the
+//! control positions the player is holding — camber, draft, twist and the
+//! sheeting angle, all from the engine's own statement of what the cloth does
+//! — and they are rebuilt whenever that statement changes. What the drawing
+//! does **not** claim is that the *forces* come from that shape: the reference
+//! boat sails on the tabular aerodynamic model, which reads areas, an aspect
+//! ratio and an angle and never asks for a shape. [`sail_mesh`] says why
 //! drawing the shape anyway is the honest way round.
 
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{embedded_asset, RenderAssetUsages};
 use bevy::mesh::Indices;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
@@ -34,7 +48,6 @@ use vela_core::aero::Sail;
 use vela_core::flying::Shape;
 use vela_core::frames::file_to_body;
 use vela_core::geometry::Point;
-use vela_core::TriMesh;
 
 use crate::frame;
 use crate::reflection;
@@ -47,42 +60,40 @@ use crate::sim::Engine;
 #[derive(Component)]
 pub struct Boat;
 
-/// Converts an engine hull into a render mesh.
+/// The model, embedded; see the module documentation.
+const MODEL: &str = "embedded://vela_app/models/sailboat.glb";
+
+/// The three meshes of the model, by the index the glTF exporter gave them:
+/// nodes are written in name order, and the file was checked after export.
+/// Raise the number here if the model is ever re-exported with more parts.
+const MODEL_BOOM: usize = 0;
+const MODEL_HULL: usize = 1;
+const MODEL_MAST: usize = 2;
+
+/// A mesh of the model, as an asset path the glTF loader resolves to the
+/// primitive itself rather than to a scene.
+fn model_mesh(index: usize) -> String {
+    format!("{MODEL}#Mesh{index}/Primitive0")
+}
+
+/// The model's one material — the baked colour, roughness and normal maps —
+/// which all three meshes share. `bevy_pbr` registers the `StandardMaterial`
+/// it builds from each glTF material under the glTF label with `/std` after
+/// it; the bare label is the loader's own `GltfMaterial`.
+fn model_material() -> String {
+    format!("{MODEL}#Material0/std")
+}
+
+/// Embeds the model in the binary.
 ///
-/// Normals are computed per face and written per vertex of a duplicated triangle
-/// list rather than averaged over a shared vertex. That is the right choice for
-/// this mesh and not laziness: a lofted hull has a hard chine at the deck edge
-/// and a hard stem, and averaging across them would round off exactly the edges
-/// that say what shape the boat is.
-#[must_use]
-pub fn hull_mesh(hull: &TriMesh) -> Mesh {
-    let count = hull.triangle_count();
-    let mut positions = Vec::with_capacity(count * 3);
-    let mut normals = Vec::with_capacity(count * 3);
+/// Only that: the systems are registered by `main`, where their order against
+/// the rest of the frame is stated in one place.
+pub struct BoatPlugin;
 
-    for index in 0..count {
-        let triangle = hull.triangle(index);
-        // The engine's winding is outward by the `TriMesh` contract; the frame
-        // map is a proper rotation, so it survives the conversion and the
-        // renderer sees front faces from outside.
-        let area_normal = triangle.area_normal();
-        let normal = frame::to_render(area_normal).normalize_or_zero();
-        for vertex in [triangle.a, triangle.b, triangle.c] {
-            positions.push(frame::to_render(vertex).to_array());
-            normals.push(normal.to_array());
-        }
+impl Plugin for BoatPlugin {
+    fn build(&self, app: &mut App) {
+        embedded_asset!(app, "models/sailboat.glb");
     }
-
-    let indices: Vec<u32> = (0..positions.len() as u32).collect();
-
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        // RENDER_WORLD alone: the hull is rigid, so nothing ever reads it back.
-        RenderAssetUsages::RENDER_WORLD,
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(Indices::U32(indices))
 }
 
 /// Panels across a sail's chord.
@@ -133,21 +144,33 @@ const PANELS: usize = 14;
 /// `flying` says the caller owes it, rather than carry a sign through every
 /// formula in the geometry.
 ///
-/// The tack is the engine's literal body point, `z` being `tack_above_water`
-/// negated: the engine applies its sail forces at heights above the water as if
-/// the body origin were on the waterline. The body origin is in fact on the
-/// baseline, forty centimetres below the design waterline on the reference
-/// boat, so the drawn foot sits about half a metre below the boom the rig
-/// letters place. Drawn rather than corrected, on purpose: a renderer that
-/// quietly offset the engine's datum would be hiding an engine error, and the
-/// gap is that error made visible.
+/// # The cut
+///
+/// The shape's luff runs straight up its own `z` from the tack, which is where
+/// `flying` leaves placement to the rig. For a main that *is* the placement:
+/// the luff is the mast. For a jib the luff is the forestay, which runs from
+/// the tack on the stemhead aft and up to the masthead, so the drawn jib
+/// stood on end above the bow with its head five metres ahead of the mast,
+/// and its foot ran aft at deck level straight through the coachroof. `Cut`
+/// is the two corrections a sailmaker would make: each section is moved aft
+/// by its height times the stay's rake, `J / I`, which lays the luff on the
+/// stay with the head at the masthead; and the foot is lifted towards the
+/// clew, which is the foot angle every headsail is cut with so that the clew
+/// clears the deck. Both are shears rather than rotations, so a chord stays a
+/// chord and the flying shape's angles are the ones drawn. The area drawn
+/// changes by nothing the eye can find and the forces do not read it at all.
 ///
 /// Two-sided, because a sail seen from the leeward side would otherwise vanish.
 /// The two windings get opposed normals, so each face is lit as the surface it is.
-fn sail_mesh(shape: &Shape, tack: Point, mirror: f64) -> Mesh {
+fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
     let tack = file_to_body(tack);
     let station = |along: f64, up: f64| {
-        let body = tack + file_to_body(shape.point(along, up));
+        let mut file = shape.point(along, up);
+        // Aft by the rake, and up by the foot's rise: `along` runs from the
+        // luff to the leech, `file.z` from the tack to the head.
+        file.x -= cut.rake * file.z;
+        file.z += cut.foot_rise * along * (1.0 - up);
+        let body = tack + file_to_body(file);
         frame::to_render(Vector3::new(body.x, mirror * body.y, body.z))
     };
 
@@ -204,28 +227,21 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64) -> Mesh {
     .with_inserted_indices(Indices::U32((0..count).collect()))
 }
 
-/// Spawns the hull, the mast and two sails under one pose entity.
+/// Spawns the model's hull, its mast and boom placed by the rig, and two sails
+/// under one pose entity.
 pub fn spawn(
     mut commands: Commands,
     engine: Res<Engine>,
+    assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let hull = meshes.add(hull_mesh(&engine.hull));
-    let white = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.88, 0.88, 0.86),
-        perceptual_roughness: 0.6,
-        ..default()
-    });
+    let skin: Handle<StandardMaterial> = assets.load(model_material());
     let cloth = materials.add(StandardMaterial {
         base_color: Color::srgb(0.95, 0.95, 0.93),
         perceptual_roughness: 0.9,
         double_sided: true,
         cull_mode: None,
-        ..default()
-    });
-    let spar = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.25, 0.25, 0.28),
         ..default()
     });
 
@@ -254,26 +270,38 @@ pub fn spawn(
     commands
         .spawn((Boat, Transform::default(), Visibility::default()))
         .with_children(|boat| {
-            boat.spawn((Mesh3d(hull), MeshMaterial3d(white), layers.clone()));
-
-            // Mast: a box of the published diameter, from the sheer to the
-            // masthead. Round would be prettier and would need a cylinder mesh.
+            // The hull is already in the render frame at the physics hull's
+            // length; see the module documentation.
             boat.spawn((
-                Mesh3d(meshes.add(Cuboid::new(
-                    rig.mast_diameter,
-                    rig.masthead - rig.sheer,
-                    rig.mast_diameter,
-                ))),
-                MeshMaterial3d(spar.clone()),
-                Transform::from_xyz(rig.mast_at, 0.5 * (rig.masthead + rig.sheer), 0.0),
+                Mesh3d(assets.load(model_mesh(MODEL_HULL))),
+                MeshMaterial3d(skin.clone()),
                 layers.clone(),
             ));
 
-            // Boom: from the mast aft along the foot, at the published height.
+            // Mast: the model's, a unit-high spar at its foot, stood on the
+            // sheer and stretched to the masthead. Its width is the model's
+            // own, scaled with the hull, and not the file's diameter.
             boat.spawn((
-                Mesh3d(meshes.add(Cuboid::new(rig.main_foot, 0.14, 0.14))),
-                MeshMaterial3d(spar),
-                Transform::from_xyz(rig.mast_at - 0.5 * rig.main_foot, rig.boom, 0.0),
+                Mesh3d(assets.load(model_mesh(MODEL_MAST))),
+                MeshMaterial3d(skin.clone()),
+                Transform::from_xyz(rig.mast_at, rig.sheer, 0.0).with_scale(Vec3::new(
+                    1.0,
+                    rig.masthead - rig.sheer,
+                    1.0,
+                )),
+                layers.clone(),
+            ));
+
+            // Boom: the model's, a unit-long spar pointing aft from the
+            // gooseneck, stretched to the foot. `trim` swings it.
+            boat.spawn((
+                Mesh3d(assets.load(model_mesh(MODEL_BOOM))),
+                MeshMaterial3d(skin),
+                Transform::from_xyz(rig.mast_at, rig.boom, 0.0).with_scale(Vec3::new(
+                    rig.main_foot,
+                    1.0,
+                    1.0,
+                )),
                 Boom,
                 layers.clone(),
             ));
@@ -295,13 +323,15 @@ pub fn spawn(
             for (sail, tack, shape) in
                 vela_core::assembly::sail_shapes(&engine.spec, *engine.sim.controls())
             {
+                let cut = Cut::of(sail, &rig);
                 boat.spawn((
-                    Mesh3d(meshes.add(sail_mesh(&shape, tack, mirror))),
+                    Mesh3d(meshes.add(sail_mesh(&shape, tack, mirror, cut))),
                     MeshMaterial3d(cloth.clone()),
                     DrawnSail {
                         sail,
                         shape,
                         mirror,
+                        cut,
                     },
                     layers.clone(),
                 ));
@@ -311,15 +341,49 @@ pub fn spawn(
 
 /// A drawn sail: which one, and what its mesh was last built from.
 ///
-/// The mesh is a function of the flying shape and of the tack the boat is on,
-/// and of nothing else. Holding both is what lets [`trim`] rebuild it exactly
-/// when one of them changes and leave it alone otherwise.
+/// The mesh is a function of the flying shape, of the tack the boat is on and
+/// of the cut, and of nothing else. Holding all three is what lets [`trim`]
+/// rebuild it exactly when one of them changes and leave it alone otherwise.
 #[derive(Component)]
 pub struct DrawnSail {
     sail: Sail,
     shape: Shape,
     /// The body-`y` mirror the mesh was built with — see [`sail_mesh`].
     mirror: f64,
+    cut: Cut,
+}
+
+/// How a sail is cut onto its rig; see [`sail_mesh`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cut {
+    /// Aft displacement of the luff per metre of height: `J / I` for a jib
+    /// on its forestay, zero for a main on its mast.
+    rake: f64,
+    /// Rise of the foot from tack to clew, m.
+    foot_rise: f64,
+}
+
+impl Cut {
+    /// A sail whose luff is a straight spar: the main.
+    const STRAIGHT: Self = Self {
+        rake: 0.0,
+        foot_rise: 0.0,
+    };
+
+    /// The cut for a sail on this rig.
+    ///
+    /// The jib's foot rise is a metre and a quarter: enough that the clew of a
+    /// five-metre foot clears a coachroof of the usual height, and a foot angle
+    /// of thirteen degrees, which is what a genoa's is.
+    fn of(sail: Sail, rig: &Rig) -> Self {
+        match sail {
+            Sail::Jib if rig.foretriangle_height > 0.0 => Self {
+                rake: f64::from(rig.foretriangle_base / rig.foretriangle_height),
+                foot_rise: 1.25,
+            },
+            _ => Self::STRAIGHT,
+        }
+    }
 }
 
 /// Marks the boom, which swings with the mainsail.
@@ -353,7 +417,6 @@ struct Rig {
     foretriangle_height: f32,
     /// `J`, the foretriangle base forward of the mast, m.
     foretriangle_base: f32,
-    mast_diameter: f32,
 }
 
 impl From<&Engine> for Rig {
@@ -382,7 +445,6 @@ impl From<&Engine> for Rig {
             main_foot: frame::metres(rig.main_foot),
             foretriangle_height: frame::metres(rig.foretriangle_height),
             foretriangle_base: frame::metres(rig.foretriangle_base),
-            mast_diameter: frame::metres(rig.mast_diameter).max(0.08),
         }
     }
 }
@@ -432,7 +494,7 @@ pub fn trim(
                 continue;
             }
             if let Some(mut existing) = meshes.get_mut(mesh) {
-                *existing = sail_mesh(shape, *tack, mirror);
+                *existing = sail_mesh(shape, *tack, mirror, drawn.cut);
                 drawn.shape = *shape;
                 drawn.mirror = mirror;
             }
@@ -442,19 +504,15 @@ pub fn trim(
     let Some((_, _, main)) = shapes.iter().find(|(sail, _, _)| *sail == Sail::Main) else {
         return;
     };
-    let rig = Rig::from(&*engine);
     // A rotation of `θ` about render `y` takes the boom tip at `(-E, 0, 0)` to
     // `z = E sin θ`, and render `z` is the engine's `y`, which is starboard. The
     // foot's chord angle is measured to leeward, so `θ` carries the sign of the
     // leeward direction on the body `y` axis — which is what `leeward_sign` is.
+    // The boom mesh's origin is the gooseneck, so the pivot is the transform's
+    // own and nothing has to be moved back.
     let rotation = Quat::from_rotation_y((leeward * main.chord_angle(0.0)) as f32);
-    // The boom pivots at the mast, so the rotation is about a point the child
-    // transform does not sit on: rotate, then put the midpoint back where the
-    // rotation left it.
     for mut transform in &mut booms {
         transform.rotation = rotation;
-        transform.translation = Vec3::new(rig.mast_at, rig.boom, 0.0)
-            + rotation * Vec3::new(-0.5 * rig.main_foot, 0.0, 0.0);
     }
 }
 
@@ -476,29 +534,4 @@ fn leeward_sign(engine: &Engine) -> f64 {
         .get("aero.apparent_wind.angle")
         .unwrap_or(1.0);
     vela_core::sim::leeward_sign(angle)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A hull mesh must carry three vertices per triangle and nothing else.
-    ///
-    /// The check that matters is the count: a mesh built from shared vertices
-    /// would silently average the normals across the deck edge, and the failure
-    /// is a rounded chine nobody notices.
-    #[test]
-    fn the_hull_mesh_keeps_its_faces_apart() {
-        let hull = TriMesh::new(
-            vec![
-                vela_core::geometry::Point::new(0.0, 0.0, 0.0),
-                vela_core::geometry::Point::new(1.0, 0.0, 0.0),
-                vela_core::geometry::Point::new(0.0, 1.0, 0.0),
-                vela_core::geometry::Point::new(0.0, 0.0, 1.0),
-            ],
-            vec![[0, 1, 2], [0, 1, 3]],
-        );
-        let mesh = hull_mesh(&hull);
-        assert_eq!(mesh.count_vertices(), 6);
-    }
 }

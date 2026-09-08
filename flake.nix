@@ -216,9 +216,9 @@
                   $out/vela-app_bg.wasm
                 mv $out/vela-app_bg.wasm.opt $out/vela-app_bg.wasm
 
-                # No assets directory: the ocean shader is embedded in the
-                # binary, so what a browser needs is the module, the glue and the
-                # page. Anything else here would be a file nobody fetches.
+                # No assets directory: the shaders and the boat model are
+                # embedded in the binary, so what a browser needs is the module,
+                # the glue and the page. Anything else here would be a file nobody fetches.
                 cp crates/vela-app/index.html $out/index.html
 
                 # Printed because it is the number that decides whether anyone

@@ -61,12 +61,14 @@ fn main() {
         }))
         // The ocean's shader is embedded in the binary rather than loaded from
         // an assets directory, so there is no asset path to configure and no
-        // directory to ship. See `ocean`.
+        // directory to ship. See `ocean`. The boat's model is embedded the same
+        // way, by `boat::BoatPlugin`.
         .add_plugins(ocean::OceanPlugin)
         // The sky owns the sun, and registers the atmosphere library that it and
         // the ocean both import. Before the ocean would work too; after it is
         // where a reader looks for "what is the water reflecting".
         .add_plugins(sky::SkyPlugin)
+        .add_plugins(boat::BoatPlugin)
         .add_plugins(sim::EnginePlugin)
         .init_resource::<view::Orbit>()
         .init_resource::<hud::FrameRate>()

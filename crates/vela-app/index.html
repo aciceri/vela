@@ -30,6 +30,15 @@
         text-align: center;
         pointer-events: none;
       }
+      #credit {
+        position: absolute;
+        right: 8px;
+        bottom: 6px;
+        font-size: 11px;
+        color: #8fa0b0;
+        text-decoration: none;
+        opacity: 0.8;
+      }
     </style>
   </head>
   <body>
@@ -40,6 +49,15 @@
         condition solved before the first frame</small
       >
     </div>
+    <!-- CC BY 4.0 asks for this, and it is owed regardless: the boat drawn is
+         somebody's work. Kept out of the canvas so the HUD stays the engine's. -->
+    <a
+      id="credit"
+      href="https://sketchfab.com/3d-models/sailboat-76d0b1e24be14d2f9a524bfce3001aeb"
+      target="_blank"
+      rel="noopener"
+      >boat model: “Sailboat” by Sergei (sergeif), CC BY 4.0</a
+    >
     <script type="module">
       import init from "./vela-app.js";
 
