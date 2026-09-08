@@ -28,6 +28,12 @@ jobs:
 
   # Each check is a derivation: `vela` builds the workspace and runs cargo test
   # in its check phase, `wasm` cross-builds to wasm32, plus fmt and clippy.
+  #
+  # The `web` check *is* the browser bundle, so it is uploaded from here as the
+  # Pages artifact rather than rebuilt by the publish job: runners share no Nix
+  # store, and a second `nix build` of the same derivation on a fresh runner is
+  # the whole cross-compilation again, a quarter of an hour, to produce bytes
+  # this job already has.
   nix-build:
     name: ${{ matrix.name }} (${{ matrix.system }})
     needs: nix-matrix
@@ -38,12 +44,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
-      - run: nix build -L '.#${{ matrix.attr }}'
+      - run: nix build -L '.#${{ matrix.attr }}' --out-link result
+      - name: Copy the bundle out of the store
+        if: matrix.name == 'web'
+        # The store path is read-only and the upload action needs to walk a
+        # normal directory, so dereference the symlink and drop the permissions.
+        run: |
+          set -Eeu
+          cp -rL result site
+          chmod -R u+w site
+      - uses: actions/upload-pages-artifact@v4
+        if: matrix.name == 'web'
+        with:
+          path: site
 
   # Publishes the browser bundle, which is how anyone is meant to see this
   # project at all. Only from the default branch: a preview per pull request
   # would need one deployment environment per branch and this is a physics
-  # engine, not a web product.
+  # engine, not a web product. Deploys the artifact the `web` check uploaded;
+  # builds nothing.
   pages:
     name: Publish the simulator
     needs: nix-build
@@ -57,19 +76,5 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - name: Build the bundle
-        run: nix build -L '.#vela-web' --out-link result
-      - name: Copy out of the store
-        # The store path is read-only and the upload action needs to walk a
-        # normal directory, so dereference the symlink and drop the permissions.
-        run: |
-          set -Eeu
-          cp -rL result site
-          chmod -R u+w site
-      - uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
       - id: deploy
         uses: actions/deploy-pages@v4
