@@ -142,6 +142,9 @@ pub struct SeaUniform {
     pub deep: Vec3,
     /// Colour where the surface faces the sky, linear RGB.
     pub shallow: Vec3,
+    /// Colour of light scattered *through* a thin crest lit from behind,
+    /// linear RGB.
+    pub scatter: Vec3,
     /// Direction towards the sun, `.w` unused.
     ///
     /// Taken from [`crate::sky::SUN`] rather than chosen here: the same constant
@@ -168,6 +171,10 @@ pub struct SeaUniform {
     /// of the realisation, computed once from it. `.zw` carry the hull's
     /// length and greatest half-breadth, m, for the bow wave.
     pub wind: Vec4,
+    /// Choppiness `λ` of the realisation, `SeaState::choppiness`: the number
+    /// the shader moves its parcels sideways by, which is the number the
+    /// physics clips the hull with.
+    pub choppiness: f32,
 }
 
 /// Samples of the stern's track the shader can carry.
@@ -251,23 +258,29 @@ impl OceanMaterial {
         }
         let downwind = downwind.normalize_or(Vec2::X);
 
-        // Deeper and less saturated than a postcard sea on purpose. This is the
-        // *transmitted* colour, seen only where the Fresnel term lets it through;
-        // the blue a viewer actually reads is mostly the reflected sky, which is
-        // how water works and why picking water colours by eye without the
-        // reflection in place produces something that looks like paint.
+        // The palette is Sea of Thieves' (Ang, SIGGRAPH 2018), by request: a
+        // saturated deep blue, a turquoise where the water is thin or faces the
+        // sky, and a green for light scattered *through* a crest. These are
+        // the *transmitted* colours, seen only where the Fresnel term lets
+        // them through; the blue a viewer reads at a distance is mostly the
+        // reflected sky, which is how water works and why picking water colours
+        // by eye without the reflection in place produces paint. The first
+        // palette was a North Atlantic in winter - grey-steel, desaturated -
+        // and read as lifeless next to a boat in sunshine.
         Self {
             sea: SeaUniform {
                 count: source.len() as u32,
                 time: time as f32,
                 significant_height: sea.state().significant_height as f32,
                 trail_count: 0,
-                deep: Vec3::new(0.004, 0.022, 0.045),
-                shallow: Vec3::new(0.055, 0.200, 0.180),
+                deep: Vec3::new(0.005, 0.038, 0.095),
+                shallow: Vec3::new(0.030, 0.290, 0.330),
+                scatter: Vec3::new(0.040, 0.520, 0.400),
                 sun: crate::sky::SUN.normalize().extend(0.0),
                 motion: Vec4::ZERO,
                 heading: Vec4::new(1.0, 0.0, 0.0, 0.0),
                 wind: Vec4::new(downwind.x, downwind.y, 0.0, 0.0),
+                choppiness: sea.state().choppiness as f32,
             },
             waves,
             trail: [TrailPoint::default(); MAX_TRAIL],
@@ -455,6 +468,7 @@ mod tests {
                 components,
                 seed: 9,
                 spreading: 8.0,
+                choppiness: 0.8,
             },
             9.81,
         )

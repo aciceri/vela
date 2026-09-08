@@ -79,8 +79,22 @@ const WIND_ANGLE: f64 = 40.0;
 /// sea to flatter the model would be the wrong lever; choosing it to stay
 /// inside what the model can do is the right one, and the number goes back up
 /// when the stall model lands.
+///
+/// Until then, `VELA_WAVE_HEIGHT` in the environment overrides it, for looking
+/// at the *water* in weather: at two metres the sea reads as a sea, and the
+/// boat, for the reasons above, does not sail in it.
 const WAVE_HEIGHT: f64 = 0.5;
 const WAVE_PERIOD: f64 = 6.0;
+
+/// The significant wave height the boat is released into: the constant, or
+/// the override; see [`WAVE_HEIGHT`].
+fn wave_height() -> f64 {
+    std::env::var("VELA_WAVE_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|height: &f64| height.is_finite() && *height >= 0.0)
+        .unwrap_or(WAVE_HEIGHT)
+}
 
 /// The simulation, and the mesh it was built from.
 ///
@@ -203,10 +217,14 @@ impl Engine {
         let sea = Seaway2D::new(
             wind,
             SeaState {
-                significant_height: WAVE_HEIGHT,
+                significant_height: wave_height(),
                 peak_period: WAVE_PERIOD,
                 // Travelling towards the boat: waves come from where the wind does.
                 heading: WIND_ANGLE.to_radians() + std::f64::consts::PI,
+                // What a sea looks like: crests pinched, troughs flat. Costs
+                // half a step again over the linear sea (`frame_cost`), and the
+                // physics feels the asymmetry too, which is right.
+                choppiness: 0.8,
                 ..SeaState::default()
             },
         );

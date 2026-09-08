@@ -27,7 +27,11 @@ const STEPS_PER_FRAME: f64 = (1.0 / 60.0) / STEP;
 const SPEC: &str = include_str!("../../../boats/yd41-form-study.ron");
 
 /// Builds a sim and times a run of steps, returning microseconds per step.
-fn cost(points_per_station: usize, components: usize) -> Result<(f64, usize), String> {
+fn cost(
+    points_per_station: usize,
+    components: usize,
+    choppiness: f64,
+) -> Result<(f64, usize), String> {
     let spec = BoatSpec::parse_ron(SPEC).map_err(|error| error.to_string())?;
     let loft = LoftOptions { points_per_station };
     let triangles = vela_core::loft_hull(
@@ -42,6 +46,7 @@ fn cost(points_per_station: usize, components: usize) -> Result<(f64, usize), St
             significant_height: 1.0,
             peak_period: 5.0,
             components,
+            choppiness,
             ..SeaState::default()
         },
     );
@@ -78,23 +83,24 @@ fn main() {
     );
     println!("defaults: {default_points} sections, {default_components} wave components\n");
 
-    println!("    points  waves  triangles     us/step   frame at 60 Hz");
-    for (points, components) in [
-        (default_points, default_components),
-        (default_points, 16),
-        (default_points, 4),
-        (13, default_components),
-        (13, 16),
-        (9, 16),
+    println!("    points  waves  chop  triangles     us/step   frame at 60 Hz");
+    for (points, components, choppiness) in [
+        (default_points, default_components, 0.0),
+        (default_points, default_components, 0.8),
+        (default_points, 16, 0.0),
+        (default_points, 4, 0.0),
+        (13, default_components, 0.0),
+        (13, 16, 0.0),
+        (9, 16, 0.0),
     ] {
-        match cost(points, components) {
+        match cost(points, components, choppiness) {
             Ok((micros, triangles)) => {
                 let frame = micros * STEPS_PER_FRAME / 16_666.7 * 100.0;
                 println!(
-                    "  {points:8}  {components:5}  {triangles:9}  {micros:10.1}  {frame:8.0} %"
+                    "  {points:8}  {components:5}  {choppiness:4}  {triangles:9}  {micros:10.1}  {frame:8.0} %"
                 );
             }
-            Err(error) => println!("  {points:8}  {components:5}  failed: {error}"),
+            Err(error) => println!("  {points:8}  {components:5}  {choppiness:4}  failed: {error}"),
         }
     }
 }

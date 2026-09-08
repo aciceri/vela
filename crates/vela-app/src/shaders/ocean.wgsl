@@ -29,12 +29,14 @@
 //
 // On top of Seascape's core, each stated where it lives: a wind sea of four
 // Gerstner components as slope only (`wind_sea`), crest sharpening of the
-// physical slope (Horvath 2015, in `fragment`), whitecaps from the swell's
-// curvature and the wind sea's Jacobian (`foam`), the bow wave (`bow_wave`) and
-// the wake along the stern's recorded track (`wake`), Smith self-shadowing for
-// a low sun (`sun_visible`), the boat's shadow fetched from Bevy's cascades and
-// its mirror image from `crate::reflection`'s camera. None of it moves a
-// vertex: the geometry is the engine's and stays so.
+// physical slope (Horvath 2015, in `fragment`), whitecaps where the swell's
+// Jacobian says a parcel is folding - remembered for a few seconds on the
+// parcel (`vertex`) - and where the wind sea's own says so, the bow wave
+// (`bow_wave`) and the wake along the stern's recorded track (`wake`), all
+// drawn as a lit, textured layer (`foam`); light through thin crests; Smith
+// self-shadowing for a low sun (`sun_visible`); the boat's shadow fetched from
+// Bevy's cascades and its mirror image from `crate::reflection`'s camera. The
+// only geometry is the engine's: the choppy displacement is the physics' own.
 
 #import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_world}
 #import bevy_pbr::mesh_view_bindings::view
@@ -66,6 +68,9 @@ struct SeaUniform {
     trail_count: u32,
     deep: vec3<f32>,
     shallow: vec3<f32>,
+    /// Colour of light scattered *through* a thin crest, linear RGB; see the
+    /// sub-surface term in `fragment`.
+    scatter: vec3<f32>,
     /// Direction towards the sun, `.w` unused. From `sky::SUN`, so the highlight
     /// and the light on the boat cannot disagree.
     sun: vec4<f32>,
@@ -79,8 +84,11 @@ struct SeaUniform {
     /// texture is live.
     heading: vec4<f32>,
     /// Downwind `(x, z)`: the realisation's mean direction of travel, unit.
-    /// What the wind sea runs along.
     wind: vec4<f32>,
+    /// Choppiness `lambda` of the realisation: how far parcels move sideways,
+    /// as a fraction of the Gerstner orbit. The physics clips the hull with
+    /// the same number; see `surface`.
+    choppiness: f32,
 };
 
 /// One recorded point of the stern's track: `(x, z)` in the render plane, the
@@ -115,56 +123,109 @@ struct VertexOutput {
     /// recovered from `world_position.y` because the mesh follows the boat and
     /// the boat is not at `y = 0`.
     @location(2) elevation: f32,
-    /// Magnitude of the surface slope. The steepness a crest reaches is what
-    /// decides where foam goes, and it is already computed in the height loop.
+    /// Magnitude of the surface slope: what the statistical self-shadowing
+    /// reads, and it is already computed in the height loop.
     @location(3) steepness: f32,
-    /// The surface's second derivatives `(zeta_xx, zeta_zz, zeta_xz)`, 1/m:
-    /// its curvature, which peaks *at* a crest where the slope is zero, and is
-    /// what the crest foam is gated on. See `Surface`.
-    @location(4) curvature: vec3<f32>,
+    /// How much foam the swell has put on this parcel of water, `[0, 1]`:
+    /// the crest is folding now, or folded in the last few seconds and the
+    /// foam has not yet dissolved. See `surface` for how it is remembered.
+    @location(4) foam: f32,
+    /// How much thinner this crest is than the water around it, `[0, 1]`:
+    /// `1 - J` clamped, which is where the crest is being squeezed sideways
+    /// and light gets through. What the sub-surface term reads.
+    @location(5) thinness: f32,
 };
 
-/// Everything one pass over the waves knows about the surface at a point.
+/// Everything one pass over the waves knows about the surface at a parcel.
 struct Surface {
     height: f32,
+    /// Horizontal displacement `D` of the parcel, m, in the render plane.
+    shift: vec2<f32>,
+    /// `d zeta / d q`.
     slope: vec2<f32>,
-    /// `(zeta_xx, zeta_zz, zeta_xz)`.
-    curvature: vec3<f32>,
+    /// The derivatives of the displacement, `(dDx/dx, dDz/dz, dDx/dz)`.
+    strain: vec3<f32>,
 };
 
-/// Elevation, its two surface slopes and its three second derivatives, from
-/// one pass over the waves.
+/// The determinant of the map from rest position to displaced position:
+/// `J = (1 + dDx/dx)(1 + dDz/dz) - (dDx/dz)^2`. One where the water has not
+/// moved sideways, less than one where parcels have been squeezed together -
+/// a crest being sharpened - and below zero where they would have crossed,
+/// which is a wave folding over. Tessendorf 2001 §4.4.
+fn jacobian(strain: vec3<f32>) -> f32 {
+    return (1.0 + strain.x) * (1.0 + strain.y) - strain.z * strain.z;
+}
+
+/// The parcel at rest position `plane`, at a time, from one pass over the
+/// waves: where it is, how high, and how the water around it is strained.
 ///
-/// The slopes come out of the same loop as the height because they are the same
-/// derivative: d/dx of a cos is -k_x a sin, so a second pass would cost another
-/// sixty-four sines to learn nothing new. The normal is then exact for the
-/// surface actually drawn rather than reconstructed from neighbouring vertices,
-/// which is what keeps the lighting from showing the grid.
+/// This is `vela_core::seaway::Seaway`'s Lagrangian construction, transcribed:
 ///
-/// The curvature is the same cosine again, times `-k_i k_j`: three multiplies
-/// per wave on a value already computed. It is what Tessendorf's foam
-/// criterion reads — the Jacobian of a virtual horizontal displacement
-/// `lambda * grad(zeta)` is `det(I + lambda * H)` with `H` this Hessian, and
-/// where it drops below one the crest would be folding over if the water were
-/// allowed to move sideways (Tessendorf 2001 §4.4; Dupuy & Bruneton 2012).
-/// The water here is not allowed to move sideways, because the hull is
-/// clipped against the sum as it stands; but the *criterion* is still the
-/// right one for where a linear crest is steepest at its top, which the
-/// slope, largest on the flank, is not.
-fn surface(plane: vec2<f32>) -> Surface {
+/// ```text
+/// X(q, t) = q - lambda * sum a_i d_i sin(theta_i)
+/// zeta(q, t) =        sum a_i     cos(theta_i)
+/// ```
+///
+/// with `lambda` the choppiness (`sea.choppiness`), the same number the physics
+/// clips the hull with. A sum of cosines has crests as round as its troughs; a
+/// real sea does not, because the water in a wave moves in circles, and this
+/// horizontal term is that motion. It pinches the crests and flattens the
+/// troughs, which is the difference between plaster and water. The physics
+/// evaluates the same surface the other way round - which parcel is under a
+/// world point - and `the_choppy_surface_is_the_one_the_parcels_draw` in
+/// `vela_core` is what keeps the two sides on one surface.
+///
+/// The slopes and the strain come out of the same loop because they are the
+/// same sine and cosine: d/dq of `a cos` is `-a k sin`, and d/dq of
+/// `-lambda a d sin` is `-lambda a k d d cos`. The normal is then exact for
+/// the surface actually drawn rather than reconstructed from neighbouring
+/// vertices, which is what keeps the lighting from showing the grid.
+fn surface(plane: vec2<f32>, time: f32) -> Surface {
     var height: f32 = 0.0;
+    var shift: vec2<f32> = vec2<f32>(0.0, 0.0);
     var slope: vec2<f32> = vec2<f32>(0.0, 0.0);
-    var curvature: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+    var strain: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+    let lambda = sea.choppiness;
     for (var index: u32 = 0u; index < sea.count; index = index + 1u) {
         let wave = waves[index];
         let k = wave.wave_vector;
-        let angle = dot(k, plane) - wave.frequency * sea.time + wave.phase;
-        let rise = wave.amplitude * cos(angle);
-        height = height + rise;
-        slope = slope - k * wave.amplitude * sin(angle);
-        curvature = curvature - vec3<f32>(k.x * k.x, k.y * k.y, k.x * k.y) * rise;
+        let angle = dot(k, plane) - wave.frequency * time + wave.phase;
+        let c = wave.amplitude * cos(angle);
+        let s = wave.amplitude * sin(angle);
+        height = height + c;
+        slope = slope - k * s;
+        // `k` is `|k| d`, so `d s = k s / |k|` and `|k| d d c = k k c / |k|`.
+        let magnitude = max(length(k), 1e-6);
+        shift = shift - lambda * k * s / magnitude;
+        strain = strain - lambda * vec3<f32>(k.x * k.x, k.y * k.y, k.x * k.y) * c / magnitude;
     }
-    return Surface(height, slope, curvature);
+    return Surface(height, shift, slope, strain);
+}
+
+/// The strain alone, for a moment in the past: what `surface` computes, minus
+/// the height and the shift nobody asked for.
+fn strain_at(plane: vec2<f32>, time: f32) -> vec3<f32> {
+    var strain: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+    let lambda = sea.choppiness;
+    for (var index: u32 = 0u; index < sea.count; index = index + 1u) {
+        let wave = waves[index];
+        let k = wave.wave_vector;
+        let angle = dot(k, plane) - wave.frequency * time + wave.phase;
+        let c = wave.amplitude * cos(angle);
+        let magnitude = max(length(k), 1e-6);
+        strain = strain - lambda * vec3<f32>(k.x * k.x, k.y * k.y, k.x * k.y) * c / magnitude;
+    }
+    return strain;
+}
+
+/// How much a parcel is folding, `[0, 1]`, from its Jacobian.
+///
+/// Foam appears well before the fold is complete: a crest whose water has
+/// been squeezed by a third is already breaking at the top, and the caps on
+/// a two-metre sea are on most crests. A calm never gets near the lower
+/// edge, so it keeps a clean surface without a gate of its own.
+fn folding(strain: vec3<f32>) -> f32 {
+    return smoothstep(0.06, 0.32, 1.0 - jacobian(strain));
 }
 
 /// How much of the analytic displacement survives at a given distance.
@@ -215,7 +276,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // to prevent.
     //
     // Render x is north and render z is east, matching the CPU's
-    // `Seaway::elevation(north, east, t)`.
+    // `Seaway::elevation(north, east, t)`. The mesh vertex is the parcel's
+    // *rest* position; where it is drawn is where the parcel has gone.
     let base = mesh_position_local_to_world(world_from_local, vec4<f32>(vertex.position, 1.0));
     let plane = base.xz;
 
@@ -223,21 +285,43 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // ask how far this vertex is from the middle of the window, because that is
     // what decides how coarsely the mesh samples there.
     let distance = length(vertex.position.xz);
-    let wave = surface(plane);
-    let displacement = wave.height * resolved(distance);
-    let slope = wave.slope * shaded(distance);
+    let resolve = resolved(distance);
+    let shade = shaded(distance);
+    let wave = surface(plane, sea.time);
+    let displacement = wave.height * resolve;
+    let shift = wave.shift * resolve;
+    let slope = wave.slope * shade;
+    let strain = wave.strain * shade;
 
-    let world = vec3<f32>(base.x, base.y + displacement, base.z);
+    let world = vec3<f32>(base.x + shift.x, base.y + displacement, base.z + shift.y);
 
-    // The surface is y = zeta(x, z), so its normal is (-dzeta/dx, 1, -dzeta/dz).
-    let normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+    // The normal of a displaced surface is the cross product of its two
+    // tangents, `(1 + dDx/dx, dzeta/dx, dDz/dx)` and `(dDx/dz, dzeta/dz, 1 + dDz/dz)`,
+    // which reduces to `(-dzeta/dx, 1, -dzeta/dz)` when nothing moves sideways.
+    let along_x = vec3<f32>(1.0 + strain.x, slope.x, strain.z);
+    let along_z = vec3<f32>(strain.z, slope.y, 1.0 + strain.y);
+    let normal = normalize(cross(along_z, along_x));
+
+    // Foam is remembered by the water, not by a buffer: the same parcel is
+    // asked whether it was folding a moment ago, and a moment before that,
+    // and whatever it answers is faded by the time since. The parcel is the
+    // right thing to ask because foam rides on the water - it moves with the
+    // orbit, and a Lagrangian sample follows the orbit for free. Three samples
+    // over four seconds is the persistence a cap has in a fresh breeze: bright
+    // as it breaks, a patch for a few seconds, gone in five (Sea of Thieves
+    // keeps a simulated accumulation buffer for the same effect; this is the
+    // analytic sea's way of having one without a render pass).
+    var foam = folding(strain);
+    foam = max(foam, 0.65 * folding(strain_at(plane, sea.time - 1.4) * shade));
+    foam = max(foam, 0.35 * folding(strain_at(plane, sea.time - 2.8) * shade));
 
     var out: VertexOutput;
     out.world_position = world;
     out.world_normal = normal;
     out.elevation = displacement;
     out.steepness = length(slope);
-    out.curvature = wave.curvature * shaded(distance);
+    out.foam = foam;
+    out.thinness = clamp(1.0 - jacobian(strain), 0.0, 1.0);
     out.clip_position = position_world_to_clip(world);
     return out;
 }
@@ -431,7 +515,7 @@ struct WindSea {
 /// whitecaps and the texture a viewer reads as "water". Without them the
 /// surface here read as rolling plaster, and that was the complaint.
 ///
-/// So four Gerstner components, spread thirty degrees either side of the
+/// So four Gerstner components, spread forty-five degrees either side of the
 /// wind, contribute their **slope** to the normal and nothing to the geometry:
 /// the same knowing dishonesty as the ripples, one scale up, stated the same
 /// way. Gerstner rather than sine because the wind sea's crests are sharp and
@@ -473,15 +557,24 @@ fn wind_sea(plane: vec2<f32>, time: f32, distance: f32) -> WindSea {
     let gust = mix(0.25, 1.0, smoothstep(-0.4, 0.4, paw));
 
     // Four components between one and three metres, on bearings within
-    // thirty degrees of the wind: the short end of a fetch-limited spectrum,
+    // forty-five degrees of the wind: the short end of a fetch-limited spectrum,
     // below what the realisation carries and above the ripple noise. Their
     // steepness `ak` is where the layer's whole look lives - at 0.03 they are
     // barely there, at 0.15 they are near the breaking limit where they add
     // and the Jacobian caps them; the sea's state sets it in between.
     var wavelengths = array<f32, 4>(1.3, 1.9, 2.4, 3.1);
-    var bearings = array<f32, 4>(-0.45, 0.2, -0.15, 0.5);
+    var bearings = array<f32, 4>(-0.7, 0.3, -0.2, 0.8);
     var offsets = array<f32, 4>(0.0, 1.9, 4.1, 2.7);
-    let steepness = mix(0.03, 0.15, smoothstep(0.0, 1.5, sea.significant_height)) * gust;
+    let steepness = mix(0.02, 0.09, smoothstep(0.0, 1.5, sea.significant_height)) * gust;
+
+    // Short crests. A component with one phase across the whole plane is a
+    // crest a kilometre long, and four of them interfere into corduroy. A
+    // real wind wave's crest is a wavelength or two long before it hands over
+    // to its neighbour, which is a phase that wanders across the plane. One
+    // slow noise supplies the wandering, and each component reads it with its
+    // own gain so their crests do not wander together.
+    let wander = ripple_value(plane / 7.0 + vec2<f32>(3.1, 1.7)) * 8.0;
+    var gains = array<f32, 4>(1.0, -0.8, 0.6, -1.2);
 
     var slope = vec2<f32>(0.0, 0.0);
     var jxx = 1.0;
@@ -494,7 +587,7 @@ fn wind_sea(plane: vec2<f32>, time: f32, distance: f32) -> WindSea {
         let omega = sqrt(9.81 * k);
         let amplitude = steepness / k;
         let direction = downwind * cos(bearings[index]) + across * sin(bearings[index]);
-        let phase = k * dot(direction, plane) - omega * time + offsets[index];
+        let phase = k * dot(direction, plane) - omega * time + offsets[index] + wander * gains[index];
         let s = sin(phase);
         let c = cos(phase);
         // Height `A cos(phase)`, the same form as the physical sea so the two
@@ -510,45 +603,61 @@ fn wind_sea(plane: vec2<f32>, time: f32, distance: f32) -> WindSea {
     let jacobian = jxx * jzz - jxz * jxz;
     // Gated where the fold is real rather than where it is merely positive:
     // caps on the sharpest crests, none on the rest, and the whole thing
-    // scaled with the sea so a calm has none.
-    let fold = smoothstep(0.4, 0.85, 1.0 - jacobian) * fade;
+    // scaled with the sea so a calm has none. The gate is lower than the
+    // swell's because these components are the ones that actually break in a
+    // breeze - Beaufort three has scattered caps, and the eye expects them.
+    let fold = smoothstep(0.22, 0.7, 1.0 - jacobian) * fade;
     return WindSea(slope * fade, fold);
 }
 
-/// Foam coverage in `[0, 1]`: whitecaps on the wind sea's folding crests, and
-/// on the swell's crests where the swell itself is steep enough to.
+/// A layer of foam on a fragment: how much of it the bubbles cover, and which
+/// way the bubbles face.
+struct Foam {
+    coverage: f32,
+    /// Slope of the bubble surface, to tilt the shading normal by.
+    bumps: vec2<f32>,
+};
+
+/// Foam from an energy in `[0, 1]` - how much foam the water here *should*
+/// carry, from whichever source: the swell's folds with their memory, the
+/// wind sea's caps, the bow wave, the wake.
 ///
 /// Not a model of breaking. Real whitecapping starts when a crest's particle
-/// velocity approaches the phase speed, which linear superposition cannot reach —
-/// this surface never breaks, however hard it blows. What it does have is the
-/// *criterion* for breaking, on two scales.
+/// velocity approaches the phase speed, and what is drawn is where the
+/// Jacobians say the water has been squeezed enough to; the energy is that,
+/// and this is what foam of that energy looks like.
 ///
-/// The swell's is its curvature: Tessendorf's `J = det(I + lambda H)` with `H`
-/// the Hessian the vertex loop carries and `lambda` the virtual choppiness a
-/// Gerstner sea of the same spectrum would have. It goes below one where a
-/// crest would be folding, which for a half-metre swell is nowhere and for a
-/// three-metre one is on every steep crest — the earlier gate on slope
-/// magnitude fired on the flanks instead, where a linear wave is steepest,
-/// and needed the height to say "no, the crest", which the curvature says by
-/// itself. The wind sea's is its own Jacobian, computed with it. Both are
-/// broken up by the ripple slope the caller has already computed, so the
-/// coverage has an edge rather than a gradient — foam is a patch of bubbles,
-/// not an airbrush — and so that a third noise lookup is not paid for the
-/// privilege.
-fn foam(detail: vec2<f32>, curvature: vec3<f32>, wind_fold: f32, significant_height: f32) -> f32 {
-    if (significant_height <= 0.0) {
-        return 0.0;
+/// # Why a threshold on a texture and not a mix
+///
+/// Foam is bubbles: a patch is either there or not, its edge is lace, and it
+/// has holes. Mixing white in by the energy - the first version - gave an
+/// airbrush, and a viewer read it as paint on the water. Sea of Thieves puts
+/// its peak mask through a noise threshold instead, so the patches grow from
+/// the noise's own peaks as the energy rises and dissolve back into them as it
+/// falls, and that is what this does: two octaves of the same gradient noise
+/// the ripples use, a coarse one for the patch shapes and a fine one for the
+/// lace, drifting slowly so the foam does not sit still on moving water.
+///
+/// The fine octave's slope is returned as bumps, so the caller can light the
+/// foam as a rough white surface rather than as a colour: a cap in the sun
+/// is bright on the side facing it and blue-grey behind, and that is where
+/// the thickness a flat mask lacks comes from.
+fn foam(plane: vec2<f32>, time: f32, energy: f32) -> Foam {
+    if (energy <= 0.02) {
+        return Foam(0.0, vec2<f32>(0.0, 0.0));
     }
-    // Virtual choppiness, m: what a trochoidal sea of this height would move
-    // its water sideways by. Scaled with the sea so the criterion is the
-    // same shape in a chop and in a gale.
-    let lambda = 1.6 * max(significant_height, 0.5);
-    let jxx = 1.0 + lambda * curvature.x;
-    let jzz = 1.0 + lambda * curvature.y;
-    let jxz = lambda * curvature.z;
-    let swell_fold = smoothstep(0.35, 0.8, 1.0 - (jxx * jzz - jxz * jxz));
-    let mottle = 0.45 + 12.0 * length(detail);
-    return clamp(max(swell_fold, wind_fold) * mottle, 0.0, 1.0);
+    let drift = vec2<f32>(0.11, 0.07) * time;
+    let coarse = ripple_value((plane + drift) / 0.9);
+    let fine = ripple_value((plane - drift * 0.6) / 0.22);
+    // In [0, 1] roughly; the coarse octave shapes the patch, the fine one
+    // frays its edge.
+    let texture = 0.5 + 0.55 * coarse + 0.3 * fine;
+    // The energy lowers the bar the texture has to clear: at full energy
+    // almost everything is foam, at a tenth only the noise's peaks are.
+    let bar = 0.92 - 0.85 * energy;
+    let coverage = smoothstep(bar, bar + 0.18, texture);
+    let bumps = ripple_slope((plane - drift * 0.6) / 0.22) * 0.35;
+    return Foam(coverage, bumps);
 }
 
 /// Foam of the bow wave in `[0, 1]`.
@@ -793,9 +902,23 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // volume rather than a painted sheet. Attenuated with distance because at
     // range the effect is below what the haze leaves visible.
     let attenuation = max(1.0 - distance * distance * 2.5e-6, 0.0);
-    transmitted = transmitted
-        + sea.shallow * clamp(in.elevation / max(significant_height, 0.2), -1.0, 1.0)
-            * 0.22 * attenuation;
+    let crest = clamp(in.elevation / max(significant_height, 0.2), -1.0, 1.0);
+    transmitted = transmitted + sea.shallow * crest * 0.22 * attenuation;
+
+    // Light through the crest. A wave seen against the sun is lit from behind,
+    // and where the crest is thin the light comes through it green: the
+    // turquoise glow on the back of a breaking wave, which is the single most
+    // recognisable thing about Sea of Thieves' water and is in every
+    // photograph of a sea with the sun low. The term is the usual one (Crest,
+    // Sea of Thieves): the view direction against the sun's, raised to a
+    // power so it is a lobe and not a wash, times how high the crest is and
+    // how much the choppiness has thinned it - `thinness` is `1 - J`, the
+    // sideways squeeze, which is exactly where a crest is narrow. Scaled by
+    // the sun's visibility so a shadowed crest does not glow.
+    let through = pow(max(dot(eye, sun), 0.0), 3.0);
+    let thin = max(crest, 0.0) * (0.35 + 2.5 * in.thinness);
+    let scatter = sea.scatter * through * thin * attenuation * seen;
+    transmitted = transmitted + scatter;
 
     var colour = mix(transmitted, reflected, fresnel);
     colour = mix(colour, boat.rgb, boat.a * fresnel);
@@ -827,23 +950,38 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     colour = colour
         + glitter(normal, sun, eye, distance) * vec3<f32>(1.0, 0.96, 0.86) * sun_up * lit * seen;
     // And take the sun's share out of the transmitted colour where it is blocked.
-    colour = colour - sea.shallow * wrapped * 0.22 * (1.0 - fresnel) * (1.0 - lit);
+    colour = colour - (sea.shallow * wrapped * 0.22 + scatter) * (1.0 - fresnel) * (1.0 - lit);
 
     // Foam sits on top of everything: it is a surface of bubbles, not a property
     // of the water under it, and it neither reflects the sky nor transmits.
-    // Whitecaps, the bow wave and the wake are all foam, and they combine as
-    // coverage rather than adding, so a whitecap crossing the trail is not
-    // brighter than white. Foam is lit like a diffuse white surface: it takes
-    // the shadow the water takes, which is what keeps a wake in the hull's
-    // shadow from glowing - but only in part, because foam is lit by the whole
-    // sky as much as by the sun, and the bow wave is mostly in the hull's
-    // shadow, which at the sun's share painted it grey.
-    let whitecap = foam(detail, in.curvature, wind.fold, significant_height);
-    let bow = bow_wave(plane, detail, sea.wind.zw);
-    let trail = wake(plane, detail);
-    let bubbles = max(max(whitecap, bow), trail);
-    let foam_colour = vec3<f32>(0.92, 0.95, 0.97) * (0.6 + 0.4 * lit);
-    colour = mix(colour, foam_colour, bubbles * 0.9);
+    // The swell's folds with their memory, the wind sea's caps, the bow wave
+    // and the wake are all foam, and they combine as an energy rather than
+    // adding, so a whitecap crossing the trail is not more than foam.
+    //
+    // The layer is lit as a rough white surface: the sky from above, and the
+    // sun on the side of each bubble that faces it, with the boat's shadow on
+    // the sun's share only. That is what gives a cap a lit side and a shaded
+    // side, and a wake in the hull's shadow a blue-grey rather than a glow.
+    let energy = max(max(in.foam, wind.fold), max(bow_wave(plane, detail, sea.wind.zw), wake(plane, detail)));
+    let lace = foam(plane, sea.time, energy);
+    if (lace.coverage > 0.0) {
+        let bubble_normal = normalize(normal + vec3<f32>(-lace.bumps.x, 0.0, -lace.bumps.y));
+        // The sky's light on a white surface is the whole hemisphere's, most
+        // of which is the pale band near the horizon, not the deep blue at
+        // the zenith - foam lit by the zenith alone came out royal blue.
+        let ambient = mix(
+            sky_reflection(vec3<f32>(0.0, 1.0, 0.0), sun),
+            sky_reflection(normalize(vec3<f32>(eye.x, 0.15, eye.z)), sun),
+            0.7,
+        );
+        let direct = vec3<f32>(1.0, 0.97, 0.9) * max(dot(bubble_normal, sun), 0.0) * 1.8 * sun_up * lit;
+        let foam_colour = vec3<f32>(0.93, 0.95, 0.97) * (ambient + direct);
+        colour = mix(colour, foam_colour, lace.coverage);
+    }
+    // Under and around the lace, the water itself is aerated: a paler,
+    // milkier body where foam has just been or is about to be.
+    let wash = energy * (1.0 - lace.coverage) * 0.2;
+    colour = mix(colour, vec3<f32>(0.45, 0.62, 0.68), wash * (1.0 - fresnel));
 
     // Aerial perspective, blended towards the sky *at the horizon* rather than
     // along the view ray.

@@ -37,6 +37,7 @@ mod ocean;
 mod reflection;
 mod sim;
 mod sky;
+mod spray;
 mod view;
 
 use bevy::prelude::*;
@@ -77,6 +78,7 @@ fn main() {
                 view::spawn,
                 hud::spawn,
                 reflection::spawn.after(view::spawn),
+                spray::spawn.after(boat::spawn),
             ),
         )
         // Input before the fixed step. `Update` runs *after* `RunFixedMainLoop`
@@ -105,6 +107,7 @@ fn main() {
                 view::follow_sea,
                 hud::update,
                 reflection::resize,
+                spray::emit_and_advance,
             ),
         )
         // The camera follows the boat's drawn pose, so it must run after it;

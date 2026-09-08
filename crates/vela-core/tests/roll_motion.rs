@@ -314,6 +314,7 @@ fn a_beam_sea_rolls_the_boat_and_a_calm_does_not() {
         // Long-crested, so that "from abeam" means exactly abeam. Spreading
         // would only add roll, so this is also the harder condition to pass.
         spreading: 0.0,
+        choppiness: 0.0,
     };
     let dt = 0.01;
     let swing = |mut sim: Sim| {

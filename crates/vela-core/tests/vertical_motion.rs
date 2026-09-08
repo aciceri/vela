@@ -246,6 +246,7 @@ fn a_hull_rides_a_wave_much_longer_than_itself() {
         // long-crested wave, and a single component with a direction drawn off
         // the heading would not be the wave this test is about.
         spreading: 0.0,
+        choppiness: 0.0,
     };
     let sea = Seaway::new(state, 9.81);
     // One component of variance a^2/2 gives H_s = 4a/sqrt(2).
@@ -406,6 +407,7 @@ fn the_wave_following_pose_becomes_an_equilibrium_in_long_waves() {
             seed: 7,
             // Long-crested: see the note in the quasi-static test above.
             spreading: 0.0,
+            choppiness: 0.0,
         };
         let sea = Seaway::new(state, 9.81);
         let mut sim = in_water(

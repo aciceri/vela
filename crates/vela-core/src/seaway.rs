@@ -115,6 +115,23 @@ pub struct SeaState {
     /// case rather than the simple one: a long-crested sea excites no roll from
     /// a head sea and looks, from a boat, like corrugated iron.
     pub spreading: f64,
+    /// Choppiness `λ`: how far, as a fraction of the linear limit, the water
+    /// is moved *horizontally* by each wave.
+    ///
+    /// A sum of cosines is a linear sea, and a linear sea's crests are as round
+    /// as its troughs. Real waves are not: a parcel of water on a deep-water
+    /// wave moves in a circle, so the surface is a trochoid — Gerstner's 1802
+    /// solution, exact for one wave — with crests narrower and sharper than the
+    /// troughs. `λ` scales that horizontal motion: zero is the linear sea, one
+    /// is the full Gerstner orbit, and the surface cusps where the sum of
+    /// component steepnesses reaches one. Tessendorf's *choppy waves* are the
+    /// same construction on a spectrum, and this is that. See
+    /// [`Seaway::elevation`] for what it does to evaluating the surface.
+    ///
+    /// Zero for every seakeeping test and measurement, which are made on the
+    /// linear sea the response operators are defined on; a frontend drawing a
+    /// sea sets it to what a sea looks like.
+    pub choppiness: f64,
 }
 
 impl Default for SeaState {
@@ -128,6 +145,7 @@ impl Default for SeaState {
             // A wind sea, not a swell. The old default was implicitly zero and
             // that was the wrong way round: unidirectional is the special case.
             spreading: 10.0,
+            choppiness: 0.0,
         }
     }
 }
@@ -405,17 +423,62 @@ impl Seaway {
     /// Surface elevation above the mean level at a world point and time, m,
     /// positive **up**.
     ///
-    /// The synthesis convention, which is public contract:
+    /// The synthesis convention, which is public contract. With the phase
+    /// `θᵢ(q) = kᵢ (qₓ dᵢx + q_y dᵢy) - ωᵢ t + φᵢ`, the parcel of water whose
+    /// rest position is `q` sits at
     ///
     /// ```text
-    /// ζ(x, y, t) = Σ aᵢ cos(kᵢ (x dᵢx + y dᵢy) - ωᵢ t + φᵢ)
+    /// X(q, t) = q - λ Σ aᵢ dᵢ sin θᵢ(q)        (horizontal, m)
+    /// ζ(q, t) =     Σ aᵢ    cos θᵢ(q)        (vertical, m, up)
     /// ```
+    ///
+    /// with `λ` the [`SeaState::choppiness`]. That is the surface a renderer
+    /// draws, parcel by parcel, and at `λ = 0` it is the plain sum of cosines.
+    ///
+    /// This function answers the *Eulerian* question — how high is the water
+    /// above world point `p` — which needs the parcel `q` that has moved to
+    /// `p`. It is found by one step of the fixed-point iteration
+    /// `q ← p + λ Σ aᵢ dᵢ sin θᵢ(q)` from `q = p`, which is exact at `λ = 0`
+    /// and otherwise off by second order in the steepness — for a 1.5 m sea
+    /// at `λ = 0.8`, a few centimetres of horizontal position and millimetres
+    /// of height, below the errors §5 of the functional analysis already
+    /// accepts. One step rather than converging because this is called at
+    /// every vertex of a hull mesh a hundred times a second, and each step is
+    /// another sum over the components; see `examples/frame_cost`.
     ///
     /// Positive up while the world frame's `z` is down, because an elevation that
     /// went negative when the water rose would be read wrong by every caller
     /// exactly once.
     #[must_use]
     pub fn elevation(&self, north: f64, east: f64, time: f64) -> f64 {
+        let (north, east) = self.rest(north, east, time);
+        self.height_at_rest(north, east, time)
+    }
+
+    /// The rest position of the parcel that has moved to a world point: the
+    /// one fixed-point step described on [`Seaway::elevation`]. Identity, and
+    /// free, at zero choppiness.
+    fn rest(&self, north: f64, east: f64, time: f64) -> (f64, f64) {
+        let choppiness = self.state.choppiness;
+        if choppiness == 0.0 {
+            return (north, east);
+        }
+        let (mut back_north, mut back_east) = (0.0, 0.0);
+        for it in &self.components {
+            let along = north * it.direction.0 + east * it.direction.1;
+            let swing =
+                it.amplitude * (it.wavenumber * along - it.frequency * time + it.phase).sin();
+            back_north += it.direction.0 * swing;
+            back_east += it.direction.1 * swing;
+        }
+        (
+            north + choppiness * back_north,
+            east + choppiness * back_east,
+        )
+    }
+
+    /// `ζ(q, t)`: the height of the parcel at rest position `q`.
+    fn height_at_rest(&self, north: f64, east: f64, time: f64) -> f64 {
         self.components
             .iter()
             .map(|it| {
@@ -427,12 +490,15 @@ impl Seaway {
 
     /// Rate of rise of the surface at a world point, m/s, positive upward.
     ///
-    /// The time derivative of [`Seaway::elevation`], term for term, which is
-    /// what a body's motion *relative to the surface* needs: a bow driving
-    /// down at a metre a second into a surface rising at half a metre a second
-    /// meets the water at a metre and a half.
+    /// The time derivative of `ζ` at the parcel under the point, term for
+    /// term, which is what a body's motion *relative to the surface* needs: a
+    /// bow driving down at a metre a second into a surface rising at half a
+    /// metre a second meets the water at a metre and a half. With choppiness
+    /// the parcel under a fixed point changes too, and that term is dropped:
+    /// it is second order in the steepness, like the one-step inversion.
     #[must_use]
     pub fn vertical_rate(&self, north: f64, east: f64, time: f64) -> f64 {
+        let (north, east) = self.rest(north, east, time);
         self.components
             .iter()
             .map(|it| {
@@ -508,7 +574,10 @@ impl Seaway {
         down: f64,
         time: f64,
     ) -> (f64, f64) {
-        let elevation = self.elevation(north, east, time);
+        // The dynamic head is the same components at the same parcel, decayed
+        // with depth, so the parcel is found once and shared.
+        let (north, east) = self.rest(north, east, time);
+        let elevation = self.height_at_rest(north, east, time);
         let depth = down + elevation;
         if depth <= 0.0 {
             return (depth, depth);
@@ -942,6 +1011,7 @@ mod tests {
                 components: 8,
                 seed: 12345,
                 spreading: 0.0,
+                choppiness: 0.0,
             },
             9.81,
         );
@@ -982,6 +1052,81 @@ mod tests {
                 max_relative = 1e-12
             );
         }
+    }
+
+    /// The choppy surface, as the renderer builds it parcel by parcel, is the
+    /// surface the Eulerian `elevation` reports: put the parcel at rest
+    /// position `q` where the documented displacement says it goes, and ask
+    /// the sea how high the water is there.
+    ///
+    /// This is the test that would catch the displacement's sign flipped on
+    /// one side - the shader sharpening crests while the hull clips against
+    /// sharpened troughs - which nothing else here can see. The tolerance is
+    /// the one-step inversion's own second-order error, and the sea is steep
+    /// enough that a first-order mistake would miss it by a hundred times.
+    #[test]
+    fn the_choppy_surface_is_the_one_the_parcels_draw() {
+        let sea = Seaway::new(
+            SeaState {
+                significant_height: 1.5,
+                peak_period: 6.0,
+                heading: 0.7,
+                components: 40,
+                seed: 3,
+                spreading: 10.0,
+                choppiness: 0.8,
+            },
+            9.81,
+        );
+        let mut worst: f64 = 0.0;
+        for (rest_north, rest_east, time) in
+            [(0.0, 0.0, 1.0), (23.0, -11.0, 4.5), (-8.0, 31.0, 9.25)]
+        {
+            let (mut north, mut east, mut height) = (rest_north, rest_east, 0.0);
+            for wave in sea.waves() {
+                let along = rest_north * wave.direction.0 + rest_east * wave.direction.1;
+                let phase = wave.wavenumber * along - wave.frequency * time + wave.phase;
+                north -= 0.8 * wave.amplitude * wave.direction.0 * phase.sin();
+                east -= 0.8 * wave.amplitude * wave.direction.1 * phase.sin();
+                height += wave.amplitude * phase.cos();
+            }
+            worst = worst.max((sea.elevation(north, east, time) - height).abs());
+        }
+        assert!(
+            worst < 0.02,
+            "the parcels and the inversion disagree by {worst:.3} m"
+        );
+
+        // And the sea is not secretly linear: the crests are sharper than the
+        // troughs, which is the whole point. Measured as the skewness of the
+        // surface along a line, positive for peaky crests, on a regular wave
+        // steep enough to show it - `ak = 0.17` - because a random sea's
+        // skewness over any line short enough to sample is mostly its phases.
+        // Linear, the same wave measures 0.013; a trochoid at this steepness
+        // measures about `1.5 λ ak`.
+        let steep = Seaway::new(
+            SeaState {
+                significant_height: 3.0,
+                peak_period: 5.0,
+                heading: 0.0,
+                components: 1,
+                seed: 3,
+                spreading: 0.0,
+                choppiness: 0.8,
+            },
+            9.81,
+        );
+        let samples: Vec<f64> = (0..4000)
+            .map(|i| steep.elevation(f64::from(i) * 0.25, 3.0, 2.0))
+            .collect();
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let m2 = samples.iter().map(|z| (z - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+        let m3 = samples.iter().map(|z| (z - mean).powi(3)).sum::<f64>() / samples.len() as f64;
+        let skewness = m3 / m2.powf(1.5);
+        assert!(
+            skewness > 0.1,
+            "a choppy sea should be peaky, skewness {skewness:.3}"
+        );
     }
 
     /// The pressure head against the closed form in the documentation, not
@@ -1064,6 +1209,7 @@ mod tests {
                     components: 60,
                     seed: 4,
                     spreading,
+                    choppiness: 0.0,
                 },
                 9.81,
             );
@@ -1112,6 +1258,7 @@ mod tests {
                     components: 200,
                     seed: 9,
                     spreading,
+                    choppiness: 0.0,
                 },
                 9.81,
             );
