@@ -19,18 +19,21 @@
 //! anyone noticed.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::message::MessageReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
-use bevy::light::{CascadeShadowConfigBuilder, NotShadowCaster};
+use bevy::light::{CascadeShadowConfigBuilder, NotShadowCaster, ShadowFilteringMethod};
 use bevy::mesh::Indices;
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
+use bevy::ui::IsDefaultUiCamera;
 
 use crate::boat::Boat;
 use crate::frame;
 use crate::ocean::OceanMaterial;
+use crate::reflection;
 use crate::sim::Engine;
 
 /// Radius of the near sea, m.
@@ -141,6 +144,28 @@ const FAR_PLANE: f32 = 20_000.0;
 /// the boat and the camera looks at the boat, so nothing ever comes near enough
 /// for the foreground to notice.
 const NEAR_PLANE: f32 = 0.5;
+
+/// Sky light, a per-view component in this version of Bevy.
+///
+/// Without it the side of a sail facing away from the sun renders black, which
+/// reads as a rendering fault rather than as shade — and it is wrong besides:
+/// sailcloth is thin enough to glow when it is backlit. Not a translucency
+/// model, just enough ambient that a shaded sail looks like cloth.
+///
+/// One constant for the chase camera and for `crate::reflection`'s mirror
+/// camera, so the boat is shaded the same in the water as above it.
+pub const AMBIENT: AmbientLight = AmbientLight {
+    color: Color::srgb(0.72, 0.79, 0.88),
+    brightness: 1_500.0,
+    affects_lightmapped_meshes: true,
+};
+
+/// The sun's illuminance, lux.
+///
+/// Two lights carry it — the shadowed one the chase camera sees and the plain
+/// one the mirror sees, both in `spawn` — and they have to agree, or the boat
+/// would be a different brightness in the water than above it.
+const SUNLIGHT: f32 = 13_000.0;
 
 /// Marks the sea surface entity.
 #[derive(Component)]
@@ -314,6 +339,11 @@ pub fn spawn(
 
     commands.spawn((
         Camera3d::default(),
+        // No multisampling. The sea is one full-screen fragment shader and the
+        // only edges in the scene are the boat's; on an integrated GPU four
+        // samples of an HDR target is bandwidth spent on edges that bloom and
+        // tonemapping soften anyway. Measured in the main pass's GPU counter.
+        Msaa::Off,
         // Overrides the projection `Camera3d` requires into place. See
         // `FAR_PLANE`, which is what gets the far sea drawn at all, and
         // `NEAR_PLANE`, which is what gets it drawn without depth fighting.
@@ -323,16 +353,15 @@ pub fn spawn(
             ..default()
         }),
         Transform::from_xyz(-28.0, 12.0, 22.0).looking_at(Vec3::new(0.0, 3.0, 0.0), Vec3::Y),
-        // Sky light, a per-view component in this version of Bevy. Without it the
-        // side of a sail facing away from the sun renders black, which reads as a
-        // rendering fault rather than as shade — and it is wrong besides:
-        // sailcloth is thin enough to glow when it is backlit. Not a translucency
-        // model, just enough ambient that a shaded sail looks like cloth.
-        AmbientLight {
-            color: Color::srgb(0.72, 0.79, 0.88),
-            brightness: 1_500.0,
-            ..default()
-        },
+        AMBIENT,
+        // The Castaño filter: nine taps read as a 5×5 Gaussian, which is the
+        // filter that turns a shadow map's stair-steps into an edge. Stated
+        // rather than inherited, because the water is the one receiver in the
+        // scene that draws the shadow *by hand* (`fetch_directional_shadow` in
+        // `shaders/ocean.wgsl`) and so has no other way to say which filter it
+        // expects; the `Temporal` alternative is a per-frame random rotation of
+        // the taps that reads as a crawling edge without TAA to average it.
+        ShadowFilteringMethod::Gaussian,
         // Sun on water is the one thing in this scene with a specular return far
         // brighter than anything else in frame. Without a display transform it
         // clips flat to white and reads as a hole in the sea rather than as
@@ -369,6 +398,11 @@ pub fn spawn(
             composite_mode: BloomCompositeMode::Additive,
             ..Bloom::NATURAL
         },
+        // Where the HUD goes. Without the marker Bevy picks the highest-order
+        // camera drawing to the primary window, which is this one today; the
+        // marker says so, and keeps the readout out of `crate::reflection`'s
+        // mirror image whatever cameras are added later.
+        IsDefaultUiCamera,
         Chase,
     ));
 
@@ -387,27 +421,68 @@ pub fn spawn(
     // darkening the hull and the rig laying a shadow across the water, which is
     // most of what tells a viewer the boat is in the scene rather than pasted
     // onto it.
+    //
+    // The biases are Bevy's defaults, and that is a decision rather than an
+    // omission: acne is a surface comparing against its own depth in the map,
+    // and the water is not in the map, so there is nothing for a bias to cure
+    // there. The two centimetres of depth bias and the 1.8 texels of normal
+    // bias — sixteen centimetres at the default cascade — are what keep the
+    // sails from striping the hull, and are far under anything the water's
+    // shadow could lose.
+    let towards_sun = Transform::default().looking_to(-crate::sky::SUN.normalize(), Vec3::Y);
     commands.spawn((
         DirectionalLight {
-            illuminance: 13_000.0,
+            illuminance: SUNLIGHT,
             shadow_maps_enabled: true,
             ..default()
         },
-        // Fitted to the boat and the water immediately around it. A single
-        // cascade stretched over the whole 8 km of visible sea would put the
-        // twelve metre boat inside one shadow-map texel, and nothing beyond a
-        // couple of hundred metres has anything to cast onto anything.
+        // Fitted to the orbit. A single cascade stretched over the whole 8 km of
+        // visible sea would put the twelve metre boat inside one shadow-map
+        // texel, and nothing beyond the boat has anything to cast onto anything.
+        //
+        // The first split is at a hundred metres so that the default view —
+        // sixty-two metres from the boat, whose shadow reaches fifty metres
+        // towards the camera under a sun twenty degrees up — lies entirely in
+        // cascade 0. It was forty, which put the water under the hull in the
+        // blend between cascades 1 and 2, and the shadow faded and coarsened
+        // exactly where it was wanted; the blend now starts at eighty metres,
+        // beyond the shadow. The price is cascade 0 spanning a hundred metres of
+        // frustum, which is nine-centimetre texels at 2048: two across the mast,
+        // dozens across the hull and the sails, which is the shadow that
+        // actually reads. The maximum is the far end of the orbit plus the
+        // shadow's length, so pulling back never drops the shadow outright — at
+        // four hundred metres the last cascade resolves the hull at thirty
+        // texels, which is about what the hull itself gets on screen there.
         CascadeShadowConfigBuilder {
             // WebGL2 supports exactly one cascade and Bevy's own default gates on
             // that; asking for four on the web target fails the pipeline.
             num_cascades: if cfg!(target_arch = "wasm32") { 1 } else { 4 },
             minimum_distance: 0.5,
-            first_cascade_far_bound: 40.0,
-            maximum_distance: 260.0,
+            first_cascade_far_bound: 100.0,
+            maximum_distance: 460.0,
             overlap_proportion: 0.2,
         }
         .build(),
-        Transform::default().looking_to(-crate::sky::SUN.normalize(), Vec3::Y),
+        towards_sun,
+    ));
+
+    // The same sun once more, without shadows, for the mirror view alone.
+    //
+    // A light illuminates only the views whose layers it shares, and shadow
+    // cascades are built per light *per view*: had the one above been put on
+    // the mirror's layer as well, the mirror would have doubled the cascade
+    // count — four more 2048-square depth passes and sixty-seven megabytes of
+    // depth on an integrated GPU — to shade a reflection the water blurs
+    // anyway. So the mirror gets a twin with no map, and the boat in the water
+    // is lit as brightly as the boat above it, minus the sails' shadow on the
+    // hull, which at reflection quality is not a difference a viewer can find.
+    commands.spawn((
+        DirectionalLight {
+            illuminance: SUNLIGHT,
+            ..default()
+        },
+        towards_sun,
+        RenderLayers::layer(reflection::LAYER),
     ));
 }
 
@@ -422,9 +497,25 @@ pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>
     let state = engine.sim.state();
     let stern = frame::to_render(state.position);
     let velocity = frame::to_render(state.world_velocity());
+    // The hull's axis in the render plane, and how fast the bow is going down
+    // through the water it is over: the bow's world velocity is z-down in the
+    // engine, and the surface under it moves too, so the plunge is the
+    // difference. The bow is the forward end of the stations.
+    let forward = frame::to_render(state.to_world(nalgebra::Vector3::x()));
+    let heading = Vec2::new(forward.x, forward.z).normalize_or(Vec2::X);
+    let bow_body = nalgebra::Vector3::new(engine.hull_length(), 0.0, 0.0);
+    let bow_world = state.position + state.to_world(bow_body);
+    let bow_velocity = state.to_world(state.point_velocity(bow_body));
+    let surface_rate = engine
+        .sea
+        .as_ref()
+        .map_or(0.0, |sea| sea.vertical_rate(bow_world.x, bow_world.y, time));
+    let plunge = (bow_velocity.z + surface_rate) as f32;
+    let hull = Vec2::new(engine.hull_length() as f32, engine.hull_half_beam() as f32);
     for (_, material) in oceans.iter_mut() {
         material.set_time(time);
         material.record(stern, velocity, time);
+        material.set_heading(heading, plunge, hull);
     }
 }
 

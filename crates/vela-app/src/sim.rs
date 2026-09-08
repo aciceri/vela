@@ -137,6 +137,25 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Length of the hull's stations, m: the bow is this far forward of the
+    /// body origin along the hull's axis.
+    #[must_use]
+    pub fn hull_length(&self) -> f64 {
+        self.spec
+            .hull
+            .as_ref()
+            .map_or(0.0, vela_core::boat::HullSpec::length)
+    }
+
+    /// Greatest half-breadth of the hull, m.
+    #[must_use]
+    pub fn hull_half_beam(&self) -> f64 {
+        self.spec
+            .hull
+            .as_ref()
+            .map_or(0.0, vela_core::boat::HullSpec::max_half_breadth)
+    }
+
     /// Builds the boat, solves its steady sailing condition, and releases it
     /// there.
     ///

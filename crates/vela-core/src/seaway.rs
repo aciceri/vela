@@ -425,6 +425,25 @@ impl Seaway {
             .sum()
     }
 
+    /// Rate of rise of the surface at a world point, m/s, positive upward.
+    ///
+    /// The time derivative of [`Seaway::elevation`], term for term, which is
+    /// what a body's motion *relative to the surface* needs: a bow driving
+    /// down at a metre a second into a surface rising at half a metre a second
+    /// meets the water at a metre and a half.
+    #[must_use]
+    pub fn vertical_rate(&self, north: f64, east: f64, time: f64) -> f64 {
+        self.components
+            .iter()
+            .map(|it| {
+                let along = north * it.direction.0 + east * it.direction.1;
+                it.amplitude
+                    * it.frequency
+                    * (it.wavenumber * along - it.frequency * time + it.phase).sin()
+            })
+            .sum()
+    }
+
     /// Depth of a world point below the instantaneous surface, m, positive below.
     ///
     /// `z` is measured down from the mean level, so a point at `z` sits

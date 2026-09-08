@@ -20,6 +20,30 @@
 //! floating on water nobody can see, sinking into crests that are not where they
 //! are drawn.
 //!
+//! # What is physical and what is cosmetic
+//!
+//! The *geometry* is the realisation and nothing else: no vertex moves for any
+//! reason the physics does not know about, which is what keeps the hull's
+//! clip and the picture the same sea. Everything the eye needs below the
+//! realisation's shortest wave — three and a half metres in the sea it is
+//! validated in — is added to the **shading** only, as slope, foam and light:
+//!
+//! - a wind sea of four Gerstner components between one and three metres,
+//!   running downwind in patches that drift with the wind, contributing slope
+//!   and the whitecaps its own Jacobian says it would have broken;
+//! - crest sharpening of the physical slope (Horvath's peak enhancement), so
+//!   the swell's crests read as crests rather than as the rounded tops of a
+//!   sum of cosines;
+//! - whitecaps on the swell where its curvature says a trochoidal sea of that
+//!   height would have folded, the bow wave along the forward third of the
+//!   hull, and the wake along the stern's recorded track;
+//! - the statistical self-shadowing of a rough surface for a low sun;
+//! - the boat's mirror image, rendered by `crate::reflection` and composited
+//!   over the analytic sky.
+//!
+//! Each of these is a known lie stated as one, in the shader, next to the
+//! thing it fakes. None of them is fed back into the physics.
+//!
 //! # Why the time comes from the engine and not from the shader
 //!
 //! Bevy offers `globals.time` to any material shader, and it is the obvious
@@ -132,6 +156,18 @@ pub struct SeaUniform {
     /// called, which draws no wake, and that is the right picture of a boat that
     /// has not moved yet.
     pub motion: Vec4,
+    /// The boat's heading and the bow's motion, for the bow wave: `(x, z)` of
+    /// the unit heading in the render plane — the hull's axis, which is not
+    /// the track over the ground because of leeway — the bow's vertical
+    /// velocity in m/s, positive downward into the water, and in `.w` whether
+    /// the reflection texture is live (1) or the material has none yet (0).
+    pub heading: Vec4,
+    /// Downwind `(x, z)` in the render plane, unit: the realisation's mean
+    /// direction of travel, amplitude-weighted, which is where the wind is
+    /// blowing to and what the shader's wind-sea layer runs along. A property
+    /// of the realisation, computed once from it. `.zw` carry the hull's
+    /// length and greatest half-breadth, m, for the bow wave.
+    pub wind: Vec4,
 }
 
 /// Samples of the stern's track the shader can carry.
@@ -160,6 +196,14 @@ pub struct OceanMaterial {
     /// The stern's track, oldest first, `sea.trail_count` entries real.
     #[uniform(2)]
     pub trail: [TrailPoint; MAX_TRAIL],
+    /// The above-water scene seen in a mirror at the mean sea level, rendered
+    /// by `crate::reflection`'s camera into an image the size of the window
+    /// (or a fraction of it), sampled at the fragment's own screen position.
+    /// `None` until that camera exists, which the shader is told through
+    /// `sea.heading.w`.
+    #[texture(3)]
+    #[sampler(4)]
+    pub reflection: Option<Handle<Image>>,
 }
 
 impl OceanMaterial {
@@ -197,6 +241,16 @@ impl OceanMaterial {
             };
         }
 
+        // Where the sea is going, amplitude-weighted: the realisation travels
+        // from the wind's direction, so this points downwind. Render x is north
+        // and render z is east, the same map the wave vectors use above.
+        let mut downwind = Vec2::ZERO;
+        for wave in source {
+            downwind +=
+                Vec2::new(wave.direction.0 as f32, wave.direction.1 as f32) * wave.amplitude as f32;
+        }
+        let downwind = downwind.normalize_or(Vec2::X);
+
         // Deeper and less saturated than a postcard sea on purpose. This is the
         // *transmitted* colour, seen only where the Fresnel term lets it through;
         // the blue a viewer actually reads is mostly the reflected sky, which is
@@ -212,10 +266,37 @@ impl OceanMaterial {
                 shallow: Vec3::new(0.055, 0.200, 0.180),
                 sun: crate::sky::SUN.normalize().extend(0.0),
                 motion: Vec4::ZERO,
+                heading: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                wind: Vec4::new(downwind.x, downwind.y, 0.0, 0.0),
             },
             waves,
             trail: [TrailPoint::default(); MAX_TRAIL],
+            reflection: None,
         }
+    }
+
+    /// Tells the water which way the hull points and how the bow is moving
+    /// through the surface, for the bow wave.
+    ///
+    /// `heading` is the unit hull axis in the render plane and `bow_plunge`
+    /// the bow's vertical velocity relative to the surface, m/s, positive
+    /// downward — a bow driving into a wave throws spray, one lifting out of it
+    /// does not. `hull` is the hull's length and greatest half-breadth, m:
+    /// where the bow is along that axis, and how far outboard the bow wave
+    /// clears the hull.
+    pub fn set_heading(&mut self, heading: Vec2, bow_plunge: f32, hull: Vec2) {
+        self.sea.heading.x = heading.x;
+        self.sea.heading.y = heading.y;
+        self.sea.heading.z = bow_plunge;
+        self.sea.wind.z = hull.x;
+        self.sea.wind.w = hull.y;
+    }
+
+    /// Gives the water the mirror image to reflect the boat from, or takes it
+    /// away. The shader reads `sea.heading.w` to know which.
+    pub fn set_reflection(&mut self, image: Option<Handle<Image>>) {
+        self.sea.heading.w = if image.is_some() { 1.0 } else { 0.0 };
+        self.reflection = image;
     }
 
     /// Advances the sea's clock without rebuilding the waves.

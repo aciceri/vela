@@ -129,6 +129,22 @@ impl Material for SkyMaterial {
         descriptor.primitive.cull_mode = None;
         Ok(())
     }
+
+    /// Blended, so that the dome is drawn *after* the opaque sea and
+    /// depth-tested against it — not because it is transparent.
+    ///
+    /// Bevy bins opaque draws by pipeline, not by distance, and the dome —
+    /// whose bounding sphere is centred on the camera — came out first: every
+    /// pixel of the screen ran the sky's cloud noise, and the sea then painted
+    /// over two thirds of them. The GPU counter said 4.9 million fragment
+    /// invocations for a 1.8 million pixel window. The transparent pass runs
+    /// after the opaque one with the depth test on, so a dome drawn there costs
+    /// exactly the pixels the sea leaves it, and the dome writes an alpha of one
+    /// so nothing about its colour changes. It writes no depth, and nothing is
+    /// ever behind it.
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
 }
 
 /// Spawns the dome, parented to nothing and moved with the camera.

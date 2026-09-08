@@ -37,6 +37,7 @@ use vela_core::geometry::Point;
 use vela_core::TriMesh;
 
 use crate::frame;
+use crate::reflection;
 use crate::sim::Engine;
 
 /// Marks the entity that carries the boat's pose.
@@ -247,10 +248,13 @@ pub fn spawn(
         engine.hull.triangle_count()
     );
 
+    // Each drawn part is on the mirror's layer as well as the main view's;
+    // layers are not inherited, so the pose entity above them carries none.
+    let layers = reflection::mirrored();
     commands
         .spawn((Boat, Transform::default(), Visibility::default()))
         .with_children(|boat| {
-            boat.spawn((Mesh3d(hull), MeshMaterial3d(white)));
+            boat.spawn((Mesh3d(hull), MeshMaterial3d(white), layers.clone()));
 
             // Mast: a box of the published diameter, from the sheer to the
             // masthead. Round would be prettier and would need a cylinder mesh.
@@ -262,6 +266,7 @@ pub fn spawn(
                 ))),
                 MeshMaterial3d(spar.clone()),
                 Transform::from_xyz(rig.mast_at, 0.5 * (rig.masthead + rig.sheer), 0.0),
+                layers.clone(),
             ));
 
             // Boom: from the mast aft along the foot, at the published height.
@@ -270,6 +275,7 @@ pub fn spawn(
                 MeshMaterial3d(spar),
                 Transform::from_xyz(rig.mast_at - 0.5 * rig.main_foot, rig.boom, 0.0),
                 Boom,
+                layers.clone(),
             ));
 
             // The sails, as the engine says they are flying.
@@ -297,6 +303,7 @@ pub fn spawn(
                         shape,
                         mirror,
                     },
+                    layers.clone(),
                 ));
             }
         });

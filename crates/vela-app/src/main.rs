@@ -34,6 +34,7 @@ mod frame;
 mod helm;
 mod hud;
 mod ocean;
+mod reflection;
 mod sim;
 mod sky;
 mod view;
@@ -68,7 +69,16 @@ fn main() {
         .add_plugins(sim::EnginePlugin)
         .init_resource::<view::Orbit>()
         .init_resource::<hud::FrameRate>()
-        .add_systems(Startup, (boat::spawn, view::spawn, hud::spawn))
+        // The mirror attaches to the ocean material the view creates, so after it.
+        .add_systems(
+            Startup,
+            (
+                boat::spawn,
+                view::spawn,
+                hud::spawn,
+                reflection::spawn.after(view::spawn),
+            ),
+        )
         // Input before the fixed step. `Update` runs *after* `RunFixedMainLoop`
         // in Bevy's main schedule, so a `helm::steer` placed there would write
         // the controls after every physics step of the frame had already read
@@ -94,15 +104,18 @@ fn main() {
                 view::advance_sea,
                 view::follow_sea,
                 hud::update,
+                reflection::resize,
             ),
         )
-        // The camera follows the boat's drawn pose, so it must run after it.
+        // The camera follows the boat's drawn pose, so it must run after it;
+        // the mirror is that camera reflected, so after it in turn.
         .add_systems(
             Update,
             (
                 view::orbit,
                 view::orbit_with_mouse,
                 view::chase.after(boat::follow),
+                reflection::follow.after(view::chase),
             ),
         )
         .run();
