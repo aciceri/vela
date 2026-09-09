@@ -55,6 +55,13 @@ fn main() {
                 // Leave the browser its own shortcuts: swallowing F5 and
                 // Ctrl-R in a physics demo is hostile.
                 prevent_default_event_handling: false,
+                // Not vsync. On this frontend the GPU frame is the ocean shader, and
+                // under Fifo a frame that misses one vblank by a millisecond waits
+                // for the next: a 20 ms frame was drawn at 33 ms and a 28 ms one at
+                // 50, which is where "17 fps" came from on a frame the GPU finished
+                // in 28. Mailbox where the platform has it, immediate otherwise;
+                // Wayland composites either way, so nothing tears.
+                present_mode: bevy::window::PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()

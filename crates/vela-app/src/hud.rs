@@ -73,7 +73,17 @@ pub fn spawn(mut commands: Commands) {
 pub struct FrameRate {
     /// Exponentially smoothed frame time, seconds.
     smoothed: f64,
+    /// Seconds since the readout was last rewritten.
+    since_rewrite: f64,
 }
+
+/// How often the readout is rewritten, s.
+///
+/// Every frame was the first answer, and every frame the text was laid out
+/// again - twenty lines of glyphs shaped and re-uploaded - for numbers that
+/// change in the third decimal. Ten times a second is as fast as a reader
+/// takes a number in, and the smoothed frame time reads the same.
+const REWRITE: f64 = 0.1;
 
 /// Rewrites the readout from the engine's telemetry.
 pub fn update(
@@ -92,6 +102,11 @@ pub fn update(
     } else {
         rate.smoothed + 0.06 * (frame - rate.smoothed)
     };
+    rate.since_rewrite += frame;
+    if rate.since_rewrite < REWRITE {
+        return;
+    }
+    rate.since_rewrite = 0.0;
 
     let state = sim.state();
     let telemetry = sim.telemetry();

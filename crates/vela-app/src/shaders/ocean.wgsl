@@ -49,16 +49,20 @@
 const PI: f32 = 3.141592653589793;
 
 // Thirty-two bytes an element, and the Rust side pins that with
-// `the_wave_layout_matches_the_shader_stride`. Three scalar pads and not a
-// `vec3`, whose sixteen-byte alignment would push the element to forty-eight.
+// `the_wave_layout_matches_the_shader_stride`. Three scalars after the
+// amplitude and not a `vec3`, whose sixteen-byte alignment would push the
+// element to forty-eight. Two of them carry the cosine and sine of the phase
+// this wave advances by over the foam memory's interval - see `surface` for
+// what that buys - and the third is a pad.
 struct ShaderWave {
     wave_vector: vec2<f32>,
     frequency: f32,
     phase: f32,
     amplitude: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: f32,
+    /// `cos(omega * MEMORY)` and `sin(omega * MEMORY)`.
+    memory_cos: f32,
+    memory_sin: f32,
+    pad: f32,
 };
 
 struct SeaUniform {
@@ -89,6 +93,9 @@ struct SeaUniform {
     /// as a fraction of the Gerstner orbit. The physics clips the hull with
     /// the same number; see `surface`.
     choppiness: f32,
+    /// The wake's reach in the render plane, `(min x, min z, max x, max z)`:
+    /// the recorded track grown by the widest the wake gets. See `wake`.
+    trail_bounds: vec4<f32>,
 };
 
 /// One recorded point of the stern's track: `(x, z)` in the render plane, the
@@ -145,6 +152,9 @@ struct Surface {
     slope: vec2<f32>,
     /// The derivatives of the displacement, `(dDx/dx, dDz/dz, dDx/dz)`.
     strain: vec3<f32>,
+    /// The same strain one and two memory intervals ago; see `surface`.
+    strain_before: vec3<f32>,
+    strain_earlier: vec3<f32>,
 };
 
 /// The determinant of the map from rest position to displaced position:
@@ -156,8 +166,9 @@ fn jacobian(strain: vec3<f32>) -> f32 {
     return (1.0 + strain.x) * (1.0 + strain.y) - strain.z * strain.z;
 }
 
-/// The parcel at rest position `plane`, at a time, from one pass over the
-/// waves: where it is, how high, and how the water around it is strained.
+/// The parcel at rest position `plane`, now, from one pass over the waves:
+/// where it is, how high, and how the water around it is strained - now and
+/// at two moments in the past.
 ///
 /// This is `vela_core::seaway::Seaway`'s Lagrangian construction, transcribed:
 ///
@@ -180,11 +191,21 @@ fn jacobian(strain: vec3<f32>) -> f32 {
 /// `-lambda a d sin` is `-lambda a k d d cos`. The normal is then exact for
 /// the surface actually drawn rather than reconstructed from neighbouring
 /// vertices, which is what keeps the lighting from showing the grid.
+///
+/// The past strains are for the foam's memory (see `vertex`), and they come
+/// out of the same sine and cosine too: a wave's phase advances by
+/// `omega * MEMORY` over the interval, and `cos(theta + a)` is
+/// `cos theta cos a - sin theta sin a` with `cos a` and `sin a` carried in the
+/// wave's own record, the double angle giving the second interval. Eight
+/// multiplies a wave instead of two more sines - the first version ran the
+/// whole loop three times, and the vertex stage was a third of the frame.
 fn surface(plane: vec2<f32>, time: f32) -> Surface {
     var height: f32 = 0.0;
     var shift: vec2<f32> = vec2<f32>(0.0, 0.0);
     var slope: vec2<f32> = vec2<f32>(0.0, 0.0);
     var strain: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+    var before: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
+    var earlier: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
     let lambda = sea.choppiness;
     for (var index: u32 = 0u; index < sea.count; index = index + 1u) {
         let wave = waves[index];
@@ -197,25 +218,17 @@ fn surface(plane: vec2<f32>, time: f32) -> Surface {
         // `k` is `|k| d`, so `d s = k s / |k|` and `|k| d d c = k k c / |k|`.
         let magnitude = max(length(k), 1e-6);
         shift = shift - lambda * k * s / magnitude;
-        strain = strain - lambda * vec3<f32>(k.x * k.x, k.y * k.y, k.x * k.y) * c / magnitude;
+        let kk = lambda * vec3<f32>(k.x * k.x, k.y * k.y, k.x * k.y) / magnitude;
+        strain = strain - kk * c;
+        // One interval back the phase was larger by `omega * MEMORY`.
+        let ca = wave.memory_cos;
+        let sa = wave.memory_sin;
+        let c1 = c * ca - s * sa;
+        let c2 = c * (2.0 * ca * ca - 1.0) - s * (2.0 * sa * ca);
+        before = before - kk * c1;
+        earlier = earlier - kk * c2;
     }
-    return Surface(height, shift, slope, strain);
-}
-
-/// The strain alone, for a moment in the past: what `surface` computes, minus
-/// the height and the shift nobody asked for.
-fn strain_at(plane: vec2<f32>, time: f32) -> vec3<f32> {
-    var strain: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
-    let lambda = sea.choppiness;
-    for (var index: u32 = 0u; index < sea.count; index = index + 1u) {
-        let wave = waves[index];
-        let k = wave.wave_vector;
-        let angle = dot(k, plane) - wave.frequency * time + wave.phase;
-        let c = wave.amplitude * cos(angle);
-        let magnitude = max(length(k), 1e-6);
-        strain = strain - lambda * vec3<f32>(k.x * k.x, k.y * k.y, k.x * k.y) * c / magnitude;
-    }
-    return strain;
+    return Surface(height, shift, slope, strain, before, earlier);
 }
 
 /// How much a parcel is folding, `[0, 1]`, from its Jacobian.
@@ -312,8 +325,8 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     // keeps a simulated accumulation buffer for the same effect; this is the
     // analytic sea's way of having one without a render pass).
     var foam = folding(strain);
-    foam = max(foam, 0.65 * folding(strain_at(plane, sea.time - 1.4) * shade));
-    foam = max(foam, 0.35 * folding(strain_at(plane, sea.time - 2.8) * shade));
+    foam = max(foam, 0.65 * folding(wave.strain_before * shade));
+    foam = max(foam, 0.35 * folding(wave.strain_earlier * shade));
 
     var out: VertexOutput;
     out.world_position = world;
@@ -679,9 +692,14 @@ fn bow_wave(plane: vec2<f32>, detail: vec2<f32>, hull: vec2<f32>) -> f32 {
     let offset = plane - sea.motion.xy;
     let along = dot(offset, heading);
     let across = abs(offset.x * heading.y - offset.y * heading.x);
-    // From the stem back to amidships, as a fraction.
+    // From the stem back to amidships, as a fraction. The foam starts a little
+    // ahead of the stem - the wave the bow pushes up breaks in front of it -
+    // and dies away over the after half of the run rather than stopping on
+    // a line: both ends were hard cuts, and a straight edge across the water
+    // at midships is the first thing a viewer's eye finds.
     let aft = (hull.x - along) / (0.5 * hull.x);
-    if (aft < 0.0 || aft > 1.0) {
+    let run = smoothstep(-0.12, 0.08, aft) * (1.0 - smoothstep(0.55, 1.15, aft));
+    if (run <= 0.0) {
         return 0.0;
     }
     // Where the crest sits: just outboard of the waterline, which flares
@@ -690,13 +708,12 @@ fn bow_wave(plane: vec2<f32>, detail: vec2<f32>, hull: vec2<f32>) -> f32 {
     // is under the hull, where foam drawn on the sea is foam nobody sees -
     // which is where the first version put it.
     let plunge = clamp(sea.heading.z, 0.0, 3.0);
-    let half_beam = hull.y * sqrt(aft);
+    let half_beam = hull.y * sqrt(max(aft, 0.0));
     let crest_at = half_beam + 0.6 + 0.6 * plunge;
     let band = 1.0 + 0.5 * plunge;
     let lobe = 1.0 - smoothstep(0.0, band, abs(across - crest_at));
-    // Brighter with speed, and along the forward half of the run; the plunge
-    // throws it well past that.
-    let strength = smoothstep(0.5, 2.5, speed) * (1.0 - aft * (0.8 - 0.3 * plunge));
+    // Brighter with speed; the plunge throws it further aft.
+    let strength = smoothstep(0.5, 2.5, speed) * run * (0.7 + 0.3 * plunge);
     let mottle = 0.5 + 8.0 * length(detail);
     return clamp(lobe * strength * mottle, 0.0, 1.0);
 }
@@ -766,14 +783,30 @@ fn wake(plane: vec2<f32>, detail: vec2<f32>) -> f32 {
     let count = sea.trail_count;
     let stern = sea.motion.xy;
     let speed = length(sea.motion.zw);
-    // Nothing recorded, or nothing near: the reach is the longest a wake can
-    // be before it has faded, and the newest point is where it is strongest.
-    if (count == 0u || distance(plane, stern) > 80.0) {
+    // Nothing recorded, or nothing near. The bounds are the track's, grown by
+    // the widest the wake gets, and the CPU keeps them: with them the loop
+    // below runs on the strip of sea the wake is actually in and not on every
+    // fragment within eighty metres of the stern, which at the default view
+    // is most of the screen. The first version ran there, sixty-four segments
+    // and a noise lookup each, and cost fifty milliseconds a frame.
+    let bounds = sea.trail_bounds;
+    if (count == 0u || plane.x < bounds.x || plane.y < bounds.y || plane.x > bounds.z || plane.y > bounds.w) {
         return 0.0;
     }
 
+    // The margin, ragged by a slow noise along the track — clamped, because
+    // the slope of a noise field is not bounded and unclamped it threw blobs of
+    // foam twenty metres off the track. A property of the point, not of the
+    // segment, so it is computed once.
+    let ragged = 0.8 + 0.3 * clamp(ripple_slope(plane * 0.18).x, -1.0, 1.0);
+
+    // Newest segment first, because the wake is strongest there and fades
+    // with age: past fifteen seconds it is under three per cent of full and
+    // the streaks have dissolved it, so the walk stops there rather than
+    // visiting every point the buffer holds.
     var best = 0.0;
-    for (var index: u32 = 0u; index < count; index = index + 1u) {
+    for (var back: u32 = 0u; back < count; back = back + 1u) {
+        let index = count - 1u - back;
         let older = trail[index].point;
         // The segment ends at the next recorded point, or at the stern itself
         // for the newest one, which is where the wake is being made now.
@@ -782,6 +815,9 @@ fn wake(plane: vec2<f32>, detail: vec2<f32>) -> f32 {
             newer = trail[index + 1u].point;
         } else {
             newer = vec4<f32>(stern, sea.time, 0.0);
+        }
+        if (sea.time - newer.z > 15.0) {
+            break;
         }
         let span = newer.xy - older.xy;
         let span_length = length(span);
@@ -798,12 +834,8 @@ fn wake(plane: vec2<f32>, detail: vec2<f32>) -> f32 {
         let age = sea.time - mix(older.z, newer.z, along / span_length);
 
         // Half a transom's width when it was made, widening by entrainment at a
-        // tenth of a metre a second, the margin ragged by a slow noise along
-        // the track — clamped, because the slope of a noise field is not
-        // bounded and unclamped it threw blobs of foam twenty metres off the
-        // track; mostly gone in five seconds, which at five knots is a boat
-        // length of clear trail and a faint one for a few more.
-        let ragged = 0.8 + 0.3 * clamp(ripple_slope(plane * 0.18).x, -1.0, 1.0);
+        // tenth of a metre a second; mostly gone in five seconds, which at five
+        // knots is a boat length of clear trail and a faint one for a few more.
         let half_width = (0.9 + 0.1 * age) * ragged;
         let strength = 0.55 * exp(-age / 5.0);
         let inside = 1.0 - smoothstep(0.45 * half_width, half_width, across);

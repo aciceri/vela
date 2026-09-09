@@ -63,6 +63,14 @@
 
       const started = () => document.getElementById("status")?.remove();
 
+      // The right button orbits the camera, and the browser answers it with a
+      // context menu. Swallowed on the canvas alone: the page keeps its
+      // keyboard shortcuts (see `prevent_default_event_handling` in `main`),
+      // and the credit link keeps its menu.
+      document.addEventListener("contextmenu", (event) => {
+        if (event.target instanceof HTMLCanvasElement) event.preventDefault();
+      });
+
       // Bevy's wasm event loop never returns: winit ends the calling frame by
       // throwing, and documents the throw in its own message. That arrives here
       // as a rejection on the *successful* path, so a page that treated every

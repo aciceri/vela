@@ -115,11 +115,19 @@ pub struct ShaderWave {
     pub phase: f32,
     /// Amplitude, m.
     pub amplitude: f32,
-    /// Padding to the 32-byte stride. Never read.
-    pub pad0: f32,
-    pub pad1: f32,
-    pub pad2: f32,
+    /// Cosine and sine of the phase this wave advances by over one
+    /// [`FOAM_MEMORY`] interval, so the shader can look the wave up in the past
+    /// with a rotation rather than another sine. The third is padding to the
+    /// 32-byte stride, never read.
+    pub memory_cos: f32,
+    pub memory_sin: f32,
+    pub pad: f32,
 }
+
+/// How far back the shader asks a parcel of water whether it was folding, s;
+/// it asks at one and two of these. The persistence a whitecap has in a fresh
+/// breeze: bright as it breaks, a patch for a few seconds, gone in five.
+pub const FOAM_MEMORY: f64 = 1.4;
 
 /// The scalars every wave shares.
 #[derive(ShaderType, Clone, Debug)]
@@ -175,6 +183,11 @@ pub struct SeaUniform {
     /// the shader moves its parcels sideways by, which is the number the
     /// physics clips the hull with.
     pub choppiness: f32,
+    /// The wake's reach in the render plane, `(min x, min z, max x, max z)`:
+    /// the recorded track grown by the widest the wake gets, kept by
+    /// [`OceanMaterial::record`] so the shader can skip the track's loop
+    /// for every fragment that is not near it, which is nearly all of them.
+    pub trail_bounds: Vec4,
 }
 
 /// Samples of the stern's track the shader can carry.
@@ -242,9 +255,9 @@ impl OceanMaterial {
                 frequency: wave.frequency as f32,
                 phase: wave.phase as f32,
                 amplitude: wave.amplitude as f32,
-                pad0: 0.0,
-                pad1: 0.0,
-                pad2: 0.0,
+                memory_cos: (wave.frequency * FOAM_MEMORY).cos() as f32,
+                memory_sin: (wave.frequency * FOAM_MEMORY).sin() as f32,
+                pad: 0.0,
             };
         }
 
@@ -281,6 +294,7 @@ impl OceanMaterial {
                 heading: Vec4::new(1.0, 0.0, 0.0, 0.0),
                 wind: Vec4::new(downwind.x, downwind.y, 0.0, 0.0),
                 choppiness: sea.state().choppiness as f32,
+                trail_bounds: Vec4::ZERO,
             },
             waves,
             trail: [TrailPoint::default(); MAX_TRAIL],
@@ -353,18 +367,39 @@ impl OceanMaterial {
         let here = Vec2::new(stern.x, stern.z);
         let count = self.sea.trail_count as usize;
         let newest = (count > 0).then(|| self.trail[count - 1].point.xy());
-        if newest.is_some_and(|last| last.distance(here) < SPACING) {
-            return;
+        if newest.is_none_or(|last| last.distance(here) >= SPACING) {
+            if count == MAX_TRAIL {
+                self.trail.copy_within(1.., 0);
+            } else {
+                self.sea.trail_count += 1;
+            }
+            let slot = self.sea.trail_count as usize - 1;
+            self.trail[slot] = TrailPoint {
+                point: Vec4::new(here.x, here.y, time as f32, 0.0),
+            };
         }
-        if count == MAX_TRAIL {
-            self.trail.copy_within(1.., 0);
-        } else {
-            self.sea.trail_count += 1;
-        }
-        let slot = self.sea.trail_count as usize - 1;
-        self.trail[slot] = TrailPoint {
-            point: Vec4::new(here.x, here.y, time as f32, 0.0),
-        };
+
+        // The wake's reach: the points still young enough to show, and the
+        // stern, grown by the widest the wake gets. `wake` in the shader
+        // widens by a tenth of a metre a second and shows nothing past
+        // fifteen seconds, so the margin is that width with the ragged edge on
+        // top; a point older than that is inside the bounds only by accident,
+        // and the shader stops at it anyway.
+        let count = self.sea.trail_count as usize;
+        let young = self.trail[..count]
+            .iter()
+            .map(|point| point.point)
+            .filter(|point| time as f32 - point.z <= 15.0);
+        let (min, max) = young.fold((here, here), |(min, max), point| {
+            (min.min(point.xy()), max.max(point.xy()))
+        });
+        const MARGIN: f32 = (0.9 + 0.1 * 15.0) * 1.1 + 0.5;
+        self.sea.trail_bounds = Vec4::new(
+            min.x - MARGIN,
+            min.y - MARGIN,
+            max.x + MARGIN,
+            max.y + MARGIN,
+        );
     }
 }
 
