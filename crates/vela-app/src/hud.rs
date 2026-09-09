@@ -47,7 +47,7 @@ pub fn spawn(mut commands: Commands) {
             "left/right  helm        up/down  mainsheet\n\
              q/e  traveller          f/r  flatten\n\
              j/l  orbit              i/k  raise      u/o  zoom\n\
-             right-drag orbit   wheel zoom",
+             right-drag orbit   wheel zoom      m  sea",
         ),
         TextFont {
             font_size: 13.0.into(),
@@ -61,6 +61,82 @@ pub fn spawn(mut commands: Commands) {
             ..default()
         },
     ));
+
+    // The sea button: the one control that is a button and not a key,
+    // because a viewer in a browser has a mouse before they have found the
+    // key list, and a change of weather is the thing they most want to try.
+    // Top right, away from the readout, and drawn as a plain framed label:
+    // a stock button would be a second style in a HUD that has one.
+    commands
+        .spawn((
+            Button,
+            SeaButton,
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(12),
+                right: px(14),
+                padding: UiRect::axes(px(10), px(6)),
+                border: UiRect::all(px(1)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.92, 0.95, 0.98, 0.5)),
+            BackgroundColor(Color::srgba(0.0, 0.05, 0.12, 0.35)),
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: 14.0.into(),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.92, 0.95, 0.98)),
+                SeaLabel,
+            ));
+        });
+}
+
+/// Marks the sea button, and the label inside it.
+#[derive(Component)]
+pub struct SeaButton;
+
+#[derive(Component)]
+pub struct SeaLabel;
+
+/// Cycles the sea on a click of the button or a press of `m`, and keeps
+/// the label saying which sea the boat is in - with a word of warning where
+/// the physics is outside its envelope; see `SeaPreset::sails`.
+pub fn sea_button(
+    mut engine: ResMut<Engine>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Query<&Interaction, (Changed<Interaction>, With<SeaButton>)>,
+    mut labels: Query<&mut Text, With<SeaLabel>>,
+) {
+    let clicked = buttons
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed);
+    if clicked || keys.just_pressed(KeyCode::KeyM) {
+        let next = engine.preset.next();
+        engine.set_sea(next);
+    }
+
+    let preset = engine.preset;
+    let wanted = match preset.state() {
+        Some((height, period)) => format!(
+            "sea: {}  {height:.1} m / {period:.0} s{}",
+            preset.name(),
+            if preset.sails() {
+                ""
+            } else {
+                "   (beyond the model: the boat will not sail)"
+            }
+        ),
+        None => format!("sea: {}", preset.name()),
+    };
+    for mut label in &mut labels {
+        if **label != wanted {
+            **label = wanted.clone();
+        }
+    }
 }
 
 /// A smoothed frame rate, kept here because nothing else needs it.

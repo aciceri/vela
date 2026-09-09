@@ -291,12 +291,19 @@ pub fn spawn(
     mut meshes: ResMut<Assets<Mesh>>,
     mut oceans: ResMut<Assets<OceanMaterial>>,
 ) {
-    if let Some(sea) = &engine.sea {
+    {
+        // Still water is a sea with no waves to draw and the same surface to
+        // shade, so the water is spawned whatever the boat was released in;
+        // `advance_sea` re-realises it when the sea changes.
+        //
         // One material, two meshes. They differ only in how finely they sample
         // the same closed form, so sharing the handle is not an optimisation but
         // a statement that it is one sea — and it means the per-frame time push
         // in `advance_sea` cannot leave the two halves on different clocks.
-        let ocean = oceans.add(OceanMaterial::realising(sea, engine.sim.time()));
+        let ocean = oceans.add(OceanMaterial::realising(
+            engine.sea.as_ref(),
+            engine.sim.time(),
+        ));
 
         commands.spawn((
             Mesh3d(meshes.add(near_disc(CORE, REACH, SEGMENTS, RINGS))),
@@ -492,7 +499,11 @@ pub fn spawn(
 /// stern's position and velocity are the whole per-frame traffic between the
 /// physics and the water; the material records the stern's track from them
 /// and the water computes everything else, the wake included.
-pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>>) {
+pub fn advance_sea(
+    engine: Res<Engine>,
+    mut drawn: Local<Option<crate::sim::SeaPreset>>,
+    mut oceans: ResMut<Assets<OceanMaterial>>,
+) {
     let time = engine.sim.time();
     let state = engine.sim.state();
     let stern = frame::to_render(state.position);
@@ -512,7 +523,16 @@ pub fn advance_sea(engine: Res<Engine>, mut oceans: ResMut<Assets<OceanMaterial>
         .map_or(0.0, |sea| sea.vertical_rate(bow_world.x, bow_world.y, time));
     let plunge = (bow_velocity.z + surface_rate) as f32;
     let hull = Vec2::new(engine.hull_length() as f32, engine.hull_half_beam() as f32);
+    // A change of weather: the water is re-realised from the engine's new
+    // sea, keeping its clock and the wake's track. Judged by the preset the
+    // water was last drawn from, so the realisation is loaded once and not
+    // every frame.
+    let changed = *drawn != Some(engine.preset);
+    *drawn = Some(engine.preset);
     for (_, material) in oceans.iter_mut() {
+        if changed {
+            material.realise(engine.sea.as_ref());
+        }
         material.set_time(time);
         material.record(stern, velocity, time);
         material.set_heading(heading, plunge, hull);

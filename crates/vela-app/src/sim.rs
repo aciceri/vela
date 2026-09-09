@@ -56,44 +56,115 @@ const SPEC: &str = include_str!("../../../boats/yd41-form-study.ron");
 const WIND_SPEED: f64 = 5.0;
 const WIND_ANGLE: f64 = 40.0;
 
-/// The sea the boat is released into.
+/// The seas the boat can be put in, from the HUD's button or the `m` key.
 ///
-/// Half a metre at six seconds: a slight sea for a forty-footer. It was a metre
-/// — the condition every seakeeping number in `docs/functional-analysis.md` is
-/// measured at — and in a metre of sea this boat does not stay sailing. §5.4's
-/// missing foil stall is why: the appendage lift is linear in angle of attack,
-/// the angle at the keel includes the roll rate times its arm, and as the waves
-/// slow the boat that ratio grows without bound — a keel lift coefficient of
-/// 3.4 was read off the HUD twenty seconds after release, where a real foil
-/// stalls near 1.2, with the boat down to a knot and the induced drag it was
-/// charged pinning it there. The functional analysis says it in as many words:
-/// seaway *motions* are usable and the seaway *speed loss* is not. Half a metre
-/// keeps the roll rate where the linear model holds and the boat at the five
-/// knots it was released at, which is the picture the frontend exists to show.
-///
-/// It was also once a metre and a half, to make the water look like it had
-/// weather in it, and `examples/motion_scale` is why it came down from there:
-/// seventeen degrees of trim and nearly three metres of sinkage against a hull
-/// 1.84 m deep, twice a real forty-footer's response — the amplitude error of
-/// no diffraction and no viscous damping, which §5.4 also names. Choosing the
-/// sea to flatter the model would be the wrong lever; choosing it to stay
-/// inside what the model can do is the right one, and the number goes back up
-/// when the stall model lands.
-///
-/// Until then, `VELA_WAVE_HEIGHT` in the environment overrides it, for looking
-/// at the *water* in weather: at two metres the sea reads as a sea, and the
-/// boat, for the reasons above, does not sail in it.
-const WAVE_HEIGHT: f64 = 0.5;
-const WAVE_PERIOD: f64 = 6.0;
+/// Named by the Douglas scale's words, sized for a forty-footer. The heading
+/// is always towards the boat, from where the wind comes, and the choppiness
+/// is always 0.8: what changes between presets is height and period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeaPreset {
+    /// A flat calm: no realisation at all, the picture and the physics of a
+    /// millpond.
+    Calm,
+    /// Half a metre at six seconds, the default; see [`SeaPreset::default`].
+    Slight,
+    /// A metre and a quarter at six seconds.
+    Moderate,
+    /// Two metres at seven.
+    Rough,
+}
 
-/// The significant wave height the boat is released into: the constant, or
-/// the override; see [`WAVE_HEIGHT`].
-fn wave_height() -> f64 {
-    std::env::var("VELA_WAVE_HEIGHT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|height: &f64| height.is_finite() && *height >= 0.0)
-        .unwrap_or(WAVE_HEIGHT)
+impl SeaPreset {
+    /// Every preset, in the order the button cycles them.
+    pub const ALL: [Self; 4] = [Self::Calm, Self::Slight, Self::Moderate, Self::Rough];
+
+    /// The word the HUD shows.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Calm => "calm",
+            Self::Slight => "slight",
+            Self::Moderate => "moderate",
+            Self::Rough => "rough",
+        }
+    }
+
+    /// The next preset round, wrapping.
+    #[must_use]
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|it| *it == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// Significant height and peak period, m and s; `None` for a calm.
+    #[must_use]
+    pub const fn state(self) -> Option<(f64, f64)> {
+        match self {
+            Self::Calm => None,
+            Self::Slight => Some((0.5, 6.0)),
+            Self::Moderate => Some((1.25, 6.0)),
+            Self::Rough => Some((2.0, 7.0)),
+        }
+    }
+
+    /// Whether the physics is inside its validated envelope in this sea.
+    ///
+    /// It is not above about a metre. §5.4's missing foil stall is why: the
+    /// appendage lift is linear in angle of attack, the angle at the keel
+    /// includes the roll rate times its arm, and as the waves slow the boat
+    /// that ratio grows without bound — a keel lift coefficient of 3.4 was
+    /// read off the HUD twenty seconds after release in a metre of sea,
+    /// where a real foil stalls near 1.2, with the boat down to a knot and
+    /// the induced drag it was charged pinning it there. The functional
+    /// analysis says it in as many words: seaway *motions* are usable and
+    /// the seaway *speed loss* is not. The HUD says so next to the preset,
+    /// so a viewer watching the boat stop in a rough sea knows they are
+    /// looking at the water, not at the boat.
+    #[must_use]
+    pub const fn sails(self) -> bool {
+        matches!(self, Self::Calm | Self::Slight)
+    }
+
+    /// The preset the boat is released in.
+    ///
+    /// Slight. It was a metre — the condition every seakeeping number in
+    /// `docs/functional-analysis.md` is measured at — and in a metre of sea
+    /// this boat does not stay sailing; see [`SeaPreset::sails`]. Half a
+    /// metre keeps the roll rate where the linear model holds and the boat
+    /// at the five knots it was released at, which is the picture the
+    /// frontend exists to show. It was also once a metre and a half, to make
+    /// the water look like it had weather in it, and `examples/motion_scale`
+    /// is why it came down from there: seventeen degrees of trim and nearly
+    /// three metres of sinkage against a hull 1.84 m deep, twice a real
+    /// forty-footer's response — the amplitude error of no diffraction and no
+    /// viscous damping, which §5.4 also names. Choosing the sea to flatter
+    /// the model would be the wrong lever; choosing it to stay inside what
+    /// the model can do is the right one, and the default goes back up when
+    /// the stall model lands. `VELA_SEA` in the environment names another
+    /// preset to start in.
+    #[must_use]
+    pub fn default() -> Self {
+        std::env::var("VELA_SEA")
+            .ok()
+            .and_then(|name| Self::ALL.into_iter().find(|it| it.name() == name))
+            .unwrap_or(Self::Slight)
+    }
+
+    /// The sea state of this preset, travelling towards the boat from where
+    /// the wind comes.
+    fn sea_state(self, wind_from: f64) -> Option<SeaState> {
+        let (significant_height, peak_period) = self.state()?;
+        Some(SeaState {
+            significant_height,
+            peak_period,
+            heading: wind_from + std::f64::consts::PI,
+            // What a sea looks like: crests pinched, troughs flat. Costs half
+            // a step again over the linear sea (`frame_cost`), and the physics
+            // feels the asymmetry too, which is right.
+            choppiness: 0.8,
+            ..SeaState::default()
+        })
+    }
 }
 
 /// The simulation, and the mesh it was built from.
@@ -129,6 +200,8 @@ pub struct Engine {
     /// than faking with a zero-height sea: a flat surface and a sea of no waves
     /// are the same picture and not the same object.
     pub sea: Option<vela_core::seaway::Seaway>,
+    /// The sea the boat is in; see [`SeaPreset`].
+    pub preset: SeaPreset,
     /// Rudder angle that balances the boat at the condition it was released in,
     /// radians.
     ///
@@ -214,25 +287,12 @@ impl Engine {
             helm.rudder_angle.to_degrees()
         );
 
-        let sea = Seaway2D::new(
-            wind,
-            SeaState {
-                significant_height: wave_height(),
-                peak_period: WAVE_PERIOD,
-                // Travelling towards the boat: waves come from where the wind does.
-                heading: WIND_ANGLE.to_radians() + std::f64::consts::PI,
-                // What a sea looks like: crests pinched, troughs flat. Costs
-                // half a step again over the linear sea (`frame_cost`), and the
-                // physics feels the asymmetry too, which is right.
-                choppiness: 0.8,
-                ..SeaState::default()
-            },
-        );
-        let realisation = sea.sea().clone();
+        let preset = SeaPreset::default();
+        let (environment, realisation) = Self::environment(preset, wind);
 
         let mut sim = sailing_sim(
             &spec,
-            Box::new(sea),
+            environment,
             base.with_rudder(helm.rudder_angle),
             &loft,
             RadiationOptions::default(),
@@ -246,11 +306,51 @@ impl Engine {
             rig,
             mast_at: spec.layout.map(|layout| layout.mast_at),
             spec,
-            sea: Some(realisation),
+            sea: realisation,
+            preset,
             balanced_helm: helm.rudder_angle,
             course: None,
             helm_bias: 0.0,
         })
+    }
+
+    /// Puts the boat in another sea, from the next step on.
+    ///
+    /// The realisation changes and the boat does not: it keeps its position,
+    /// velocity and attitude, and meets the new water where it is. See
+    /// `Sim::set_environment` for what that means at the first step. The
+    /// renderer reads [`Engine::sea`] and re-realises the water from it; the
+    /// wake and the spray carry on, being records of where the boat has been.
+    pub fn set_sea(&mut self, preset: SeaPreset) {
+        if preset == self.preset {
+            return;
+        }
+        let wind = UniformWind::uniform(WIND_SPEED, WIND_ANGLE.to_radians());
+        let (environment, realisation) = Self::environment(preset, wind);
+        self.sim.set_environment(environment);
+        self.sea = realisation;
+        self.preset = preset;
+        info!("sea set to {}", preset.name());
+    }
+
+    /// The environment of a preset under the wind, and the realisation the
+    /// renderer draws it from — `None` for a calm, which is still water and
+    /// not a sea of no waves.
+    fn environment(
+        preset: SeaPreset,
+        wind: UniformWind,
+    ) -> (
+        Box<dyn vela_core::Environment>,
+        Option<vela_core::seaway::Seaway>,
+    ) {
+        match preset.sea_state(WIND_ANGLE.to_radians()) {
+            Some(state) => {
+                let sea = Seaway2D::new(wind, state);
+                let realisation = sea.sea().clone();
+                (Box::new(sea), Some(realisation))
+            }
+            None => (Box::new(StillWater::new(wind)), None),
+        }
     }
 }
 

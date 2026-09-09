@@ -42,12 +42,37 @@ mod view;
 
 use bevy::prelude::*;
 
+/// The window's starting size, and on the web its scale.
+///
+/// On a desktop the compositor sets both and this is a hint. In a browser the
+/// canvas takes the page's size, and its *scale* is the display's pixel ratio
+/// - 1.25, 2, 3 on a phone - which is overridden to one here, for two reasons.
+///
+/// The first is a defect: with a ratio other than one, Bevy 0.19's UI hit test
+/// on the web compares the cursor in CSS pixels against node rectangles in
+/// physical ones, and the sea button answers a click a quarter of the screen
+/// away from where it is drawn and none where it is. Measured in headless
+/// Chromium at 1.25 and at 1; the override makes the two coordinate systems
+/// the same one. The second is cost: the sea is a full-screen fragment
+/// shader, and a display with a pixel ratio of two asks for four times the
+/// fragments to draw the same picture a little sharper. At CSS resolution
+/// the water is what a web game draws, and the text is what a browser draws
+/// at that ratio anyway.
+fn resolution() -> bevy::window::WindowResolution {
+    let resolution = bevy::window::WindowResolution::new(1280, 720);
+    if cfg!(target_arch = "wasm32") {
+        resolution.with_scale_factor_override(1.0)
+    } else {
+        resolution
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "vela".into(),
-                resolution: (1280, 720).into(),
+                resolution: resolution(),
                 // The canvas takes its size from the page rather than
                 // from a hard-coded pixel count, which is what makes the
                 // wasm build usable at all.
@@ -115,6 +140,7 @@ fn main() {
                 view::advance_sea,
                 view::follow_sea,
                 hud::update,
+                hud::sea_button,
                 reflection::resize,
                 spray::emit_and_advance,
             ),

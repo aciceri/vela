@@ -227,7 +227,7 @@ pub struct OceanMaterial {
 }
 
 impl OceanMaterial {
-    /// Loads a realisation into the material.
+    /// A material drawing a realisation - or still water, for `None`.
     ///
     /// # Panics
     ///
@@ -236,8 +236,50 @@ impl OceanMaterial {
     /// draw a different sea from the one the physics is using, quietly, which is
     /// the failure this whole module is arranged to prevent.
     #[must_use]
-    pub fn realising(sea: &Seaway, time: f64) -> Self {
-        let source = sea.waves();
+    pub fn realising(sea: Option<&Seaway>, time: f64) -> Self {
+        // The palette is Sea of Thieves' (Ang, SIGGRAPH 2018), by request: a
+        // saturated deep blue, a turquoise where the water is thin or faces the
+        // sky, and a green for light scattered *through* a crest. These are
+        // the *transmitted* colours, seen only where the Fresnel term lets
+        // them through; the blue a viewer reads at a distance is mostly the
+        // reflected sky, which is how water works and why picking water colours
+        // by eye without the reflection in place produces paint. The first
+        // palette was a North Atlantic in winter - grey-steel, desaturated -
+        // and read as lifeless next to a boat in sunshine.
+        let mut material = Self {
+            sea: SeaUniform {
+                count: 0,
+                time: time as f32,
+                significant_height: 0.0,
+                trail_count: 0,
+                deep: Vec3::new(0.005, 0.038, 0.095),
+                shallow: Vec3::new(0.030, 0.290, 0.330),
+                scatter: Vec3::new(0.040, 0.520, 0.400),
+                sun: crate::sky::SUN.normalize().extend(0.0),
+                motion: Vec4::ZERO,
+                heading: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                wind: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                choppiness: 0.0,
+                trail_bounds: Vec4::ZERO,
+            },
+            waves: [ShaderWave::default(); MAX_WAVES],
+            trail: [TrailPoint::default(); MAX_TRAIL],
+            reflection: None,
+        };
+        material.realise(sea);
+        material
+    }
+
+    /// Loads a realisation into the material - or still water, for `None` -
+    /// keeping everything that is not the sea's: the clock, the wake's track,
+    /// the boat's motion, the mirror. What a change of weather is to the
+    /// water: the waves are new, and the boat has still been where it has been.
+    ///
+    /// # Panics
+    ///
+    /// As [`OceanMaterial::realising`].
+    pub fn realise(&mut self, sea: Option<&Seaway>) {
+        let source = sea.map_or(&[][..], Seaway::waves);
         assert!(
             source.len() <= MAX_WAVES,
             "a realisation of {} waves cannot be drawn by a shader that carries {MAX_WAVES}; \
@@ -245,8 +287,8 @@ impl OceanMaterial {
             source.len()
         );
 
-        let mut waves = [ShaderWave::default(); MAX_WAVES];
-        for (slot, wave) in waves.iter_mut().zip(source) {
+        self.waves = [ShaderWave::default(); MAX_WAVES];
+        for (slot, wave) in self.waves.iter_mut().zip(source) {
             *slot = ShaderWave {
                 wave_vector: Vec2::new(
                     (wave.wavenumber * wave.direction.0) as f32,
@@ -263,43 +305,20 @@ impl OceanMaterial {
 
         // Where the sea is going, amplitude-weighted: the realisation travels
         // from the wind's direction, so this points downwind. Render x is north
-        // and render z is east, the same map the wave vectors use above.
+        // and render z is east, the same map the wave vectors use above. Still
+        // water keeps whatever direction it had; nothing reads it there.
         let mut downwind = Vec2::ZERO;
         for wave in source {
             downwind +=
                 Vec2::new(wave.direction.0 as f32, wave.direction.1 as f32) * wave.amplitude as f32;
         }
-        let downwind = downwind.normalize_or(Vec2::X);
+        let downwind = downwind.normalize_or(self.sea.wind.xy());
 
-        // The palette is Sea of Thieves' (Ang, SIGGRAPH 2018), by request: a
-        // saturated deep blue, a turquoise where the water is thin or faces the
-        // sky, and a green for light scattered *through* a crest. These are
-        // the *transmitted* colours, seen only where the Fresnel term lets
-        // them through; the blue a viewer reads at a distance is mostly the
-        // reflected sky, which is how water works and why picking water colours
-        // by eye without the reflection in place produces paint. The first
-        // palette was a North Atlantic in winter - grey-steel, desaturated -
-        // and read as lifeless next to a boat in sunshine.
-        Self {
-            sea: SeaUniform {
-                count: source.len() as u32,
-                time: time as f32,
-                significant_height: sea.state().significant_height as f32,
-                trail_count: 0,
-                deep: Vec3::new(0.005, 0.038, 0.095),
-                shallow: Vec3::new(0.030, 0.290, 0.330),
-                scatter: Vec3::new(0.040, 0.520, 0.400),
-                sun: crate::sky::SUN.normalize().extend(0.0),
-                motion: Vec4::ZERO,
-                heading: Vec4::new(1.0, 0.0, 0.0, 0.0),
-                wind: Vec4::new(downwind.x, downwind.y, 0.0, 0.0),
-                choppiness: sea.state().choppiness as f32,
-                trail_bounds: Vec4::ZERO,
-            },
-            waves,
-            trail: [TrailPoint::default(); MAX_TRAIL],
-            reflection: None,
-        }
+        self.sea.count = source.len() as u32;
+        self.sea.significant_height = sea.map_or(0.0, |sea| sea.state().significant_height as f32);
+        self.sea.wind.x = downwind.x;
+        self.sea.wind.y = downwind.y;
+        self.sea.choppiness = sea.map_or(0.0, |sea| sea.state().choppiness as f32);
     }
 
     /// Tells the water which way the hull points and how the bow is moving
@@ -518,7 +537,7 @@ mod tests {
     #[test]
     fn every_wave_crosses_intact() {
         let sea = sea(12);
-        let material = OceanMaterial::realising(&sea, 3.25);
+        let material = OceanMaterial::realising(Some(&sea), 3.25);
 
         assert_eq!(material.sea.count, 12);
         assert!((material.sea.time - 3.25).abs() < 1e-6);
@@ -543,7 +562,7 @@ mod tests {
     /// nothing whatever the loop bound turns out to be.
     #[test]
     fn the_unused_slots_are_calm() {
-        let material = OceanMaterial::realising(&sea(4), 0.0);
+        let material = OceanMaterial::realising(Some(&sea(4)), 0.0);
         for slot in &material.waves[4..] {
             assert_eq!(slot.amplitude, 0.0);
         }
@@ -571,6 +590,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot be drawn by a shader")]
     fn too_many_waves_is_an_error_and_not_a_crop() {
-        let _ = OceanMaterial::realising(&sea(MAX_WAVES + 1), 0.0);
+        let _ = OceanMaterial::realising(Some(&sea(MAX_WAVES + 1)), 0.0);
     }
 }

@@ -439,6 +439,21 @@ impl Sim {
         self.restrained_pose = state;
     }
 
+    /// Replaces the environment the boat is in - the wind and the water -
+    /// from the next step on.
+    ///
+    /// The modules are not told. None of them holds a copy of the sea: each
+    /// reads it through the context at every step, so a new sea is simply the
+    /// one the next step evaluates. What a swap does not do is fade: a boat on
+    /// a calm handed a two-metre sea meets its first crest in one step, with
+    /// the jolt that implies, and the radiation memory carries on from the
+    /// motion it had. That is the honest behaviour of a change of weather
+    /// nobody asked the physics to smooth; a caller wanting a gentle change
+    /// hands over a sea that starts gentle.
+    pub fn set_environment(&mut self, env: Box<dyn Environment>) {
+        self.env = env;
+    }
+
     #[must_use]
     pub fn body(&self) -> &RigidBody {
         &self.body
