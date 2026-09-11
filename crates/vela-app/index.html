@@ -21,6 +21,7 @@
         display: block;
         width: 100%;
         height: 100%;
+        touch-action: none;
       }
       #status {
         position: absolute;
@@ -69,6 +70,22 @@
       // and the credit link keeps its menu.
       document.addEventListener("contextmenu", (event) => {
         if (event.target instanceof HTMLCanvasElement) event.preventDefault();
+      });
+
+      // Plain Tab navigates Bevy's widgets rather than blurring the canvas.
+      // Shift-Tab remains a browser action, so keyboard users can leave the
+      // simulator for the attribution link. Browser shortcuts stay untouched.
+      document.addEventListener("keydown", (event) => {
+        if (
+          event.target instanceof HTMLCanvasElement &&
+          event.key === "Tab" &&
+          !event.shiftKey &&
+          !event.ctrlKey &&
+          !event.altKey &&
+          !event.metaKey
+        ) {
+          event.preventDefault();
+        }
       });
 
       // Bevy's wasm event loop never returns: winit ends the calling frame by

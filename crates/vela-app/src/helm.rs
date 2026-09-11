@@ -1,12 +1,11 @@
-//! The keyboard, as a crew.
+//! Manual controls and an explicitly engaged helmsman.
 //!
 //! # What a control is here
 //!
 //! `vela_core::Controls` is what the crew can change while sailing, and every
 //! field of it is either an angle in radians or a line position normalised from
-//! 0 eased to 1 hard. This module maps keys onto those and does nothing else: it
-//! computes no forces, holds no state of its own beyond a rate, and never
-//! touches the simulation's pose.
+//! 0 eased to 1 hard. This module maps keyboard and cockpit input onto those
+//! controls. It computes no forces and never touches the simulation's pose.
 //!
 //! # Rates, not steps
 //!
@@ -18,29 +17,15 @@
 //!
 //! # The helmsman
 //!
-//! When neither steering key is held, a helmsman steers the boat to a
-//! **course** — the heading it was on when the keys were last released — with
-//! a proportional-plus-rate law on the rudder about the balanced angle. Not
-//! back to the balanced angle itself, which is what this file did second, and
-//! not to amidships, which is what it did first.
+//! Course hold starts engaged and captures the boat's heading on its first
+//! frame. It steers about the balanced rudder angle with proportional, rate,
+//! and slow integral corrections, limited to the rate a wheel turns.
 //!
-//! Both earlier versions failed for the reason §5.5a states: a boat with a
-//! fixed rudder has no course stability. Amidships releases a trimmed boat with
-//! the helm in the wrong place and it luffs up in seconds. The balanced angle
-//! is the equilibrium solve's, found with trim held and in flat water; released
-//! with trim free into a seaway the yaw balance moves at once, and the boat
-//! luffed head to wind inside fifteen seconds, stopped, then bore away to a
-//! broad reach and back — a viewer read a boat that "does not move against the
-//! sea", and was right. Every real boat has someone on the wheel doing what
-//! this does: holding the course with small corrections, at the rate a wheel
-//! turns. The gains are a helmsman's, not a tuned controller's — a degree of
-//! rudder per degree off course, and three seconds' worth of yaw rate to keep
-//! it from hunting — and the balanced angle is the trim the corrections sit
-//! on, so in flat water the rudder rests exactly where the solve put it.
-//!
-//! Steering by hand takes over completely and sets a new course on release.
+//! Manual rudder input disengages course hold. Releasing a key or slider keeps
+//! that rudder angle: assistance resumes only through [`set_course_hold`],
+//! capturing the current heading on the next steering frame.
 
-use bevy::prelude::*;
+use bevy::{input_focus::InputFocus, prelude::*, ui_widgets::Slider};
 use vela_core::equilibrium::MAX_HELM;
 
 use crate::sim::Engine;
@@ -84,31 +69,60 @@ const BIAS_LIMIT: f64 = 0.26;
 /// Fraction of a line's travel per second, held.
 const SHEET_RATE: f64 = 0.35;
 
-/// Applies the keyboard to the engine's controls, and the helmsman when the
-/// keyboard is not steering.
-pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMut<Engine>) {
+/// Sets a persistent manual rudder angle in physical radians.
+///
+/// Positive is port, negative starboard. Taking the wheel disengages course
+/// hold and forgets its course and learned bias without changing sail controls.
+pub fn set_rudder(engine: &mut Engine, angle: f64) {
+    set_course_hold(engine, false);
+    let mut controls = *engine.sim.controls();
+    controls.rudder_angle = angle.clamp(-MAX_HELM, MAX_HELM);
+    engine.sim.set_controls(controls);
+}
+
+/// Engages or disengages course hold without moving the rudder.
+///
+/// Engaging captures the current heading on the next steering frame. Either
+/// transition forgets the previous course and learned bias.
+pub fn set_course_hold(engine: &mut Engine, enabled: bool) {
+    engine.hold_course = enabled;
+    engine.course = None;
+    engine.helm_bias = 0.0;
+}
+
+/// Applies manual keyboard controls and, while engaged, course hold.
+///
+/// A focused slider owns keyboard input; course hold continues independently.
+pub fn steer(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    focus: Res<InputFocus>,
+    sliders: Query<(), With<Slider>>,
+    mut engine: ResMut<Engine>,
+) {
     let dt = time.delta_secs() as f64;
     let mut controls = *engine.sim.controls();
+    let slider_focused = focus.get().is_some_and(|entity| sliders.contains(entity));
+    let pressed = |key| !slider_focused && keys.pressed(key);
 
     // Left and right are the boat's, not the screen's. A positive rudder angle
     // adds angle of attack in the same sense as positive leeway — see
     // `vela_core::controls` — which turns the bow to port, so "steer to
     // starboard" is a negative angle.
-    let mut steering = 0.0;
-    if keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA) {
-        steering += 1.0;
-    }
-    if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) {
-        steering -= 1.0;
-    }
+    let port = pressed(KeyCode::ArrowLeft) || pressed(KeyCode::KeyA);
+    let starboard = pressed(KeyCode::ArrowRight) || pressed(KeyCode::KeyD);
 
-    let state = engine.sim.state();
-    let heading = state.attitude.euler_angles().2;
-    let yaw_rate = state.angular_velocity.z;
-
-    if steering == 0.0 {
-        // The course is the heading the keys were last released on; the first
-        // frame sets it to the heading the boat was released on.
+    if port || starboard {
+        // Even opposing keys take the wheel; releasing never re-engages hold.
+        set_course_hold(&mut engine, false);
+        let steering = f64::from(u8::from(port)) - f64::from(u8::from(starboard));
+        controls.rudder_angle =
+            (controls.rudder_angle + steering * HELM_RATE * dt).clamp(-MAX_HELM, MAX_HELM);
+    } else if engine.hold_course {
+        let state = engine.sim.state();
+        let heading = state.attitude.euler_angles().2;
+        let yaw_rate = state.angular_velocity.z;
+        // Capture only when assistance is engaged, including the first frame.
         let course = *engine.course.get_or_insert(heading);
         // Wrapped, so that a course across north is a small error and not a
         // full turn the wrong way.
@@ -131,20 +145,15 @@ pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMu
         } else {
             controls.rudder_angle + step * gap.signum()
         };
-    } else {
-        engine.course = None;
-        engine.helm_bias = 0.0;
-        controls.rudder_angle =
-            (controls.rudder_angle + steering * HELM_RATE * dt).clamp(-MAX_HELM, MAX_HELM);
     }
 
     // Sheet and traveller, the two the boom angle is the product of. Trimming
     // both with one pair of keys would hide the reason the boat has both.
     let mut sheet = 0.0;
-    if keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW) {
+    if pressed(KeyCode::ArrowUp) || pressed(KeyCode::KeyW) {
         sheet += 1.0;
     }
-    if keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS) {
+    if pressed(KeyCode::ArrowDown) || pressed(KeyCode::KeyS) {
         sheet -= 1.0;
     }
     if sheet != 0.0 {
@@ -152,10 +161,10 @@ pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMu
     }
 
     let mut traveller = 0.0;
-    if keys.pressed(KeyCode::KeyE) {
+    if pressed(KeyCode::KeyE) {
         traveller += 1.0;
     }
-    if keys.pressed(KeyCode::KeyQ) {
+    if pressed(KeyCode::KeyQ) {
         traveller -= 1.0;
     }
     if traveller != 0.0 {
@@ -168,10 +177,10 @@ pub fn steer(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut engine: ResMu
     // the fact that it is a different control from the sheet is §4.5's point,
     // not an oversight.
     let mut flat = 0.0;
-    if keys.pressed(KeyCode::KeyR) {
+    if pressed(KeyCode::KeyR) {
         flat += 1.0;
     }
-    if keys.pressed(KeyCode::KeyF) {
+    if pressed(KeyCode::KeyF) {
         flat -= 1.0;
     }
     if flat != 0.0 {

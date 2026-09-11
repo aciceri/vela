@@ -212,14 +212,16 @@ pub struct Engine {
     /// equilibrium solve computes it, and this is where the answer is kept: it
     /// is the trim the helmsman's corrections sit on. See `crate::helm`.
     pub balanced_helm: f64,
-    /// The heading the helmsman is holding, radians, `None` while a hand is on
-    /// the wheel. Set to the heading the keys are released on — and on the
-    /// first frame, to the heading the boat was released on.
+    /// Whether the helmsman holds a course. Starts engaged; manual rudder input
+    /// disengages it until explicitly enabled again through `crate::helm`.
+    pub hold_course: bool,
+    /// The heading the helmsman is holding, radians. `None` in manual mode or
+    /// before the first steering frame after course hold is engaged.
     pub course: Option<f64>,
     /// The helmsman's learned offset from the balanced helm, radians: the
     /// slow integral of the heading error, which absorbs the difference
     /// between the balance the solve found and the one the free boat has.
-    /// Reset whenever a hand takes the wheel.
+    /// Reset whenever a hand takes the wheel or course hold is toggled.
     pub helm_bias: f64,
 }
 
@@ -309,6 +311,7 @@ impl Engine {
             sea: realisation,
             preset,
             balanced_helm: helm.rudder_angle,
+            hold_course: true,
             course: None,
             helm_bias: 0.0,
         })

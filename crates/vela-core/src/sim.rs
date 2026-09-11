@@ -454,6 +454,12 @@ impl Sim {
         self.env = env;
     }
 
+    /// The active wind and water fields, shared with the force modules.
+    #[must_use]
+    pub fn environment(&self) -> &dyn Environment {
+        self.env.as_ref()
+    }
+
     #[must_use]
     pub fn body(&self) -> &RigidBody {
         &self.body

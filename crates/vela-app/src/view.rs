@@ -448,7 +448,13 @@ pub fn orbit_with_mouse(
     mut motion: MessageReader<MouseMotion>,
     mut wheel: MessageReader<MouseWheel>,
     mut orbit: ResMut<Orbit>,
+    panels: Query<&bevy::ui::RelativeCursorPosition>,
 ) {
+    if panels.iter().any(|cursor| cursor.cursor_over()) {
+        motion.clear();
+        wheel.clear();
+        return;
+    }
     // Radians per pixel. Set so that dragging across a 1280-pixel window sweeps
     // most of a turn, which is what makes a drag feel like turning the boat
     // rather than nudging it.
