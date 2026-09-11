@@ -40,9 +40,12 @@
 //! drawing the shape anyway is the honest way round.
 
 use bevy::asset::{embedded_asset, RenderAssetUsages};
+use bevy::light::TransmittedShadowReceiver;
 use bevy::mesh::Indices;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::PrimitiveTopology;
+use bevy::render::render_resource::{AsBindGroup, Face, PrimitiveTopology};
+use bevy::shader::ShaderRef;
 use nalgebra::Vector3;
 use vela_core::aero::Sail;
 use vela_core::flying::Shape;
@@ -50,6 +53,7 @@ use vela_core::frames::file_to_body;
 use vela_core::geometry::Point;
 
 use crate::frame;
+use crate::ocean::embedded_shader;
 use crate::reflection;
 use crate::sim::Engine;
 
@@ -84,15 +88,89 @@ fn model_material() -> String {
     format!("{MODEL}#Material0/std")
 }
 
-/// Embeds the model in the binary.
-///
-/// Only that: the systems are registered by `main`, where their order against
-/// the rest of the frame is stated in one place.
+/// Embeds the model and registers its material extension and one-time upgrade.
 pub struct BoatPlugin;
 
 impl Plugin for BoatPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "models/sailboat.glb");
+        embedded_asset!(app, "shaders/boat.wgsl");
+        app.add_plugins(MaterialPlugin::<BoatMaterial>::default())
+            .add_systems(Update, finish_materials);
+    }
+}
+
+type BoatMaterial = ExtendedMaterial<StandardMaterial, BoatSurface>;
+
+/// The atlas already classifies metal in its blue ORM channel. The extension
+/// preserves that classification, all texture handles and the baked normals.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct BoatSurface {
+    /// x: 0 for the model's atlas, 1 for metric-UV sailcloth. A vec4 keeps the
+    /// uniform layout valid on WebGL2 without target-dependent padding.
+    #[uniform(100)]
+    finish: Vec4,
+}
+
+impl MaterialExtension for BoatSurface {
+    fn fragment_shader() -> ShaderRef {
+        embedded_shader!("shaders/boat.wgsl")
+    }
+
+    fn deferred_fragment_shader() -> ShaderRef {
+        embedded_shader!("shaders/boat.wgsl")
+    }
+}
+
+/// Removed after the loaded material has been upgraded; nothing is cloned or
+/// allocated on subsequent frames, including while the boat is being trimmed.
+#[derive(Component, Clone, Copy)]
+enum BoatFinish {
+    Atlas,
+    Cloth,
+}
+
+fn finish_materials(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    standard: Res<Assets<StandardMaterial>>,
+    mut extended: ResMut<Assets<BoatMaterial>>,
+    pending: Query<(Entity, &MeshMaterial3d<StandardMaterial>, &BoatFinish)>,
+    mut finished: Local<[Option<Handle<BoatMaterial>>; 2]>,
+) {
+    for (entity, original, finish) in &pending {
+        let index = match finish {
+            BoatFinish::Atlas => 0,
+            BoatFinish::Cloth => 1,
+        };
+        if finished[index].is_none() {
+            // The model is asynchronous, including its JPEG dependencies.
+            // Procedural cloth is inserted directly into Assets, not loaded.
+            if index == 0 && !assets.is_loaded_with_dependencies(original.0.id()) {
+                continue;
+            }
+            let Some(base) = standard.get(&original.0) else {
+                continue;
+            };
+            let mut base = base.clone();
+            if index == 0 {
+                // Enable the clearcoat shader path; its per-pixel strength is
+                // masked to gelcoat/varnish, never to metal, by the extension.
+                base.clearcoat = 1.0;
+            }
+            finished[index] = Some(extended.add(BoatMaterial {
+                base,
+                extension: BoatSurface {
+                    finish: Vec4::new(index as f32, 0.0, 0.0, 0.0),
+                },
+            }));
+        }
+        if let Some(material) = &finished[index] {
+            commands
+                .entity(entity)
+                .remove::<(MeshMaterial3d<StandardMaterial>, BoatFinish)>()
+                .insert(MeshMaterial3d(material.clone()));
+        }
     }
 }
 
@@ -178,6 +256,13 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
     let vertices = CHORDS * PANELS * 12;
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(vertices);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(vertices);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(vertices);
+    let cloth_coordinate = |along: f64, up: f64| {
+        [
+            (along * shape.planform().chord(up)) as f32,
+            (up * shape.planform().luff()) as f32,
+        ]
+    };
 
     for panel in 0..PANELS {
         let (low, high) = (
@@ -195,6 +280,14 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
                 station(forward, high),
                 station(aft, high),
             ];
+            // Unrolled cloth metres, not normalized triangle coordinates: weave
+            // and crosscut seam widths stay physical under trim and on both tacks.
+            let cloth_corners = [
+                cloth_coordinate(aft, low),
+                cloth_coordinate(forward, low),
+                cloth_coordinate(forward, high),
+                cloth_coordinate(aft, high),
+            ];
             // Two triangles a quad, then the same two reversed. The normal comes
             // from the quad's own diagonals rather than from a triangle, so both
             // halves of a panel are lit alike and the surface reads as cloth
@@ -206,12 +299,14 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
                 for index in winding {
                     positions.push(corners[index].to_array());
                     normals.push(normal.to_array());
+                    uvs.push(cloth_corners[index]);
                 }
             }
             for winding in [[0, 2, 1], [0, 3, 2]] {
                 for index in winding {
                     positions.push(corners[index].to_array());
                     normals.push((-normal).to_array());
+                    uvs.push(cloth_corners[index]);
                 }
             }
         }
@@ -224,6 +319,7 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_indices(Indices::U32((0..count).collect()))
 }
 
@@ -238,10 +334,14 @@ pub fn spawn(
 ) {
     let skin: Handle<StandardMaterial> = assets.load(model_material());
     let cloth = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.95, 0.95, 0.93),
-        perceptual_roughness: 0.9,
+        base_color: Color::srgb(0.94, 0.935, 0.905),
+        perceptual_roughness: 0.84,
+        reflectance: 0.38,
+        diffuse_transmission: 0.18,
+        thickness: 0.0004,
         double_sided: true,
-        cull_mode: None,
+        // sail_mesh already carries both windings with opposed normals.
+        cull_mode: Some(Face::Back),
         ..default()
     });
 
@@ -275,6 +375,7 @@ pub fn spawn(
             boat.spawn((
                 Mesh3d(assets.load(model_mesh(MODEL_HULL))),
                 MeshMaterial3d(skin.clone()),
+                BoatFinish::Atlas,
                 layers.clone(),
             ));
 
@@ -284,6 +385,7 @@ pub fn spawn(
             boat.spawn((
                 Mesh3d(assets.load(model_mesh(MODEL_MAST))),
                 MeshMaterial3d(skin.clone()),
+                BoatFinish::Atlas,
                 Transform::from_xyz(rig.mast_at, rig.sheer, 0.0).with_scale(Vec3::new(
                     1.0,
                     rig.masthead - rig.sheer,
@@ -297,6 +399,7 @@ pub fn spawn(
             boat.spawn((
                 Mesh3d(assets.load(model_mesh(MODEL_BOOM))),
                 MeshMaterial3d(skin),
+                BoatFinish::Atlas,
                 Transform::from_xyz(rig.mast_at, rig.boom, 0.0).with_scale(Vec3::new(
                     rig.main_foot,
                     1.0,
@@ -327,6 +430,8 @@ pub fn spawn(
                 boat.spawn((
                     Mesh3d(meshes.add(sail_mesh(&shape, tack, mirror, cut))),
                     MeshMaterial3d(cloth.clone()),
+                    BoatFinish::Cloth,
+                    TransmittedShadowReceiver,
                     DrawnSail {
                         sail,
                         shape,
