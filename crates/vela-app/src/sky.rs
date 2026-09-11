@@ -169,6 +169,8 @@ pub fn spawn(
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(SkyMaterial::at(0.0))),
         Transform::default(),
+        // A sky enclosure must never occlude the sun in the shadow pass.
+        bevy::light::NotShadowCaster,
     ));
 }
 
