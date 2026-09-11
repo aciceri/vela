@@ -1,5 +1,5 @@
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import vela::ocean_surface::{sea, surface, folding, hull_foam}
+#import vela::ocean_surface::{sea, surface, hull_foam}
 
 // All positions are parcel/rest coordinates. The physical orbit enters only
 // when locating a hull source, and the ocean supplies it again when drawing.
@@ -31,10 +31,9 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let old = select(0.0, packed.r + packed.g / 255.0, valid);
 
     let wave = surface(parcel, sea.time, 0.0);
-    // Integrating gentle compression each period would eventually whiten the
-    // whole sea. Strong folds inject quickly; weak shoulders contribute little.
-    let breaking = folding(wave.strain);
-    let rate = 2.4 * breaking * breaking * breaking + 5.0 * hull_foam(parcel + wave.shift);
+    // Ambient breaking is evaluated everywhere by the optical field. This
+    // bounded history stores only aeration injected by the physical hull.
+    let rate = 5.0 * hull_foam(parcel + wave.shift);
     let total_rate = rate + history.step.z;
     let equilibrium = rate / total_rate;
     // Exact solution of dF/dt = source*(1-F) - decay*F for this source sample.

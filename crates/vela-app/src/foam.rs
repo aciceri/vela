@@ -1,10 +1,11 @@
-//! Persistent, engine-clock foam on an advected parcel-space lattice.
+//! Persistent, engine-clock boat foam on an advected parcel-space lattice.
 //!
-//! A fullscreen raster pass reads one256² UNORM image and writes the other,
+//! A fullscreen raster pass reads one 256² UNORM image and writes the other,
 //! before any camera renders. No compute, storage buffers, camera, depth,
 //! tonemapping or multisampling is involved. The visible ocean keeps the last
 //! submitted image until the render world acknowledges a successful pass; an
 //! unavailable pipeline or image therefore cannot flip valid history away.
+//! Ambient whitecaps belong to the global optical field, not this bounded wake.
 
 use std::sync::{
     atomic::{AtomicU32, Ordering},

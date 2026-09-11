@@ -44,6 +44,10 @@ const NADIR: vec3<f32> = vec3<f32>(0.50, 0.60, 0.69);
 /// Colour and strength of the sun itself.
 const SUN_COLOUR: vec3<f32> = vec3<f32>(1.0, 0.93, 0.80);
 
+// Scene luminance scale, cd/m² per unit of the analytic sky. Every procedural
+// surface applies the camera's exposure once, just like Bevy's PBR materials.
+const SKY_LUMINANCE: f32 = 1000.0;
+
 /// A cheap 2D value hash, in `[0, 1)`.
 ///
 /// Dave Hoskins' `hash12`, and specifically *not* the `fract(sin(dot(...)))` one
@@ -186,4 +190,19 @@ fn sky_reflection(
     roughness: f32,
 ) -> vec3<f32> {
     return sky_radiance(direction, sun, drift, roughness, false);
+}
+
+// Cosine-weighted low-frequency environment quadrature. Normalizing the weights
+// preserves constant radiance while letting shaded faces see different sky.
+// The downward hemisphere is dark ocean bounce, not the horizon's pale haze.
+fn sky_irradiance(normal: vec3<f32>, sun: vec3<f32>, drift: vec2<f32>) -> vec3<f32> {
+    let weights = abs(normal);
+    let x = sky_reflection(vec3<f32>(select(-1.0, 1.0, normal.x >= 0.0), 0.35, 0.0) / 1.059481,
+        sun, drift, 1.0);
+    let z = sky_reflection(vec3<f32>(0.0, 0.35, select(-1.0, 1.0, normal.z >= 0.0)) / 1.059481,
+        sun, drift, 1.0);
+    let y = select(vec3<f32>(0.025, 0.045, 0.060),
+        sky_reflection(vec3<f32>(0.0, 1.0, 0.0), sun, drift, 1.0), normal.y >= 0.0);
+    return (x * weights.x + y * weights.y + z * weights.z)
+        / max(weights.x + weights.y + weights.z, 0.001);
 }

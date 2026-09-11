@@ -1,15 +1,16 @@
 // The physical Gerstner realisation is shared with the foam accumulation pass.
-// Near the hull it is exact; farther out each wavelength is filtered against
-// the polar mesh's spacing before sampling, not faded as one radial band.
+// Geometry is sampled on a camera-projected grid, filtered against world-space
+// cell edges rather than distance from the boat.
 // Water optics use dielectric Fresnel, GGX/Smith and the same cloudy sky as the
-// dome. Foam is persistent state in parcel coordinates; the wake also changes
-// surface slope and roughness after its visible bubbles have dissolved.
+// dome. Ambient whitecaps come from the global optical field; boat foam persists
+// in parcel coordinates. The wake also changes slope and roughness after its
+// visible bubbles have dissolved.
 
-#import bevy_pbr::mesh_functions::{get_world_from_local, mesh_position_local_to_world}
+#import vela::ocean_geometry::{projected_vertex, projection_margin}
 #import bevy_pbr::mesh_view_bindings::view
 #import bevy_pbr::shadows::fetch_directional_shadow
 #import bevy_pbr::view_transformations::position_world_to_clip
-#import vela::atmosphere::{sky_reflection, cloud_offset}
+#import vela::atmosphere::{sky_reflection, sky_irradiance, cloud_offset, SKY_LUMINANCE}
 #import vela::ocean_surface::{sea, trail, surface, jacobian, folding, hull_foam}
 
 /// Local rather than imported: naga_oil resolves function imports reliably and
@@ -24,6 +25,8 @@ const PI: f32 = 3.141592653589793;
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var reflection_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var foam_history: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(6) var foam_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(7) var optical_field: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(8) var optical_sampler: sampler;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -31,12 +34,10 @@ struct Vertex {
 };
 
 struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
+    @builtin(position) @invariant clip_position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
-    /// Elevation of this vertex above the mean level, m. Carried rather than
-    /// recovered from `world_position.y` because the mesh follows the boat and
-    /// the boat is not at `y = 0`.
+    /// Elevation of this vertex above the mean level, m.
     @location(2) elevation: f32,
     /// Magnitude of the surface slope: what the statistical self-shadowing
     /// reads, and it is already computed in the height loop.
@@ -54,15 +55,9 @@ struct VertexOutput {
 
 @vertex
 fn vertex(vertex: Vertex) -> VertexOutput {
-    let world_from_local = get_world_from_local(vertex.instance_index);
-    let base = mesh_position_local_to_world(world_from_local, vec4<f32>(vertex.position, 1.0));
-    let radius = length(vertex.position.xz);
-    // Both polar meshes have edges at most ~4.3% of their radius. Feeding all
-    // sixty waves to their distant vertices aliased into spokes and blotches.
-    // Keep the hull's neighbourhood exact and resolve wavelengths individually.
-    let spacing = radius * 0.043 * smoothstep(20.0, 40.0, radius);
-    let wave = surface(base.xz, sea.time, spacing);
-    let world = base.xyz + vec3<f32>(wave.shift.x, wave.height, wave.shift.y);
+    let projected = projected_vertex(vertex.position);
+    let wave = projected.wave;
+    let world = projected.world;
     let along_x = vec3<f32>(1.0 + wave.strain.x, wave.slope.x, wave.strain.z);
     let along_z = vec3<f32>(wave.strain.z, wave.slope.y, 1.0 + wave.strain.y);
     var out: VertexOutput;
@@ -72,7 +67,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     out.steepness = length(wave.slope);
     out.foam = folding(wave.strain);
     out.thinness = clamp(1.0 - jacobian(wave.strain), 0.0, 1.0);
-    out.parcel = base.xz;
+    out.parcel = projected.parcel;
     out.variance = wave.variance;
     out.clip_position = position_world_to_clip(world);
     return out;
@@ -277,121 +272,70 @@ struct WindSea {
     variance: f32,
 };
 
-/// The short wind-driven waves the realisation does not carry, as a slope.
-///
-/// The physical sea is a six second swell: its shortest component is three and
-/// a half metres long, and a twelve metre hull integrates anything shorter to
-/// nothing, which is why the physics stops there. The eye does not. A sea in
-/// ten knots of wind is covered in half-metre to three-metre wind waves with
-/// short steep crests, and it is those — not the swell — that carry the
-/// whitecaps and the texture a viewer reads as "water". Without them the
-/// surface here read as rolling plaster, and that was the complaint.
-///
-/// So four Gerstner components, spread forty-five degrees either side of the
-/// wind, contribute their **slope** to the normal and nothing to the geometry:
-/// the same knowing dishonesty as the ripples, one scale up, stated the same
-/// way. Gerstner rather than sine because the wind sea's crests are sharp and
-/// its troughs flat, and a trochoid's slope has exactly that asymmetry.
-/// Their steepness `kA` scales with the sea state, and where two components
-/// add they pass the cusping limit — which is where the Jacobian
-/// `J = (1 - sum k Dx² A cos)(1 - sum k Dz² A cos) - (sum k Dx Dz A cos)²`
-/// of the layer's own (virtual) horizontal displacement goes below one,
-/// Tessendorf's criterion for a crest breaking and the gate the whitecaps use.
-///
-/// Four coherent components interfere, and a sea that interferes coherently
-/// over a kilometre is corduroy - the first version was, and a viewer read
-/// it as a pattern rather than as water. A real wind sea is patchy on the
-/// scale of tens of metres: gusts and lulls lay cat's paws on it, and the
-/// wind waves under one gust are not in phase with those under the next. A
-/// slow noise across the plane, drifting downwind, sets each patch's
-/// amplitude, and that is what breaks the bands up.
-///
-/// Each component is filtered by projected footprint, not camera distance.
+// Twelve non-harmonic bands sample the unresolved short-wave spectrum. Each
+// gets a separate finite crest envelope travelling at deep-water group speed.
+// Removed bands become variance before noise/trigonometry, not enlarged noise.
 fn wind_sea(plane: vec2<f32>, time: f32, footprint: f32) -> WindSea {
-    // The wind is where the physical sea's mean heading comes from: the
-    // realisation travels *towards* the boat from the wind's direction, so its
-    // mean wave vector points downwind, and the wind sea runs the same way.
-    // Computed once on the CPU from the realisation and carried in the
-    // uniform; a sum over sixty components per fragment is not a direction.
     let downwind = sea.wind.xy;
     let across = vec2<f32>(-downwind.y, downwind.x);
-
-    // Cat's paws: patches thirty metres or so across, drifting downwind at a
-    // walking pace, between a quarter and full strength.
     let gust_filter = 1.0 - smoothstep(0.15, 0.5, footprint / 32.0);
     let paw = ripple_value((plane - downwind * time * 1.28) / 32.0) * gust_filter;
-    let gust = mix(0.25, 1.0, smoothstep(-0.4, 0.4, paw));
-
-    // Four components between one and three metres, on bearings within
-    // forty-five degrees of the wind: the short end of a fetch-limited spectrum,
-    // below what the realisation carries and above the ripple noise. Their
-    // steepness `ak` is where the layer's whole look lives - at 0.03 they are
-    // barely there, at 0.15 they are near the breaking limit where they add
-    // and the Jacobian caps them; the sea's state sets it in between.
-    var wavelengths = array<f32, 4>(1.3, 1.9, 2.4, 3.1);
-    var bearings = array<f32, 4>(-0.7, 0.3, -0.2, 0.8);
-    var offsets = array<f32, 4>(0.0, 1.9, 4.1, 2.7);
-    let steepness = mix(0.02, 0.09, smoothstep(0.0, 1.5, sea.significant_height)) * gust;
-
-    // Short crests. A component with one phase across the whole plane is a
-    // crest a kilometre long, and four of them interfere into corduroy. A
-    // real wind wave's crest is a wavelength or two long before it hands over
-    // to its neighbour, which is a phase that wanders across the plane. One
-    // slow noise supplies the wandering, and each component reads it with its
-    // own gain so their crests do not wander together.
-    let wander = ripple_value((plane - downwind * time * 0.35) / 7.0 + vec2<f32>(3.1, 1.7)) * 5.0;
-    var gains = array<f32, 4>(1.0, -0.8, 0.6, -1.2);
-
-    var slope = vec2<f32>(0.0, 0.0);
+    let gust = mix(0.35, 1.0, smoothstep(-0.4, 0.4, paw));
+    var wavelengths = array<f32, 12>(
+        0.55, 0.68, 0.84, 1.04, 1.27, 1.51, 1.83, 2.13, 2.47, 2.83, 3.19, 3.47);
+    var directions = array<vec2<f32>, 12>(
+        vec2<f32>(0.613746, -0.789504), vec2<f32>(0.751806, 0.659385),
+        vec2<f32>(0.908966, -0.416871), vec2<f32>(0.581683, 0.813416),
+        vec2<f32>(0.783822, -0.620986), vec2<f32>(0.973666, 0.227978),
+        vec2<f32>(0.882333, 0.470626), vec2<f32>(0.982004, -0.188859),
+        vec2<f32>(0.802096, 0.597195), vec2<f32>(0.935897, -0.352274),
+        vec2<f32>(0.996802, 0.079915), vec2<f32>(0.872745, -0.488177));
+    var weights = array<f32, 12>(0.35, 0.48, 0.64, 0.78, 0.91, 1.0, 0.96, 0.89, 0.76, 0.6, 0.45, 0.28);
+    // sqrt(4 / sum(weights²)) retains the old four-band slope-energy budget.
+    let steepness = mix(0.02, 0.09, smoothstep(0.0, 1.5, sea.significant_height))
+        * gust * 0.807713;
+    var slope = vec2<f32>(0.0);
     var jxx = 1.0;
     var jzz = 1.0;
     var jxz = 0.0;
     var variance = 0.0;
-    for (var index: u32 = 0u; index < 4u; index = index + 1u) {
+    for (var index = 0u; index < 12u; index += 1u) {
         let wavelength = wavelengths[index];
         let k = 2.0 * PI / wavelength;
-        // Deep-water dispersion, the same law the physical sea obeys.
-        let omega = sqrt(9.81 * k);
-        // A packet moves at half the phase speed in deep water. Each component
-        // has its own envelope, so crests grow and subside instead of marching
-        // as four equally strong, endless sine trains.
-        let direction = downwind * cos(bearings[index]) + across * sin(bearings[index]);
-        let group_phase = dot(direction, plane) * k * 0.17 - omega * time * 0.085;
-        let group_filter = 1.0 - smoothstep(0.8, 2.8, k * 0.17 * footprint);
-        let packet = 0.65 + 0.35 * sin(group_phase + offsets[index] * 2.3) * group_filter;
-        let packet_energy = packet * packet + 0.06125 * (1.0 - group_filter * group_filter);
-        let filtered = 1.0 - smoothstep(0.8, 2.8, k * footprint);
-        variance += 0.5 * steepness * steepness * packet_energy * (1.0 - filtered * filtered);
+        let ak = steepness * weights[index];
+        // Specular reflection generates harmonics above the slope frequency.
+        // Fade before a crest becomes a repeating two-pixel serration.
+        let filtered = 1.0 - smoothstep(0.45, 1.75, k * footprint);
+        // Mean squared envelope; no unresolved octave needs its phase sampled.
+        variance += 0.5 * ak * ak * 0.60 * (1.0 - filtered * filtered);
         if (filtered <= 0.0) {
             continue;
         }
-        let amplitude = steepness * packet * filtered / k;
-        let phase = k * dot(direction, plane) - omega * time + offsets[index] + wander * gains[index];
+        let direction = downwind * directions[index].x + across * directions[index].y;
+        let lateral = vec2<f32>(-direction.y, direction.x);
+        let omega = sqrt(9.81 * k);
+        let group_speed = omega / (2.0 * k);
+        let packet_at = vec2<f32>(
+            (dot(direction, plane) - group_speed * time) / (6.0 * wavelength),
+            dot(lateral, plane) / (2.3 * wavelength))
+            + vec2<f32>(f32(index) * 13.71, f32(index) * 7.93);
+        let envelope_noise = ripple_value(packet_at);
+        let packet = 0.5 + 0.5 * smoothstep(-0.35, 0.35, envelope_noise);
+        let phase = k * dot(direction, plane) - omega * time
+            + f32(index) * 2.399963 + envelope_noise * 2.4;
+        let amplitude_slope = ak * packet * filtered;
         let s = sin(phase);
         let c = cos(phase);
-        // Height `A cos(phase)`, the same form as the physical sea so the two
-        // layers move alike; its slope is `-k D A sin(phase)`.
-        slope = slope - direction * k * amplitude * s;
-        // The trochoid's horizontal displacement is `-D A sin(phase)`, so the
-        // Jacobian of the map it would have made, with unit choppiness, has
-        // these derivatives.
-        jxx = jxx - k * direction.x * direction.x * amplitude * c;
-        jzz = jzz - k * direction.y * direction.y * amplitude * c;
-        jxz = jxz - k * direction.x * direction.y * amplitude * c;
+        slope -= direction * amplitude_slope * s;
+        jxx -= direction.x * direction.x * amplitude_slope * c;
+        jzz -= direction.y * direction.y * amplitude_slope * c;
+        jxz -= direction.x * direction.y * amplitude_slope * c;
     }
-    let jacobian = jxx * jzz - jxz * jxz;
-    // Gated where the fold is real rather than where it is merely positive:
-    // caps on the sharpest crests, none on the rest, and the whole thing
-    // scaled with the sea so a calm has none. The gate is lower than the
-    // swell's because these components are the ones that actually break in a
-    // breeze - Beaufort three has scattered caps, and the eye expects them.
-    let fold = smoothstep(0.22, 0.7, 1.0 - jacobian);
-    // Transform the parametric slope through the horizontal deformation.
-    // Without this, the "Gerstner" detail still shades symmetric sine waves.
+    let determinant = jxx * jzz - jxz * jxz;
+    let fold = smoothstep(0.22, 0.7, 1.0 - determinant);
     let choppy_slope = vec2<f32>(
         jzz * slope.x - jxz * slope.y,
-        jxx * slope.y - jxz * slope.x,
-    ) / max(jacobian, 0.4);
+        jxx * slope.y - jxz * slope.x) / max(determinant, 0.4);
     return WindSea(choppy_slope, fold, variance);
 }
 
@@ -464,7 +408,8 @@ fn remembered_foam(parcel: vec2<f32>, fresh: f32) -> f32 {
     let inside = smoothstep(0.0, 0.06, edge);
     let encoded = textureSampleLevel(foam_history, foam_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rg;
     let history = encoded.x + encoded.y / 255.0;
-    return mix(fresh, history, inside);
+    // Only hull-generated foam is bounded state; ambient breaking is global.
+    return max(fresh, history * inside);
 }
 
 /// How much of the sun a facet sees past its neighbours, in `[0, 1]`.
@@ -566,12 +511,29 @@ fn wake(plane: vec2<f32>, footprint: f32) -> vec3<f32> {
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let sun = normalize(sea.sun.xyz);
     let plane = in.world_position.xz;
-    let footprint = max(length(dpdx(in.parcel)), length(dpdy(in.parcel)));
+    // Largest singular value of the pixel-to-parcel Jacobian. Taking only the
+    // longer axis underestimated diagonal footprints and left grazing moire.
+    let parcel_dx = dpdx(in.parcel);
+    let parcel_dy = dpdy(in.parcel);
+    let xx = dot(parcel_dx, parcel_dx);
+    let yy = dot(parcel_dy, parcel_dy);
+    let xy = dot(parcel_dx, parcel_dy);
+    let footprint = sqrt(0.5 * (xx + yy + sqrt((xx - yy) * (xx - yy) + 4.0 * xy * xy)));
     let to_eye = view.world_position - in.world_position;
     let distance = max(length(to_eye), 1e-4);
     let viewer = to_eye / distance;
     let physical = normalize(in.world_normal);
-    let slope = physical.xz / max(physical.y, 0.05);
+    var slope = physical.xz / max(physical.y, 0.05);
+    var swell_variance = in.variance;
+    var swell_foam = in.foam;
+    if (sea.temporal.y > 0.5) {
+        let clip = position_world_to_clip(vec3<f32>(in.parcel.x, 0.0, in.parcel.y));
+        let uv = (clip.xy / max(clip.w, 1e-6) / projection_margin()) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+        let field = textureSampleLevel(optical_field, optical_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+        slope = -field.xy;
+        swell_variance = field.z;
+        swell_foam = field.w;
+    }
     let wind = wind_sea(in.parcel, sea.time, footprint);
     let detail = ripples(in.parcel, sea.time, footprint);
     let turbulent = wake(plane, footprint);
@@ -583,7 +545,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let dx = dpdx(normal);
     let dy = dpdy(normal);
     let pixel_variance = 0.25 * (dot(dx, dx) + dot(dy, dy));
-    let alpha = clamp(sqrt(0.001 + in.variance + detail.z + wind.variance + pixel_variance + turbulent.z * 0.012), 0.035, 0.35);
+    let alpha = clamp(sqrt(0.001 + swell_variance + detail.z + wind.variance + pixel_variance + turbulent.z * 0.012), 0.035, 0.35);
     let roughness = sqrt(alpha);
     let fresnel = fresnel_water(dot(normal, viewer));
     let drift = cloud_offset(sea.time);
@@ -592,13 +554,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let mirror = boat_reflection(in.world_position, reflected_ray, alpha);
     // Correct premultiplied composition: do not multiply the blurred mirror's
     // coverage twice, and do not replace the transmitted light with a sail.
-    let reflected = environment * (1.0 - mirror.a) + mirror.rgb;
+    let scene_exposure = SKY_LUMINANCE * view.exposure;
+    // The planar camera has already exposed its PBR output. Undo that scale
+    // before mixing with scene radiance, then expose the whole ocean once.
+    let reflected = environment * (1.0 - mirror.a) + mirror.rgb / max(scene_exposure, 1e-6);
 
     let view_z = dot(
         vec4<f32>(view.world_from_view[2].xyz, 0.0),
         vec4<f32>(in.world_position, 1.0) - view.world_from_view[3]);
     let lit = fetch_directional_shadow(0u, vec4<f32>(in.world_position, 1.0), normal, view_z, in.clip_position.xy);
-    let seen = sun_visible(sun, in.steepness);
+    let seen = sun_visible(sun, length(slope));
     let sun_up = smoothstep(0.0, 0.08, sun.y);
     let illumination = lit * seen * sun_up;
     let wrapped = pow(clamp(dot(normal, sun) * 0.4 + 0.6, 0.0, 1.0), 6.0);
@@ -611,17 +576,17 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Aerated wake water changes absorption without painting an opaque trail.
     transmitted = mix(max(transmitted, vec3<f32>(0.0)), sea.shallow * 0.35, turbulent.z * 0.12);
     var colour = transmitted * (1.0 - fresnel) + reflected * fresnel;
-    colour += vec3<f32>(4.2, 3.9, 3.5) * sun_specular(normal, sun, viewer, alpha) * illumination;
+    // Low sun through haze: direct irradiance, not an arbitrary white-glint gain.
+    colour += vec3<f32>(1.65, 1.54, 1.35) * sun_specular(normal, sun, viewer, alpha) * illumination;
 
-    let fresh = max(max(in.foam, wind.fold), hull_foam(plane));
+    let fresh = max(max(swell_foam, wind.fold), hull_foam(plane));
     let energy = remembered_foam(in.parcel, fresh);
     let lace = foam(in.parcel, sea.time, energy, footprint);
     if (lace.coverage > 0.0) {
         let bubble_normal = normalize(normal + vec3<f32>(-lace.bumps.x, 0.0, -lace.bumps.y));
-        let ambient = sky_reflection(vec3<f32>(0.0, 1.0, 0.0), sun, drift, 1.0);
-        let horizon_light = sky_reflection(normalize(vec3<f32>(viewer.x, 0.2, viewer.z)), sun, drift, 1.0);
-        let direct = vec3<f32>(1.0, 0.97, 0.9) * max(dot(bubble_normal, sun), 0.0) * 1.8 * sun_up * lit;
-        let foam_colour = vec3<f32>(0.93, 0.95, 0.97) * (mix(ambient, horizon_light, 0.65) + direct);
+        let ambient = sky_irradiance(bubble_normal, sun, drift);
+        let direct = vec3<f32>(1.65, 1.54, 1.35) * max(dot(bubble_normal, sun), 0.0) / PI * sun_up * lit;
+        let foam_colour = vec3<f32>(0.93, 0.95, 0.97) * (ambient + direct);
         colour = mix(colour, foam_colour, lace.coverage);
     }
     let wash = energy * (1.0 - lace.coverage) * 0.12;
@@ -629,5 +594,5 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let horizontal = normalize(vec3<f32>(-viewer.x, 0.001, -viewer.z));
     let haze = 1.0 - exp(-distance / 5500.0);
     colour = mix(colour, sky_reflection(horizontal, sun, drift, 1.0), haze);
-    return vec4<f32>(colour, 1.0);
+    return vec4<f32>(colour * scene_exposure, 1.0);
 }

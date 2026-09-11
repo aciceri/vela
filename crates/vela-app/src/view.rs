@@ -1,33 +1,22 @@
-//! The camera, the light, and the patch of sea that follows the boat.
+//! The camera, lighting and camera-projected sampling of the physical sea.
 //!
-//! # The sea is a moving window, not an ocean
-//!
-//! The surface is a finite disc kept centred on the boat. Because the elevation
-//! is a closed form of *world* position, moving the disc does not move the
-//! water: a wave crest stays where it is while the mesh slides under it. That is
-//! the whole reason the sea is shared as a realisation rather than as a height
-//! field — a height field would have to be rebuilt every time the window moved,
-//! and this does not have to be rebuilt at all.
-//!
-//! What moves with the boat is the *sampling*: the vertices slide through the
-//! wave field, so the polygonal approximation of a crest shifts as the window
-//! goes by. A uniform lattice could have been snapped to its own cell size to
-//! hold the sampling still, and an earlier version was; a graded mesh has no
-//! lattice to snap to. The trade is taken with open eyes — see [`RINGS`] —
-//! because the crawl is a slow low-contrast shimmer in the middle distance,
-//! while the faceting a uniform grid produced near the boat was the first thing
-//! anyone noticed.
+//! The ocean grid covers the visible water, independently of the boat's position.
+//! Zoom changes metres per cell uniformly across the image rather than revealing
+//! a dense disc surrounded by flattened waves. Both colour and motion-vector
+//! passes project the same grid and evaluate the same world-space wave field.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::visibility::RenderLayers;
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::ecs::message::MessageReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::light::{CascadeShadowConfigBuilder, NotShadowCaster, ShadowFilteringMethod};
 use bevy::mesh::Indices;
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
+use bevy::post_process::motion_blur::MotionBlur;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
+use bevy::render::view::{ColorGrading, ColorGradingSection};
 use bevy::ui::IsDefaultUiCamera;
 
 use crate::boat::Boat;
@@ -36,199 +25,66 @@ use crate::ocean::OceanMaterial;
 use crate::reflection;
 use crate::sim::Engine;
 
-/// Radius of the near sea, m.
-///
-/// Six hundred metres of finely drawn water around a twelve metre boat. It
-/// was two hundred, and the edge was the first thing a viewer saw: the
-/// displacement fades to nothing at the rim (see `resolved` in
-/// `shaders/ocean.wgsl`), and a disc of moving crests inside a plane of still
-/// ones reads as a circle drawn on the sea, whatever the shading does. Three
-/// times the radius costs a fifth more rings, because the spacing is
-/// geometric, and pushes the circle to where a half-metre crest is a pixel.
-/// The far ring picks up exactly here.
-const REACH: f32 = 600.0;
+/// Screen-grid divisions, also supplied as shader definitions to both passes.
+/// 31,073 vertices cover visible water at every zoom, rather than concentrating
+/// most of the old polar mesh under the boat.
+pub(crate) const SEA_COLUMNS: u32 = 192;
+pub(crate) const SEA_ROWS: u32 = 160;
 
-/// Angular segments around the near disc and the far ring alike.
-///
-/// One constant for both because the two meshes meet at `REACH`, and they meet
-/// cleanly only if their rims are the same polygon: the disc's outermost row
-/// and the ring's innermost are then the same vertices, computed the same way,
-/// and the seam is watertight without any overlap to fight over depth. A
-/// hundred and sixty is 2.25 degrees a segment, which at the rim is a cell just
-/// under eight metres across and at the horizon a silhouette straight enough
-/// that no facet shows.
-const SEGMENTS: u32 = 160;
-
-/// Rings of vertices across the near disc, from [`CORE`] out to [`REACH`].
-///
-/// Together with [`SEGMENTS`] this is the near sea's vertex budget: two
-/// hundred rings of a hundred and sixty is 32,001 vertices with the centre,
-/// a quarter over the 161-by-161 square grid it replaced for three times the
-/// radius. That budget is measured rather than guessed — every vertex
-/// evaluates the whole sixty-component wave sum, and a 257-square was running
-/// eight million transcendentals a frame for detail in water that is faded flat
-/// anyway.
-///
-/// The spacing is geometric, each ring a fixed ratio further out than the last
-/// — 3.3 per cent here — so a cell grows in proportion to its radius: a metre
-/// across at thirty metres, three and a half at a hundred, twenty at the rim.
-/// That is what keeps a cell roughly constant in *screen* space for a camera
-/// looking down at a plane, and it is why the near water is smooth where a
-/// uniform grid of the same budget was a visible mesh of 2.5 m facets against a
-/// shortest wave of 3.5 m.
-///
-/// A square grid graded the same way was tried first and is worth recording as
-/// the wrong shape: grading separably along each axis produces cells that are
-/// fine in one direction and coarse in the other everywhere except the diagonal,
-/// and along the axes through the boat they degenerate to slivers three
-/// centimetres by five metres. A disc has one radial direction and grades along
-/// it alone.
-const RINGS: u32 = 200;
-
-/// Radius of the innermost ring of the near disc, m.
-///
-/// Inside it is a fan of triangles from a single vertex at the boat's origin.
-/// With the ratio above the first cells out from here are close to square —
-/// 3.4 per cent of the radius one way, 3.9 the other — and a metre puts the
-/// whole fan under the transom.
-const CORE: f32 = 1.0;
-
-/// Outer radius of the far sea, m.
-///
-/// Chosen so the water runs out where the horizon is rather than before it. The
-/// chase camera sits around twenty-five metres above the surface, and a flat
-/// plane cut off at eight kilometres puts its edge 0.18 degrees below the eye's
-/// level; a curved Earth would put the true horizon 0.16 degrees below it. The
-/// seam therefore lands within a fiftieth of a degree — under a pixel at 1080p —
-/// of where a viewer already expects the sea to end. That buys the entire
-/// impression of distance without modelling curvature, which is a very good
-/// trade for one constant.
-const HORIZON: f32 = 8_000.0;
-
-/// Concentric rings across the far sea.
-///
-/// Sixty-four bands over a thirteenfold change in radius, each about four per
-/// cent wider than the one inside it: twenty-five metres at the inner rim,
-/// which is what lets the far ring keep *shading* the swell for a while after
-/// it has stopped displacing it — see `shaded` in `shaders/ocean.wgsl`. The
-/// whole ring is still a third of the near disc's vertices, which is the
-/// point: uniform spacing fine enough for the inner rim would need thousands
-/// of rings, and every band past a kilometre would draw triangles smaller than
-/// a pixel.
-const HORIZON_RINGS: u32 = 64;
-
-/// Far bound of the chase camera's frustum, m.
-///
-/// Worth being precise about what this does, because the name misleads in this
-/// version of Bevy: the matrix `PerspectiveProjection` builds is reverse-Z and
-/// *infinite*, so `far` never clips a fragment and never enters the depth
-/// mapping. It is the far plane of the culling frustum, and a mesh whose
-/// bounding volume falls wholly outside it is dropped entire. Left at the
-/// default kilometre the far sea would not be clipped at the kilometre mark; it
-/// would simply never be drawn.
-///
-/// Twenty kilometres is the eight kilometre ring plus the four hundred metres the
-/// orbit can pull the camera back, and then a wide margin, which costs nothing
-/// precisely because `far` is not in the matrix.
+/// Culling range for the camera, including the projected sea's 8 km horizon.
 const FAR_PLANE: f32 = 20_000.0;
 
-/// Near plane of the chase camera, m.
-///
-/// This is the one that buys depth precision, and it is the reason to state it
-/// rather than take Bevy's 0.1: with an infinite reverse-Z projection the depth
-/// resolution at any distance scales with `near`, so five times the near plane is
-/// five times the resolution eight kilometres out — which is where two
-/// tessellations of the same water have to agree about which is in front.
-///
-/// Half a metre is free here. The orbit will not close inside fifteen metres of
-/// the boat and the camera looks at the boat, so nothing ever comes near enough
-/// for the foreground to notice.
+/// Reverse-Z near plane. The 14 m minimum orbit keeps the boat comfortably clear.
 const NEAR_PLANE: f32 = 0.5;
 
-/// Sky light, a per-view component in this version of Bevy.
-///
-/// Without it the side of a sail facing away from the sun renders black, which
-/// reads as a rendering fault rather than as shade — and it is wrong besides:
-/// sailcloth is thin enough to glow when it is backlit. Not a translucency
-/// model, just enough ambient that a shaded sail looks like cloth.
-///
-/// One constant for the chase camera and for `crate::reflection`'s mirror
-/// camera, so the boat is shaded the same in the water as above it.
+/// Both views use analytic sky lighting in the boat material, not a uniform fill.
 pub const AMBIENT: AmbientLight = AmbientLight {
-    color: Color::srgb(0.72, 0.79, 0.88),
-    brightness: 1_500.0,
+    color: Color::WHITE,
+    brightness: 0.0,
     affects_lightmapped_meshes: true,
 };
 
-/// The sun's illuminance, lux.
-///
-/// Two lights carry it — the shadowed one the chase camera sees and the plain
-/// one the mirror sees, both in `spawn` — and they have to agree, or the boat
-/// would be a different brightness in the water than above it.
-const SUNLIGHT: f32 = 13_000.0;
+/// Shared by direct view and planar reflection; shaders expose radiance once.
+pub const EXPOSURE: bevy::camera::Exposure = bevy::camera::Exposure { ev100: 10.0 };
+
+/// Low, hazy sun; ocean.wgsl uses the same 1650 lux and warm spectral balance.
+const SUNLIGHT: f32 = 1_650.0;
 
 /// Marks the sea surface entity.
 #[derive(Component)]
 pub struct Sea;
 
-/// Marks the camera that follows the boat.
+/// Marks the main camera and holds its presentation-only spring state.
 #[derive(Component)]
-pub struct Chase;
-
-/// Vertices on `rings + 1` concentric rings from `inner` to `outer`, in the render
-/// plane, `segments` around each.
-///
-/// The radial spacing is geometric: each ring sits a fixed ratio further out
-/// than the last, so that `rings` steps of it cover exactly the span asked for.
-/// Radii are computed from the power rather than accumulated, which keeps the
-/// rings where forty-eight roundings would not; and the outermost is set to
-/// `outer` outright rather than computed, because a mesh built to meet another
-/// at that radius has to land on it exactly, not to within a unit of the last
-/// place.
-fn polar_rows(inner: f32, outer: f32, segments: u32, rings: u32) -> Vec<[f32; 3]> {
-    let ratio = (outer / inner).powf(1.0 / rings as f32);
-    let arc = std::f32::consts::TAU / segments as f32;
-    let mut positions = Vec::with_capacity(((rings + 1) * segments) as usize);
-    for ring in 0..=rings {
-        let radius = if ring == rings {
-            outer
-        } else {
-            inner * ratio.powi(ring as i32)
-        };
-        for segment in 0..segments {
-            let angle = segment as f32 * arc;
-            positions.push([radius * angle.cos(), 0.0, radius * angle.sin()]);
-        }
-    }
-    positions
+pub struct Chase {
+    /// Azimuth, elevation and logarithmic distance.
+    orbit: Vec3,
+    orbit_velocity: Vec3,
+    target: Vec3,
+    target_velocity: Vec3,
 }
 
-/// Two triangles per quad between consecutive rings laid out by [`polar_rows`],
-/// whose first vertex is at index `first`.
-fn polar_bands(first: u32, segments: u32, rings: u32, indices: &mut Vec<u32>) {
-    for ring in 0..rings {
-        for segment in 0..segments {
-            // The seam closes by wrapping onto the ring's first column rather
-            // than by duplicating it, so there is no pair of coincident vertices
-            // to keep in step.
-            let beside_segment = (segment + 1) % segments;
-            let here = first + ring * segments + segment;
-            let beside = first + ring * segments + beside_segment;
-            let out = first + (ring + 1) * segments + segment;
-            let out_beside = first + (ring + 1) * segments + beside_segment;
-            // Wound counter-clockwise seen from above, which is what puts the
-            // front face towards a camera looking down at the water.
-            indices.extend_from_slice(&[here, beside, out]);
-            indices.extend_from_slice(&[out, beside, out_beside]);
+/// Static NDC coordinates. The shader projects these onto the mean-water plane
+/// and displaces them; no CPU mesh rebuild or boat-centred transform is needed.
+fn projected_grid(columns: u32, rows: u32) -> Mesh {
+    let mut positions = Vec::with_capacity(((columns + 1) * (rows + 1)) as usize);
+    for row in 0..=rows {
+        for column in 0..=columns {
+            positions.push([
+                2.0 * column as f32 / columns as f32 - 1.0,
+                0.0,
+                2.0 * row as f32 / rows as f32 - 1.0,
+            ]);
         }
     }
-}
-
-/// Positions only, for the ocean shader to displace.
-///
-/// The shader computes the normal from the analytic slope, so an uploaded
-/// normal would be overwritten. No UVs either — nothing samples a texture.
-fn sea_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
+    let mut indices = Vec::with_capacity((columns * rows * 6) as usize);
+    for row in 0..rows {
+        for column in 0..columns {
+            let here = row * (columns + 1) + column;
+            let above = here + columns + 1;
+            indices.extend_from_slice(&[here, here + 1, above, above, here + 1, above + 1]);
+        }
+    }
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD,
@@ -237,57 +93,11 @@ fn sea_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// A flat disc of radius `outer`, for the ocean shader to displace.
-///
-/// A fan from the centre to the ring at `core`, then `rings - 1` geometric bands
-/// out to the rim — the same construction as [`horizon_ring`] from a radius of
-/// zero, which is what a near sea and a far sea being one surface ought to look
-/// like in the code as well. See [`RINGS`] for why the near sea is a disc and
-/// not a square.
-fn near_disc(core: f32, outer: f32, segments: u32, rings: u32) -> Mesh {
-    let mut positions = Vec::with_capacity((1 + rings * segments) as usize);
-    positions.push([0.0, 0.0, 0.0]);
-    positions.extend(polar_rows(core, outer, segments, rings - 1));
-
-    let mut indices = Vec::with_capacity(((2 * rings - 1) * segments * 3) as usize);
-    for segment in 0..segments {
-        let beside = (segment + 1) % segments;
-        // Same orientation as the bands: centre, then the far corner, then the
-        // near one, so the fan's front face is the bands' front face.
-        indices.extend_from_slice(&[0, 1 + beside, 1 + segment]);
-    }
-    polar_bands(1, segments, rings - 1, &mut indices);
-
-    sea_mesh(positions, indices)
-}
-
-/// A flat annulus from `inner` to `outer`, for the ocean shader to displace.
-///
-/// The near disc stops at six hundred metres, and beyond it there was
-/// background: an edge that reads as a wall rather than as distance. This is the
-/// water that carries the eye from there to the horizon, and it can afford to be
-/// very coarse, because everything it draws is at least six hundred metres away
-/// and the short waves it fails to resolve are waves nobody at that range can
-/// see.
-///
-/// The radial spacing is geometric rather than uniform — each ring's radius a
-/// fixed ratio times the one inside it, the ratio derived from the two radii and
-/// the ring count rather than tuned — which keeps every band subtending roughly
-/// the same angle at the camera. That is the property worth having: it spends
-/// vertices in proportion to how much of the screen they cover, whereas uniform
-/// spacing is simultaneously too coarse at the inner rim and absurdly fine out
-/// near the horizon.
-fn horizon_ring(inner: f32, outer: f32, segments: u32, rings: u32) -> Mesh {
-    let positions = polar_rows(inner, outer, segments, rings);
-    let mut indices = Vec::with_capacity((rings * segments * 6) as usize);
-    polar_bands(0, segments, rings, &mut indices);
-    sea_mesh(positions, indices)
-}
-
 /// Spawns the sea, the camera and the light.
 pub fn spawn(
     mut commands: Commands,
     engine: Res<Engine>,
+    orbit: Res<Orbit>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut oceans: ResMut<Assets<OceanMaterial>>,
 ) {
@@ -296,60 +106,32 @@ pub fn spawn(
         // shade, so the water is spawned whatever the boat was released in;
         // `advance_sea` re-realises it when the sea changes.
         //
-        // One material, two meshes. They differ only in how finely they sample
-        // the same closed form, so sharing the handle is not an optimisation but
-        // a statement that it is one sea — and it means the per-frame time push
-        // in `advance_sea` cannot leave the two halves on different clocks.
+        // One projected surface reaches the horizon without a near/far seam.
         let ocean = oceans.add(OceanMaterial::realising(
             engine.sea.as_ref(),
             engine.sim.time(),
         ));
 
         commands.spawn((
-            Mesh3d(meshes.add(near_disc(CORE, REACH, SEGMENTS, RINGS))),
-            MeshMaterial3d(ocean.clone()),
-            Transform::default(),
-            Sea,
-            // The sea casts no shadow. Nothing in this scene is under it, and
-            // leaving it a caster put both tessellations -- sixty-six thousand
-            // triangles -- through the shadow pass once per cascade for an effect
-            // that cannot exist. Measured: it was most of the frame.
-            NotShadowCaster,
-        ));
-
-        // Inner radius `REACH` and the disc's `SEGMENTS`, so that the ring's
-        // innermost row is vertex for vertex the disc's rim: the same radius,
-        // the same angles, the same arithmetic. The seam is then closed by
-        // construction, with no gap for the sky to show through and no overlap
-        // for two tessellations to fight over depth in. The square grid this
-        // replaced overlapped the ring in four corner wedges and needed to be
-        // held a hand's breadth above it to settle the flicker; there is nothing
-        // left to settle, and the two sit at the same height.
-        //
-        // Same `Sea` marker, so `follow_sea` carries this with the disc, and the
-        // ring's sampling of the wave field moves with the boat as the disc's
-        // does. Waves too short for these wider triangles are filtered before
-        // sampling; their unresolved slope energy still broadens reflections.
-        commands.spawn((
-            Mesh3d(meshes.add(horizon_ring(REACH, HORIZON, SEGMENTS, HORIZON_RINGS))),
+            Mesh3d(meshes.add(projected_grid(SEA_COLUMNS, SEA_ROWS))),
             MeshMaterial3d(ocean),
             Transform::default(),
             Sea,
-            // The sea casts no shadow. Nothing in this scene is under it, and
-            // leaving it a caster put both tessellations -- sixty-six thousand
-            // triangles -- through the shadow pass once per cascade for an effect
-            // that cannot exist. Measured: it was most of the frame.
+            // The NDC bounding box is not its world-space shader projection.
+            NoFrustumCulling,
+            // Only the boat casts shadows; water still receives them.
             NotShadowCaster,
         ));
     }
 
+    let chase = Chase::new(&orbit, frame::to_render(engine.sim.state().position));
+    let camera_pose = chase.pose();
     commands.spawn((
         Camera3d::default(),
-        // No multisampling. The sea is one full-screen fragment shader and the
-        // only edges in the scene are the boat's; on an integrated GPU four
-        // samples of an HDR target is bandwidth spent on edges that bloom and
-        // tonemapping soften anyway. Measured in the main pass's GPU counter.
+        // Thin rigging needs edge antialiasing. FXAA runs after tonemapping
+        // rather than multiplying the full-screen ocean's HDR sample count.
         Msaa::Off,
+        bevy::anti_alias::fxaa::Fxaa::default(),
         // Overrides the projection `Camera3d` requires into place. See
         // `FAR_PLANE`, which is what gets the far sea drawn at all, and
         // `NEAR_PLANE`, which is what gets it drawn without depth fighting.
@@ -358,8 +140,9 @@ pub fn spawn(
             far: FAR_PLANE,
             ..default()
         }),
-        Transform::from_xyz(-28.0, 12.0, 22.0).looking_at(Vec3::new(0.0, 3.0, 0.0), Vec3::Y),
+        camera_pose,
         AMBIENT,
+        EXPOSURE,
         // The Castaño filter: nine taps read as a 5×5 Gaussian, which is the
         // filter that turns a shadow map's stair-steps into an edge. Stated
         // rather than inherited, because the water is the one receiver in the
@@ -380,26 +163,35 @@ pub fn spawn(
         // also desaturates brights across the spectrum, which is what keeps a
         // glint coloured instead of white.
         Tonemapping::AcesFitted,
+        // Neutral white balance and untouched highlights preserve the sail's
+        // whites; a small saturation reduction quiets shadows and midtones.
+        ColorGrading {
+            shadows: ColorGradingSection {
+                saturation: 0.94,
+                ..default()
+            },
+            midtones: ColorGradingSection {
+                saturation: 0.97,
+                ..default()
+            },
+            ..default()
+        },
+        MotionBlur {
+            shutter_angle: 0.18,
+            samples: 3,
+        },
         // Bloom brings `Hdr` with it as a required component, and that is the
         // half that matters: it gives the camera a float render target, so a
         // glint can be brighter than white before the transform above pulls it
         // back.
         //
-        // Thresholded, which is the whole difference between glitter and haze.
-        // Energy-conserving bloom with no prefilter scatters every pixel in
-        // proportion to its brightness, and a sunlit sea is uniformly bright, so
-        // it would fog the entire surface. Cutting in above 0.7 leaves the water
-        // alone and blooms only what the sun is actually mirroring. Bevy couples
-        // the two settings and says so: a prefilter this aggressive is not
-        // energy-conserving, so the composite has to be additive to match.
-        //
-        // Intensity well under the 0.15 default. This is a simulator, and the
-        // effect is here to make a highlight read, not to glow.
+        // Only the bright cores of highlights bloom. Broad low-threshold bloom
+        // used to erase wave detail around the sun's already bright reflection.
         Bloom {
-            intensity: 0.06,
+            intensity: 0.025,
             prefilter: BloomPrefilter {
-                threshold: 0.7,
-                threshold_softness: 0.3,
+                threshold: 2.0,
+                threshold_softness: 0.5,
             },
             composite_mode: BloomCompositeMode::Additive,
             ..Bloom::NATURAL
@@ -407,9 +199,10 @@ pub fn spawn(
         // Where the HUD goes. Without the marker Bevy picks the highest-order
         // camera drawing to the primary window, which is this one today; the
         // marker says so, and keeps the readout out of `crate::reflection`'s
-        // mirror image whatever cameras are added later.
+        // mirror image whatever cameras are added later. Standard scene
+        // postprocessing finishes before UI, keeping the HUD sharp and ungraded.
         IsDefaultUiCamera,
-        Chase,
+        chase,
     ));
 
     // The sun, and the only shadow caster. Its direction is `sky::SUN` rather
@@ -422,11 +215,10 @@ pub fn spawn(
     // true of a *flat* one — but the surface is displaced, and the ocean's
     // fragment stage looks the shadow map up at the *displaced* world position
     // (`fetch_directional_shadow` in `shaders/ocean.wgsl`), so the shadow lands
-    // on the water that is actually drawn. The sea itself is in no depth or
-    // shadow pass: the map is the boat's alone. What it buys is the sails
-    // darkening the hull and the rig laying a shadow across the water, which is
-    // most of what tells a viewer the boat is in the scene rather than pasted
-    // onto it.
+    // on the water that is actually drawn. Water participates in the velocity
+    // prepass, not the shadow map: only the boat casts a shadow.
+    // The hull and rig shade one another and the water, anchoring the boat
+    // in the scene rather than leaving it looking pasted onto the surface.
     //
     // The biases are Bevy's defaults, and that is a decision rather than an
     // omission: acne is a surface comparing against its own depth in the map,
@@ -439,6 +231,7 @@ pub fn spawn(
     commands.spawn((
         DirectionalLight {
             illuminance: SUNLIGHT,
+            color: Color::linear_rgb(1.0, 1.54 / 1.65, 1.35 / 1.65),
             shadow_maps_enabled: true,
             ..default()
         },
@@ -485,6 +278,7 @@ pub fn spawn(
     commands.spawn((
         DirectionalLight {
             illuminance: SUNLIGHT,
+            color: Color::linear_rgb(1.0, 1.54 / 1.65, 1.35 / 1.65),
             ..default()
         },
         towards_sun,
@@ -516,11 +310,22 @@ pub fn advance_sea(
     let bow_body = nalgebra::Vector3::new(engine.hull_length(), 0.0, 0.0);
     let bow_world = state.position + state.to_world(bow_body);
     let bow_velocity = state.to_world(state.point_velocity(bow_body));
-    let surface_rate = engine
+    // Encounter derivative, including horizontal travel across a sloping wave.
+    // The z-down bow velocity adds to the positive-up surface rate.
+    let (immersion, plunge) = engine
         .sea
         .as_ref()
-        .map_or(0.0, |sea| sea.vertical_rate(bow_world.x, bow_world.y, time));
-    let plunge = (bow_velocity.z + surface_rate) as f32;
+        .map_or((bow_world.z, bow_velocity.z), |sea| {
+            let before = bow_world - bow_velocity * 0.01;
+            let after = bow_world + bow_velocity * 0.01;
+            let rate = (sea.elevation(after.x, after.y, time + 0.01)
+                - sea.elevation(before.x, before.y, time - 0.01))
+                / 0.02;
+            (
+                bow_world.z + sea.elevation(bow_world.x, bow_world.y, time),
+                bow_velocity.z + rate,
+            )
+        });
     let hull = Vec2::new(engine.hull_length() as f32, engine.hull_half_beam() as f32);
     // A change of weather: the water is re-realised from the engine's new
     // sea, keeping its clock and the wake's track. Judged by the preset the
@@ -534,41 +339,18 @@ pub fn advance_sea(
         }
         material.set_time(time);
         material.record(stern, velocity, time);
-        material.set_heading(heading, plunge, hull);
+        material.set_heading(heading, plunge as f32, hull);
+        material.sea.sun.w = immersion as f32;
     }
 }
 
-/// Keeps the sea centred on the boat.
+/// Requested orbit around the boat; [`Chase`] smooths it without changing physics.
 ///
-/// Continuously, not snapped, and the change of mind is worth recording. A
-/// uniform grid could be snapped to its own cell size, which kept every vertex
-/// on a fixed world lattice so the sampling stayed still while the window slid
-/// — the right argument for a uniform grid, and the module documentation says
-/// what it cost. A geometrically spaced disc has no lattice to snap to, so
-/// snapping would only quantise the window's position into jumps while the
-/// sampling moved anyway: all of the lurch and none of the benefit. Following
-/// the boat exactly is both simpler and smoother.
-pub fn follow_sea(engine: Res<Engine>, mut seas: Query<&mut Transform, With<Sea>>) {
-    let centre = frame::to_render(engine.sim.state().position);
-    for mut transform in &mut seas {
-        // Horizontal only: the mean level is world `y = 0` and the boat's heave
-        // is the boat's. The two tessellations share that height, and their
-        // shared rim relies on it.
-        transform.translation.x = centre.x;
-        transform.translation.z = centre.z;
-    }
-}
-
-/// Where the chase camera sits, in the boat's neighbourhood.
-///
-/// Spherical rather than a fixed offset, because the first thing anyone wants
-/// from a simulator is to look at the thing from somewhere else — and because a
-/// fixed viewpoint makes some questions unanswerable. "Is the sail there?" and
-/// "is the boat floating at the right depth?" are both trivial from abeam and
-/// both guesswork from astern.
+/// Input changes these targets immediately. The camera's separate spring state
+/// keeps keyboard, mouse and wheel equally responsive without input-rate filters.
 #[derive(Resource)]
 pub struct Orbit {
-    /// Bearing of the camera from the boat, radians, 0 dead astern.
+    /// World-space bearing, radians; zero is astern of a north-facing boat.
     pub azimuth: f32,
     /// Elevation above the horizontal, radians.
     pub elevation: f32,
@@ -609,7 +391,7 @@ pub fn orbit(keys: Res<ButtonInput<KeyCode>>, time: Res<Time>, mut orbit: ResMut
     let azimuth = 1.2 * dt * (held(KeyCode::KeyJ) - held(KeyCode::KeyL));
     let elevation = 0.8 * dt * (held(KeyCode::KeyI) - held(KeyCode::KeyK));
     orbit.turn(azimuth, elevation);
-    orbit.pull(1.0 + 0.9 * dt * (held(KeyCode::KeyO) - held(KeyCode::KeyU)));
+    orbit.pull((0.9 * dt * (held(KeyCode::KeyO) - held(KeyCode::KeyU))).exp());
 }
 
 impl Orbit {
@@ -629,7 +411,7 @@ impl Orbit {
 
     /// Applies a change in bearing and elevation, keeping both in range.
     fn turn(&mut self, azimuth: f32, elevation: f32) {
-        self.azimuth += azimuth;
+        self.azimuth = wrap_angle(self.azimuth + azimuth);
         self.elevation = (self.elevation + elevation).clamp(Self::LOWEST, Self::HIGHEST);
     }
 
@@ -640,6 +422,14 @@ impl Orbit {
     /// jumps through the boat when you are close.
     fn pull(&mut self, factor: f32) {
         self.distance = (self.distance * factor).clamp(Self::NEAREST, Self::FURTHEST);
+    }
+
+    fn coordinates(&self) -> Vec3 {
+        Vec3::new(
+            wrap_angle(self.azimuth),
+            self.elevation.clamp(Self::LOWEST, Self::HIGHEST),
+            self.distance.clamp(Self::NEAREST, Self::FURTHEST).ln(),
+        )
     }
 }
 
@@ -692,76 +482,87 @@ pub fn orbit_with_mouse(
     }
 }
 
-/// Holds the camera on its orbit around the boat, looking at it.
+/// Holds a level horizon while smoothing framing and the boat's translation.
 ///
-/// The orbit is in *world* axes rather than the boat's, so the view does not
-/// heel and roll with the hull. A camera rigidly attached to a boat in a seaway
-/// is unwatchable, and worse, it hides the motion the simulation exists to show
-/// by making the boat the one still thing on screen.
+/// Runs after boat presentation and both input systems; the reflection follows
+/// this result. Neither hull attitude nor simulated time enters the camera rig.
 pub fn chase(
     orbit: Res<Orbit>,
+    time: Res<Time>,
     boats: Query<&Transform, (With<Boat>, Without<Chase>)>,
-    mut cameras: Query<&mut Transform, With<Chase>>,
+    mut cameras: Query<(&mut Transform, &mut Chase)>,
 ) {
     let Ok(boat) = boats.single() else {
         return;
     };
-    let (sin_azimuth, cos_azimuth) = orbit.azimuth.sin_cos();
-    let (sin_elevation, cos_elevation) = orbit.elevation.sin_cos();
-    // Azimuth zero is dead astern: render `x` is north, which is the bow.
-    let offset = orbit.distance
-        * Vec3::new(
-            -cos_azimuth * cos_elevation,
-            sin_elevation,
-            sin_azimuth * cos_elevation,
-        );
+    let dt = time.delta_secs();
+    let requested = orbit.coordinates();
     let target = boat.translation + Vec3::Y * orbit.focus;
-    for mut camera in &mut cameras {
-        camera.translation = target + offset;
-        camera.look_at(target, Vec3::Y);
+    for (mut camera, mut chase) in &mut cameras {
+        // Unwrap around the current pose, not zero: crossing ±π takes the short
+        // route. Rewrap after integration to preserve precision over many turns.
+        let desired = Vec3::new(
+            chase.orbit.x + wrap_angle(requested.x - chase.orbit.x),
+            requested.y,
+            requested.z,
+        );
+        chase.orbit = damp(chase.orbit, &mut chase.orbit_velocity, desired, 24.0, dt);
+        chase.orbit.x = wrap_angle(chase.orbit.x);
+        chase.target = damp(chase.target, &mut chase.target_velocity, target, 10.0, dt);
+        *camera = chase.pose();
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl Chase {
+    fn new(orbit: &Orbit, boat: Vec3) -> Self {
+        Self {
+            orbit: orbit.coordinates(),
+            orbit_velocity: Vec3::ZERO,
+            target: boat + Vec3::Y * orbit.focus,
+            target_velocity: Vec3::ZERO,
+        }
+    }
 
-    /// The disc must be a closed fan and lattice of quads with the vertex and
-    /// index counts that follow from its ring and segment counts.
-    ///
-    /// Cheap, and it catches the off-by-one where the bands are counted from the
-    /// centre rather than from the first ring — which either leaves a crack
-    /// around the rim or indexes past the last vertex.
-    #[test]
-    fn the_disc_closes() {
-        let mesh = near_disc(1.0, 10.0, 8, 4);
-        assert_eq!(mesh.count_vertices(), 1 + 4 * 8);
-        assert_eq!(
-            mesh.indices().map(bevy::mesh::Indices::len),
-            Some(8 * 3 + 3 * 8 * 6)
+    fn pose(&self) -> Transform {
+        let (sin_azimuth, cos_azimuth) = self.orbit.x.sin_cos();
+        let (sin_elevation, cos_elevation) = self.orbit.y.sin_cos();
+        // Render x is north. Zoom stays multiplicative during smoothing too.
+        let distance = self.orbit.z.exp().clamp(Orbit::NEAREST, Orbit::FURTHEST);
+        let offset = distance
+            * Vec3::new(
+                -cos_azimuth * cos_elevation,
+                sin_elevation,
+                sin_azimuth * cos_elevation,
+            );
+        Transform::from_translation(self.target + offset).looking_at(self.target, Vec3::Y)
+    }
+}
+
+fn wrap_angle(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Exact critically damped step for a held target, stable even across long frames.
+/// Stop residual momentum at a target or reversal: never overshoot a bound or
+/// keep moving away from the requested pose. There is no accumulated prediction.
+fn damp(current: Vec3, velocity: &mut Vec3, target: Vec3, rate: f32, dt: f32) -> Vec3 {
+    if dt <= 0.0 {
+        return current;
+    }
+    let decay = (-rate * dt).exp();
+    let error = current - target;
+    let tangent = *velocity + rate * error;
+    let mut next = target + (error + tangent * dt) * decay;
+    *velocity = (*velocity - rate * tangent * dt) * decay;
+    for axis in 0..3 {
+        let bounded = next[axis].clamp(
+            current[axis].min(target[axis]),
+            current[axis].max(target[axis]),
         );
+        if bounded != next[axis] || bounded == target[axis] {
+            velocity[axis] = 0.0;
+        }
+        next[axis] = bounded;
     }
-
-    /// The far ring's innermost row must be the near disc's rim, exactly.
-    ///
-    /// Bitwise, not approximately: the two meshes sit at the same height with no
-    /// offset to hide behind, so a rim vertex a unit in the last place off the
-    /// ring's would open a hairline gap the sky shows through. Computing the rim
-    /// radius by repeated power instead of setting it is the plausible mistake,
-    /// and it fails this.
-    #[test]
-    fn the_seam_is_shared_vertex_for_vertex() {
-        let disc = near_disc(CORE, REACH, SEGMENTS, RINGS);
-        let ring = horizon_ring(REACH, HORIZON, SEGMENTS, HORIZON_RINGS);
-        let positions = |mesh: &Mesh| {
-            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
-                .and_then(bevy::mesh::VertexAttributeValues::as_float3)
-                .expect("positions")
-                .to_vec()
-        };
-        let rim = &positions(&disc)[(1 + (RINGS - 1) * SEGMENTS) as usize..];
-        let inner = &positions(&ring)[..SEGMENTS as usize];
-        assert_eq!(rim.len(), SEGMENTS as usize);
-        assert_eq!(rim, inner);
-    }
+    next
 }

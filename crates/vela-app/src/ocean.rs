@@ -10,11 +10,11 @@
 //! ```
 //!
 //! The physics evaluates that on the CPU wherever a hull triangle happens to be.
-//! This module evaluates the *same sum* in a vertex shader, on whatever grid the
-//! renderer likes. Nothing is transferred per frame and no height field is
-//! shared — the two sides agree because they compute the same function from the
-//! same numbers, and `vela_core`'s `the_synthesis_convention_is_pinned` is what
-//! keeps them from drifting apart.
+//! This module evaluates the *same sum* in GPU geometry and optical passes.
+//! They share wave parameters and the engine clock with physics, not a height
+//! field. The two sides agree because they compute the same function from the
+//! same numbers; `vela_core`'s `the_synthesis_convention_is_pinned` keeps them
+//! from drifting apart.
 //!
 //! Getting this wrong has a very specific and very silly failure mode: a boat
 //! floating on water nobody can see, sinking into crests that are not where they
@@ -22,20 +22,20 @@
 //!
 //! # What is physical and what is cosmetic
 //!
-//! Near the hull, geometry is the exact physical realisation. Farther out,
-//! wavelengths smaller than the polar mesh can resolve are filtered before
-//! sampling; their slope variance survives as optical roughness. The renderer
-//! never feeds this level of detail back into the physics. Detail below the
-//! realisation's shortest wave is added only as slope, foam and light:
+//! The projected grid filters wavelengths its world-space cells cannot resolve.
+//! A screen-resolved optical field retains shorter visible slopes; unresolved
+//! slope variance survives as roughness. Neither level of detail feeds back
+//! into the physics. Detail below the realisation's shortest wave is added
+//! only as slope, foam and light:
 //!
-//! - a wind sea of four Gerstner components between one and three metres,
+//! - twelve non-harmonic short-wave bands between half a metre and 3.5 metres,
 //!   running downwind in independently modulated wave packets, contributing slope
 //!   and the whitecaps its own Jacobian says it would have broken;
 //! - GGX sunlight with dielectric Fresnel and unresolved slope variance, rather
 //!   than an artificially capped reflection or magnified distant noise;
-//! - persistent whitecaps injected by swell compression and the bow/stern into
-//!   a scrolling parcel-space history texture; transport and decay follow the
-//!   engine clock, while cellular pores stretch with the physical wave orbit;
+//! - global whitecaps reconstructed from recent swell compression, independent
+//!   of the boat-local history that transports and decays its wake foam;
+//!   cellular pores stretch with the physical wave orbit;
 //! - fixed-scale ripple bands and foam detail filtered by pixel footprint,
 //!   rather than rescaling their coordinates as the camera moves;
 //! - the statistical self-shadowing of a rough surface for a low sun;
@@ -98,14 +98,11 @@ pub const MAX_WAVES: usize = 64;
 /// One linear wave, in the layout WGSL wants.
 ///
 /// `vela_core::seaway::Wave` carries the same five numbers in `f64` with the
-/// direction as a tuple. This is that, narrowed to `f32` and padded out to 32
-/// bytes: a uniform array's stride must be a multiple of 16, and the five
-/// payload floats plus the two-float alignment of the vector come to 24. Three
-/// scalar pads rather than a `Vec3`, which was what this had first — a `vec3` is
-/// 16-aligned in WGSL and `encase` follows suit, so that "padding" started at
-/// offset 32 and made the element 48 bytes, while the shader read it at 32. The
-/// picture was still a sea, and not the one the boat was floating on, which is
-/// the failure `the_wave_layout_matches_the_shader_stride` now pins.
+/// direction as a tuple. The shader narrows them to `f32` and adds two
+/// precomputed phase-rotation coefficients for reconstructing recent breaking.
+/// One scalar pad completes the uniform array's 32-byte stride. A `Vec3` pad
+/// would be 16-aligned and inflate the element to 48 bytes; the shader layout
+/// contract is pinned by `the_wave_layout_matches_the_shader_stride`.
 #[derive(ShaderType, Clone, Copy, Default, Debug)]
 pub struct ShaderWave {
     /// Wave vector `k d`, rad/m, in the render plane as `(north, east)`.
@@ -116,9 +113,10 @@ pub struct ShaderWave {
     pub phase: f32,
     /// Amplitude, m.
     pub amplitude: f32,
-    /// Scalar padding preserves the 32-byte uniform-array stride.
-    pub pad0: f32,
-    pub pad1: f32,
+    /// Fixed 0.3 s phase rotation for analytic whitecap age integration.
+    pub age_rotation_cos: f32,
+    pub age_rotation_sin: f32,
+    /// Remaining scalar padding preserves the 32-byte uniform-array stride.
     pub pad2: f32,
 }
 
@@ -146,7 +144,7 @@ pub struct SeaUniform {
     /// Colour of light scattered *through* a thin crest lit from behind,
     /// linear RGB.
     pub scatter: Vec3,
-    /// Direction towards the sun, `.w` unused.
+    /// Direction towards the sun; `.w` is bow immersion in metres (positive wet).
     ///
     /// Taken from [`crate::sky::SUN`] rather than chosen here: the same constant
     /// orients the `DirectionalLight`, and a highlight that did not line up with
@@ -162,8 +160,8 @@ pub struct SeaUniform {
     pub motion: Vec4,
     /// The boat's heading and the bow's motion, for the bow wave: `(x, z)` of
     /// the unit heading in the render plane — the hull's axis, which is not
-    /// the track over the ground because of leeway — the bow's vertical
-    /// velocity in m/s, positive downward into the water, and in `.w` whether
+    /// the track over the ground because of leeway — the bow's signed entry
+    /// velocity relative to the encountered moving surface in m/s, and in `.w` whether
     /// the reflection texture is live (1) or the material has none yet (0).
     pub heading: Vec4,
     /// Downwind `(x, z)` in the render plane, unit: the realisation's mean
@@ -184,6 +182,9 @@ pub struct SeaUniform {
     /// Parcel-space history bounds: `(origin.x, origin.z, span, enabled)`.
     /// The origin follows the boat on a downwind-advected texel lattice.
     pub foam_region: Vec4,
+    /// Previous rendered simulation time; remaining lanes are reserved.
+    /// Only the wave clock resets: the camera's previous view stays valid.
+    pub temporal: Vec4,
 }
 
 /// Samples of the stern's track the shader can carry.
@@ -224,8 +225,14 @@ pub struct OceanMaterial {
     #[texture(5)]
     #[sampler(6)]
     pub foam_history: Option<Handle<Image>>,
+    /// Screen-resolved optical slopes, unresolved variance and ambient foam.
+    /// A neutral image is bound until the optical pass acknowledges its target.
+    #[texture(7)]
+    #[sampler(8)]
+    pub optical_field: Option<Handle<Image>>,
     /// A new physical realisation invalidates accumulated foam, even at rest.
     pub(crate) foam_epoch: u64,
+    motion_history_valid: bool,
 }
 
 impl OceanMaterial {
@@ -264,12 +271,15 @@ impl OceanMaterial {
                 choppiness: 0.0,
                 trail_bounds: Vec4::ZERO,
                 foam_region: Vec4::ZERO,
+                temporal: Vec4::new(time as f32, 0.0, 0.0, 0.0),
             },
             waves: [ShaderWave::default(); MAX_WAVES],
             trail: [TrailPoint::default(); MAX_TRAIL],
             reflection: None,
             foam_history: None,
+            optical_field: None,
             foam_epoch: 0,
+            motion_history_valid: false,
         };
         material.realise(sea);
         material
@@ -294,6 +304,7 @@ impl OceanMaterial {
 
         self.waves = [ShaderWave::default(); MAX_WAVES];
         for (slot, wave) in self.waves.iter_mut().zip(source) {
+            let (age_rotation_sin, age_rotation_cos) = (wave.frequency as f32 * 0.3).sin_cos();
             *slot = ShaderWave {
                 wave_vector: Vec2::new(
                     (wave.wavenumber * wave.direction.0) as f32,
@@ -302,8 +313,8 @@ impl OceanMaterial {
                 frequency: wave.frequency as f32,
                 phase: wave.phase as f32,
                 amplitude: wave.amplitude as f32,
-                pad0: 0.0,
-                pad1: 0.0,
+                age_rotation_cos,
+                age_rotation_sin,
                 pad2: 0.0,
             };
         }
@@ -326,15 +337,17 @@ impl OceanMaterial {
         self.sea.choppiness = sea.map_or(0.0, |sea| sea.state().choppiness as f32);
         self.foam_epoch = self.foam_epoch.wrapping_add(1);
         self.sea.foam_region = Vec4::ZERO;
+        self.motion_history_valid = false;
+        self.sea.temporal.x = self.sea.time;
     }
 
     /// Tells the water which way the hull points and how the bow is moving
     /// through the surface, for the bow wave.
     ///
     /// `heading` is the unit hull axis in the render plane and `bow_plunge`
-    /// the bow's vertical velocity relative to the surface, m/s, positive
-    /// downward — a bow driving into a wave throws spray, one lifting out of it
-    /// does not. `hull` is the hull's length and greatest half-breadth, m:
+    /// the bow's signed encounter velocity relative to the moving surface,
+    /// including horizontal travel across wave slopes, m/s: positive entering,
+    /// negative emerging. `hull` is the hull's length and greatest half-breadth, m:
     /// where the bow is along that axis, and how far outboard the bow wave
     /// clears the hull.
     pub fn set_heading(&mut self, heading: Vec2, bow_plunge: f32, hull: Vec2) {
@@ -362,7 +375,15 @@ impl OceanMaterial {
     /// the statement that the realisation is fixed, which is the contract the
     /// physics and the picture agree by.
     pub fn set_time(&mut self, time: f64) {
-        self.sea.time = time as f32;
+        let time = time as f32;
+        let elapsed = time - self.sea.time;
+        self.sea.temporal.x = if self.motion_history_valid && (0.0..=0.25).contains(&elapsed) {
+            self.sea.time
+        } else {
+            time
+        };
+        self.sea.time = time;
+        self.motion_history_valid = true;
     }
 
     /// Tells the water where the stern is now, how fast it is going over the
@@ -456,6 +477,14 @@ impl Material for OceanMaterial {
         embedded_shader!("shaders/ocean.wgsl")
     }
 
+    fn prepass_vertex_shader() -> ShaderRef {
+        embedded_shader!("shaders/ocean_prepass.wgsl")
+    }
+
+    fn prepass_fragment_shader() -> ShaderRef {
+        embedded_shader!("shaders/ocean_prepass.wgsl")
+    }
+
     /// Sizes the shader's wave and trail arrays from [`MAX_WAVES`] and
     /// [`MAX_TRAIL`].
     ///
@@ -466,13 +495,9 @@ impl Material for OceanMaterial {
     /// Bevy uses for `MATERIAL_BIND_GROUP`, and both stages get them because
     /// both declare the bindings.
     ///
-    /// No prepass override, on purpose. The prepass and shadow passes would need
-    /// the same displacement as the visible pass, but neither runs for this
-    /// material: the camera carries no `DepthPrepass`, and both sea meshes are
-    /// `NotShadowCaster`. The boat's shadow still lands on the displaced water,
-    /// because the shadow map is the boat's own and the fragment stage samples it
-    /// at the displaced position — see `fetch_directional_shadow` in
-    /// `ocean.wgsl`. Nothing about the sea has to be rasterised for that.
+    /// The motion prepass shares the projected grid's displaced geometry.
+    /// The sea remains `NotShadowCaster`; boat shadows are sampled in the
+    /// visible shader at the displaced world position.
     fn specialize(
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
@@ -481,11 +506,17 @@ impl Material for OceanMaterial {
     ) -> Result<(), SpecializedMeshPipelineError> {
         let waves = ShaderDefVal::UInt("MAX_WAVES".into(), MAX_WAVES as u32);
         let trail = ShaderDefVal::UInt("MAX_TRAIL".into(), MAX_TRAIL as u32);
+        let columns = ShaderDefVal::UInt("OCEAN_COLUMNS".into(), crate::view::SEA_COLUMNS as u32);
+        let rows = ShaderDefVal::UInt("OCEAN_ROWS".into(), crate::view::SEA_ROWS as u32);
         descriptor.vertex.shader_defs.push(waves.clone());
         descriptor.vertex.shader_defs.push(trail.clone());
+        descriptor.vertex.shader_defs.push(columns.clone());
+        descriptor.vertex.shader_defs.push(rows.clone());
         if let Some(fragment) = &mut descriptor.fragment {
             fragment.shader_defs.push(waves);
             fragment.shader_defs.push(trail);
+            fragment.shader_defs.push(columns);
+            fragment.shader_defs.push(rows);
         }
         Ok(())
     }
@@ -511,6 +542,21 @@ pub struct OceanPlugin;
 impl Plugin for OceanPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/ocean.wgsl");
+        bevy::shader::load_shader_library!(app, "shaders/ocean_geometry.wgsl");
+        embedded_asset!(app, "shaders/ocean_prepass.wgsl");
+        // Keep Bevy 0.19's MotionBlur pipeline, depth binding and pre-bloom
+        // schedule. Replace only its shader with an ABI-compatible bounded
+        // reconstruction; register before RenderStartup loads that asset.
+        app.world()
+            .resource::<bevy::asset::io::embedded::EmbeddedAssetRegistry>()
+            .insert_asset(
+                std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/shaders/motion_blur.wgsl"
+                )),
+                std::path::Path::new("bevy_post_process/motion_blur/motion_blur.wgsl"),
+                include_bytes!("shaders/motion_blur.wgsl").as_slice(),
+            );
         app.add_plugins((
             MaterialPlugin::<OceanMaterial>::default(),
             crate::foam::FoamPlugin,

@@ -35,6 +35,7 @@ mod frame;
 mod helm;
 mod hud;
 mod ocean;
+mod optical;
 mod reflection;
 mod sim;
 mod sky;
@@ -97,6 +98,7 @@ fn main() {
         // directory to ship. See `ocean`. The boat's model is embedded the same
         // way, by `boat::BoatPlugin`.
         .add_plugins(ocean::OceanPlugin)
+        .add_plugins(optical::OpticalPlugin)
         // The sky owns the sun, and registers the atmosphere library that it and
         // the ocean both import. Before the ocean would work too; after it is
         // where a reader looks for "what is the water reflecting".
@@ -139,7 +141,6 @@ fn main() {
                 boat::follow,
                 boat::trim,
                 view::advance_sea,
-                view::follow_sea,
                 hud::update,
                 hud::sea_button,
                 reflection::resize,
@@ -153,7 +154,10 @@ fn main() {
             (
                 view::orbit,
                 view::orbit_with_mouse,
-                view::chase.after(boat::follow),
+                view::chase
+                    .after(boat::follow)
+                    .after(view::orbit)
+                    .after(view::orbit_with_mouse),
                 reflection::follow.after(view::chase),
             ),
         )

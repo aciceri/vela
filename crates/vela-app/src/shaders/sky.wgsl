@@ -4,7 +4,7 @@
 // nothing but where it sits in the depth buffer, which is why `sky.rs` is free to
 // pick it to clear the sea rather than to model a distance.
 
-#import vela::atmosphere::sky_colour
+#import vela::atmosphere::{sky_colour, SKY_LUMINANCE}
 #import bevy_pbr::forward_io::VertexOutput
 #import bevy_pbr::mesh_view_bindings::view
 
@@ -19,5 +19,5 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let direction = normalize(in.world_position.xyz - view.world_position);
     // The zero-roughness atmosphere used by water, with only the solar disc
     // added. `drift.xy` is sky::cloud_drift at the ocean's engine time.
-    return vec4<f32>(sky_colour(direction, sun.xyz, drift.xy), 1.0);
+    return vec4<f32>(sky_colour(direction, sun.xyz, drift.xy) * (SKY_LUMINANCE * view.exposure), 1.0);
 }

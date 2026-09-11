@@ -2,14 +2,15 @@
 
 // The same Lagrangian wave sum as vela_core::seaway::Seaway. The plane is
 // (north, east), mapped to render (x, z), and height is positive upward.
-// Scalar padding, not vec3, preserves the Rust uniform array's 32-byte stride.
+// Scalar rotation/padding fields preserve the Rust array's 32-byte stride.
 struct ShaderWave {
     wave_vector: vec2<f32>,
     frequency: f32,
     phase: f32,
     amplitude: f32,
-    padding_x: f32,
-    padding_y: f32,
+    // Phase rotation to sample the same parcel 0.3 engine seconds earlier.
+    age_rotation_cos: f32,
+    age_rotation_sin: f32,
     padding_z: f32,
 };
 
@@ -29,6 +30,8 @@ struct SeaUniform {
     trail_bounds: vec4<f32>,
     // Rest-plane origin, square span in metres, and whether history is live.
     foam_region: vec4<f32>,
+    // Previous rendered simulation time, reset on a new realisation/rewind.
+    temporal: vec4<f32>,
 };
 
 struct TrailPoint {
@@ -90,6 +93,26 @@ fn folding(strain: vec3<f32>) -> f32 {
     return smoothstep(0.06, 0.32, 1.0 - jacobian(strain));
 }
 
+// Smooth world-space value noise: fixed cells, no per-frame random phases.
+// Contact crosses the same eddies continuously; asymmetric cells keep port
+// and starboard from becoming two identical painted lines.
+fn contact_hash(cell: vec2<f32>) -> f32 {
+    var p = fract(vec3<f32>(cell.x, cell.y, cell.x) * 0.1031);
+    p = p + dot(p, p.yzx + vec3<f32>(33.33));
+    return fract((p.x + p.y) * p.z);
+}
+
+fn contact_noise(point: vec2<f32>) -> f32 {
+    let cell = floor(point);
+    let f = fract(point);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(contact_hash(cell), contact_hash(cell + vec2<f32>(1.0, 0.0)), u.x),
+        mix(contact_hash(cell + vec2<f32>(0.0, 1.0)), contact_hash(cell + vec2<f32>(1.0)), u.x),
+        u.y
+    );
+}
+
 // Current bow/stern aeration only. The history pass stores what is left after
 // the hull moves on; the old track is not traversed for every history texel.
 // Input is displaced world position, so injection lands next to the hull,
@@ -97,7 +120,12 @@ fn folding(strain: vec3<f32>) -> f32 {
 fn hull_foam(world_plane: vec2<f32>) -> f32 {
     let speed = length(sea.motion.zw);
     let hull = sea.wind.zw;
-    if (speed < 0.5 || hull.x <= 0.0) {
+    let entry = clamp(sea.heading.z - 0.12, 0.0, 3.0);
+    // sun.w is the physical bow-waterline immersion; heading.w remains the
+    // reflection-valid flag. A dry, rising or deeply buried stem cannot
+    // continuously aerate a sheet on the free surface.
+    let wet = step(0.0, sea.sun.w) * (1.0 - smoothstep(0.0, 0.55, sea.sun.w));
+    if (hull.x <= 0.0 || (speed < 0.5 && entry * wet <= 0.0)) {
         return 0.0;
     }
     let heading = sea.heading.xy;
@@ -106,13 +134,28 @@ fn hull_foam(world_plane: vec2<f32>) -> f32 {
     let across = abs(offset.x * heading.y - offset.y * heading.x);
     let speed_gate = smoothstep(0.5, 2.5, speed);
     let aft = (hull.x - along) / (0.5 * hull.x);
-    let run = smoothstep(-0.12, 0.08, aft) * (1.0 - smoothstep(0.55, 1.15, aft));
-    let plunge = clamp(sea.heading.z, 0.0, 3.0);
-    let crest_at = hull.y * sqrt(max(aft, 0.0)) + 0.6 + 0.6 * plunge;
-    let lobe = 1.0 - smoothstep(0.0, 1.0 + 0.5 * plunge, abs(across - crest_at));
-    let bow = lobe * run * (0.7 + 0.3 * plunge);
+    let run = smoothstep(-0.04, 0.08, aft) * (1.0 - smoothstep(0.35, 0.85, aft));
+    let crest_at = hull.y * sqrt(max(aft, 0.0)) + 0.18 + 0.22 * entry;
+    let lobe = 1.0 - smoothstep(0.0, 0.45 + 0.22 * entry, abs(across - crest_at));
+    let bow = lobe * run * wet * smoothstep(0.0, 1.0, entry);
     let stern_run = smoothstep(-3.2, -1.5, along) * (1.0 - smoothstep(0.0, 0.8, along));
     let stern_width = max(0.75, hull.y * 0.65);
     let stern = stern_run * (1.0 - smoothstep(0.3 * stern_width, stern_width, across));
-    return clamp(speed_gate * max(bow, stern), 0.0, 1.0);
+    let envelope = max(bow, speed_gate * stern);
+    if (envelope <= 0.0) {
+        return 0.0;
+    }
+
+    // Metre-scale rafts with smaller holes, resolvable by the 0.625m history
+    // texels rather than aliased subpixel noise. The physical clock evolves
+    // the source; history carries the separated parcels away after contact.
+    let eddy = world_plane - sea.wind.xy * (sea.time * 0.12);
+    let warp = vec2<f32>(
+        contact_noise(eddy * 0.28),
+        contact_noise(eddy * 0.28 + vec2<f32>(17.0, 5.0))
+    ) - vec2<f32>(0.5);
+    let patches = contact_noise(eddy * 0.85 + warp * 1.5);
+    let bubbles = contact_noise(eddy * 1.4 - warp);
+    let broken = smoothstep(0.32, 0.66, patches * 0.72 + bubbles * 0.28);
+    return clamp(envelope * broken, 0.0, 1.0);
 }

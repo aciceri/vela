@@ -53,7 +53,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, T
 use bevy::window::{PrimaryWindow, WindowResized};
 
 use crate::ocean::OceanMaterial;
-use crate::view::{Chase, AMBIENT};
+use crate::view::{Chase, AMBIENT, EXPOSURE};
 
 /// The render layer the mirror camera sees.
 ///
@@ -166,6 +166,7 @@ pub fn spawn(
         // The same sky light as the chase camera, or the boat would be shaded
         // differently in the water than above it.
         AMBIENT,
+        EXPOSURE,
         RenderLayers::layer(LAYER),
         Mirror,
     ));

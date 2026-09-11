@@ -41,10 +41,15 @@
 
 use bevy::asset::{embedded_asset, RenderAssetUsages};
 use bevy::light::TransmittedShadowReceiver;
-use bevy::mesh::Indices;
-use bevy::pbr::{ExtendedMaterial, MaterialExtension};
+use bevy::mesh::{Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef, VertexAttributeValues};
+use bevy::pbr::{
+    ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, Face, PrimitiveTopology};
+use bevy::render::render_resource::{
+    AsBindGroup, Face, PrimitiveTopology, RenderPipelineDescriptor, ShaderType,
+    SpecializedMeshPipelineError, VertexFormat,
+};
 use bevy::shader::ShaderRef;
 use nalgebra::Vector3;
 use vela_core::aero::Sail;
@@ -95,8 +100,34 @@ impl Plugin for BoatPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "models/sailboat.glb");
         embedded_asset!(app, "shaders/boat.wgsl");
-        app.add_plugins(MaterialPlugin::<BoatMaterial>::default())
-            .add_systems(Update, finish_materials);
+        embedded_asset!(app, "shaders/boat_prepass.wgsl");
+        app.init_resource::<HullContact>()
+            .add_plugins(MaterialPlugin::<BoatMaterial>::default())
+            .add_systems(Update, (finish_materials, update_surface).chain())
+            .add_systems(
+                PostUpdate,
+                reset_rigid_motion.after(bevy::transform::TransformSystems::Propagate),
+            );
+    }
+}
+
+/// A reset changes the simulation, not the camera. Retain camera velocity while
+/// removing the artificial hull/boom travel from the old simulation state.
+fn reset_rigid_motion(
+    engine: Res<Engine>,
+    mut previous_time: Local<Option<f64>>,
+    mut meshes: Query<
+        (&GlobalTransform, &mut bevy::pbr::PreviousGlobalTransform),
+        With<MeshMaterial3d<BoatMaterial>>,
+    >,
+) {
+    let time = engine.sim.time();
+    let reset = previous_time.is_none_or(|previous| time < previous || time - previous > 0.25);
+    *previous_time = Some(time);
+    if reset {
+        for (current, mut previous) in &mut meshes {
+            previous.0 = current.affine();
+        }
     }
 }
 
@@ -106,10 +137,12 @@ type BoatMaterial = ExtendedMaterial<StandardMaterial, BoatSurface>;
 /// preserves that classification, all texture handles and the baked normals.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 struct BoatSurface {
-    /// x: 0 for the model's atlas, 1 for metric-UV sailcloth. A vec4 keeps the
-    /// uniform layout valid on WebGL2 without target-dependent padding.
+    /// x: atlas / cloth / hardware; zw: the sail's unrolled foot and luff, m.
+    /// Vec4 fields and arrays keep the uniform layout valid on WebGL2.
     #[uniform(100)]
     finish: Vec4,
+    #[uniform(101)]
+    environment: BoatEnvironment,
 }
 
 impl MaterialExtension for BoatSurface {
@@ -120,6 +153,142 @@ impl MaterialExtension for BoatSurface {
     fn deferred_fragment_shader() -> ShaderRef {
         embedded_shader!("shaders/boat.wgsl")
     }
+
+    fn prepass_vertex_shader() -> ShaderRef {
+        embedded_shader!("shaders/boat_prepass.wgsl")
+    }
+
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Preserve every StandardMaterial prepass binding and attribute. Only
+        // deforming sails carry the extra previous-local-position stream.
+        let prepass = descriptor
+            .vertex
+            .shader_defs
+            .iter()
+            .any(|def| *def == "PREPASS_PIPELINE".into());
+        if prepass && layout.0.contains(PREVIOUS_POSITION) {
+            let previous = layout
+                .0
+                .get_layout(&[PREVIOUS_POSITION.at_shader_location(8)])?;
+            descriptor.vertex.buffers[0]
+                .attributes
+                .extend(previous.attributes);
+            descriptor
+                .vertex
+                .shader_defs
+                .push("SAIL_PREVIOUS_POSITION".into());
+        }
+        Ok(())
+    }
+}
+
+const CONTACT_COLUMNS: usize = 17;
+const CONTACT_ROWS: usize = 5;
+const CONTACT_SAMPLES: usize = CONTACT_COLUMNS * CONTACT_ROWS;
+
+/// Contact is sampled in boat-local metres, so its drying history stays on the
+/// same hull parcel through translation, yaw and heel. No fragment wave sums.
+#[derive(Clone, Copy, Debug, Reflect, ShaderType)]
+struct BoatEnvironment {
+    boat_from_world: Mat4,
+    grid: Vec4,
+    sun_time: Vec4,
+    /// xy: current sea intersection and draining wet-film height, in local y.
+    contact: [Vec4; CONTACT_SAMPLES],
+}
+
+impl Default for BoatEnvironment {
+    fn default() -> Self {
+        Self {
+            boat_from_world: Mat4::IDENTITY,
+            grid: Vec4::new(0.0, -2.0, 0.75, 1.0),
+            sun_time: crate::sky::SUN.normalize().extend(0.0),
+            contact: [Vec4::ZERO; CONTACT_SAMPLES],
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct HullContact {
+    environment: BoatEnvironment,
+    time: Option<f64>,
+}
+
+fn update_surface(
+    engine: Res<Engine>,
+    mut history: ResMut<HullContact>,
+    mut materials: ResMut<Assets<BoatMaterial>>,
+) {
+    let time = engine.sim.time();
+    if history.time == Some(time) {
+        return;
+    }
+    let reset = history.time.is_none_or(|previous| time < previous);
+    let dt = history
+        .time
+        .map_or(0.0, |previous| (time - previous).max(0.0)) as f32;
+    history.time = Some(time);
+    let state = engine.sim.state();
+    let rotation = frame::rotation(&state.attitude);
+    let position = frame::to_render(state.position);
+    let world_from_boat = Mat4::from_rotation_translation(rotation, position);
+    let environment = &mut history.environment;
+    environment.boat_from_world = world_from_boat.inverse();
+    environment.sun_time = crate::sky::SUN.normalize().extend(time as f32);
+    if let Some((min, max)) = engine.hull.bounds() {
+        environment.grid = Vec4::new(
+            frame::metres(min.x) - 0.15,
+            frame::metres(min.y) - 0.25,
+            frame::metres(max.x - min.x + 0.30) / (CONTACT_COLUMNS - 1) as f32,
+            frame::metres(max.y - min.y + 0.50) / (CONTACT_ROWS - 1) as f32,
+        );
+    }
+    let grid = environment.grid;
+    let up = rotation * Vec3::Y;
+    // A height field in the boat frame is well-conditioned throughout sailing
+    // heel angles. Near a knockdown retain the last finite contact, rather than
+    // dividing by a horizontal body-up axis.
+    if up.y > 0.15 {
+        for row in 0..CONTACT_ROWS {
+            for column in 0..CONTACT_COLUMNS {
+                let index = row * CONTACT_COLUMNS + column;
+                let origin = world_from_boat.transform_point3(Vec3::new(
+                    grid.x + column as f32 * grid.z,
+                    0.0,
+                    grid.y + row as f32 * grid.w,
+                ));
+                let previous = environment.contact[index];
+                let mut height = if reset { -origin.y / up.y } else { previous.x };
+                // Fixed-point intersection: heel moves xz as local height
+                // changes. Three CPU samples include that displacement rather
+                // than sampling the unheeled baseline or a fixed body height.
+                for _ in 0..3 {
+                    let world = origin + up * height;
+                    let sea = engine.sea.as_ref().map_or(0.0, |sea| {
+                        frame::metres(sea.elevation(f64::from(world.x), f64::from(world.z), time))
+                    });
+                    height = ((sea - origin.y) / up.y).clamp(-6.0, 6.0);
+                }
+                // A draining film recedes at 2.5 cm/s in body coordinates.
+                // Its finite 18 cm feather also fades parcels above contact;
+                // raising the sea immediately re-wets them.
+                let film = if reset {
+                    height
+                } else {
+                    height.max(previous.y - dt * 0.025)
+                };
+                environment.contact[index] = Vec4::new(height, film, 0.0, 0.0);
+            }
+        }
+    }
+    for (_, material) in materials.iter_mut() {
+        material.extension.environment = *environment;
+    }
 }
 
 /// Removed after the loaded material has been upgraded; nothing is cloned or
@@ -127,7 +296,8 @@ impl MaterialExtension for BoatSurface {
 #[derive(Component, Clone, Copy)]
 enum BoatFinish {
     Atlas,
-    Cloth,
+    Cloth(Sail),
+    Hardware,
 }
 
 fn finish_materials(
@@ -135,13 +305,20 @@ fn finish_materials(
     assets: Res<AssetServer>,
     standard: Res<Assets<StandardMaterial>>,
     mut extended: ResMut<Assets<BoatMaterial>>,
-    pending: Query<(Entity, &MeshMaterial3d<StandardMaterial>, &BoatFinish)>,
-    mut finished: Local<[Option<Handle<BoatMaterial>>; 2]>,
+    history: Res<HullContact>,
+    pending: Query<(
+        Entity,
+        &MeshMaterial3d<StandardMaterial>,
+        &BoatFinish,
+        Option<&DrawnSail>,
+    )>,
+    mut finished: Local<[Option<Handle<BoatMaterial>>; 5]>,
 ) {
-    for (entity, original, finish) in &pending {
+    for (entity, original, finish, sail) in &pending {
         let index = match finish {
             BoatFinish::Atlas => 0,
-            BoatFinish::Cloth => 1,
+            BoatFinish::Cloth(sail) => *sail as usize + 1,
+            BoatFinish::Hardware => 4,
         };
         if finished[index].is_none() {
             // The model is asynchronous, including its JPEG dependencies.
@@ -158,10 +335,21 @@ fn finish_materials(
                 // masked to gelcoat/varnish, never to metal, by the extension.
                 base.clearcoat = 1.0;
             }
+            let finish = if let Some(sail) = sail {
+                Vec4::new(
+                    1.0,
+                    0.0,
+                    sail.shape.planform().chord(0.0) as f32,
+                    sail.shape.planform().luff() as f32,
+                )
+            } else {
+                Vec4::new(if index == 0 { 0.0 } else { 2.0 }, 0.0, 0.0, 0.0)
+            };
             finished[index] = Some(extended.add(BoatMaterial {
                 base,
                 extension: BoatSurface {
-                    finish: Vec4::new(index as f32, 0.0, 0.0, 0.0),
+                    finish,
+                    environment: history.environment,
                 },
             }));
         }
@@ -174,17 +362,17 @@ fn finish_materials(
     }
 }
 
-/// Panels across a sail's chord.
-///
-/// Coarse, because the chordwise mean line is a smooth arc that eight panels
-/// already round off.
-const CHORDS: usize = 8;
+/// Visual tessellation resolves centimetre-amplitude tension folds without
+/// changing the engine's flying shape or the hull used for pressure integration.
+const CHORDS: usize = 24;
 
-/// Panels up a sail's luff.
-///
-/// Finer than the chord: twist varies continuously with height and is the
-/// direction the eye reads.
-const PANELS: usize = 14;
+/// Finer spanwise sampling rounds the cloth and resolves the corner fans.
+const PANELS: usize = 48;
+
+/// CPU cloth deformation is not a rigid transform or a GPU morph target.
+/// An extra vertex attribute works on WebGL2 without storage buffers.
+const PREVIOUS_POSITION: MeshVertexAttribute =
+    MeshVertexAttribute::new("PreviousSailPosition", 0x5645_4c41, VertexFormat::Float32x3);
 
 /// A sail as a cambered surface, in the render frame.
 ///
@@ -240,10 +428,39 @@ const PANELS: usize = 14;
 ///
 /// Two-sided, because a sail seen from the leeward side would otherwise vanish.
 /// The two windings get opposed normals, so each face is lit as the surface it is.
-fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
+fn sail_mesh(
+    shape: &Shape,
+    tack: Point,
+    mirror: f64,
+    cut: Cut,
+    previous: Option<VertexAttributeValues>,
+) -> Mesh {
     let tack = file_to_body(tack);
     let station = |along: f64, up: f64| {
+        let cloth = Vec2::new(
+            (along * shape.planform().chord(up)) as f32,
+            (up * shape.planform().luff()) as f32,
+        );
+        let foot = shape.planform().chord(0.0) as f32;
+        let luff = shape.planform().luff() as f32;
+        // Radial folds run along corner load paths. More draft and twist mean
+        // more slack; flattening/tightening the flying shape reduces them.
+        // This is a bounded visual cloth relief, not a new force model.
+        let slack = (shape.profile(up).camber() as f32 * 4.0
+            + (shape.chord_angle(1.0) - shape.chord_angle(0.0)).abs() as f32 * 0.5)
+            .clamp(0.05, 1.0);
+        let mut fold = 0.0;
+        for corner in [Vec2::ZERO, Vec2::new(foot, 0.0), Vec2::new(0.0, luff)] {
+            let delta = cloth - corner;
+            let radius = delta.length();
+            let angle = delta.y.atan2(delta.x);
+            fold += (angle * 8.0).sin() * (-radius / 1.4).exp() * (radius / 0.16).min(1.0);
+        }
+        // Keep the attachment points and all three cut edges on the engine's
+        // surface. The relief mirrors with the cloth, before frame conversion.
+        let pinned = ((along * (1.0 - along) * up * (1.0 - up) * 140.0) as f32).clamp(0.0, 1.0);
         let mut file = shape.point(along, up);
+        file += shape.camber_direction(up) * f64::from(0.012 * slack * fold * pinned);
         // Aft by the rake, and up by the foot's rise: `along` runs from the
         // luff to the leech, `file.z` from the tack to the head.
         file.x -= cut.rake * file.z;
@@ -257,6 +474,7 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(vertices);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(vertices);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(vertices);
+    let mut cut_uvs: Vec<[f32; 2]> = Vec::with_capacity(vertices);
     let cloth_coordinate = |along: f64, up: f64| {
         [
             (along * shape.planform().chord(up)) as f32,
@@ -288,6 +506,12 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
                 cloth_coordinate(forward, high),
                 cloth_coordinate(aft, high),
             ];
+            let cut_corners = [
+                [aft as f32, low as f32],
+                [forward as f32, low as f32],
+                [forward as f32, high as f32],
+                [aft as f32, high as f32],
+            ];
             // Two triangles a quad, then the same two reversed. The normal comes
             // from the quad's own diagonals rather than from a triangle, so both
             // halves of a panel are lit alike and the surface reads as cloth
@@ -300,6 +524,7 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
                     positions.push(corners[index].to_array());
                     normals.push(normal.to_array());
                     uvs.push(cloth_corners[index]);
+                    cut_uvs.push(cut_corners[index]);
                 }
             }
             for winding in [[0, 2, 1], [0, 3, 2]] {
@@ -307,6 +532,7 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
                     positions.push(corners[index].to_array());
                     normals.push((-normal).to_array());
                     uvs.push(cloth_corners[index]);
+                    cut_uvs.push(cut_corners[index]);
                 }
             }
         }
@@ -315,12 +541,162 @@ fn sail_mesh(shape: &Shape, tack: Point, mirror: f64, cut: Cut) -> Mesh {
     let count = positions.len() as u32;
     Mesh::new(
         PrimitiveTopology::TriangleList,
-        RenderAssetUsages::RENDER_WORLD,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(
+        PREVIOUS_POSITION,
+        previous.unwrap_or_else(|| VertexAttributeValues::Float32x3(positions.clone())),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, cut_uvs)
     .with_inserted_indices(Indices::U32((0..count).collect()))
+}
+
+/// The inspected GLB already contains rails, pulpits, six winches, coachroof
+/// handrails and mast spreaders (2,340 hull triangles). Its preparation removed
+/// standing rigging. Add that missing load path and its joints, not a second
+/// set of deck fittings. All dimensions below are actual metres.
+fn standing_rigging(rig: &Rig, engine: &Engine) -> Mesh {
+    let mut hardware = HardwareMesh::default();
+    let head = Vec3::new(rig.mast_at, rig.masthead - 0.06, 0.0);
+    let beam = engine
+        .hull
+        .bounds()
+        .map_or(1.65, |(min, max)| frame::metres(max.y - min.y) * 0.44);
+    let bow = Vec3::new(rig.mast_at + rig.foretriangle_base, rig.sheer + 0.06, 0.0);
+    let stern = Vec3::new(0.80, rig.sheer + 0.02, 0.0);
+    hardware.stay(bow, head);
+    // Split backstay clears the cockpit; both lower legs end at real deck
+    // height rather than crossing the wheel already modelled in the atlas.
+    let split = Vec3::new(1.0, rig.sheer + 2.25, 0.0);
+    hardware.tube(split, head, 0.0045, 10);
+    for side in [-1.0, 1.0] {
+        hardware.stay(stern + Vec3::Z * side * beam * 0.63, split);
+        let chainplate = Vec3::new(rig.mast_at + 0.16, rig.sheer, side * beam);
+        // Actual GLB spreader-tip bounds: x=-0.16, z=±1.035 and
+        // normalized mast y=0.547. Route the cap shroud over that hardware.
+        let spreader = Vec3::new(
+            rig.mast_at - 0.16,
+            rig.sheer + (rig.masthead - rig.sheer) * 0.547,
+            side * 1.035,
+        );
+        hardware.stay(chainplate, spreader);
+        hardware.tube(spreader, head, 0.0045, 10);
+        hardware.tube(
+            spreader - Vec3::Y * 0.027,
+            spreader + Vec3::Y * 0.027,
+            0.014,
+            12,
+        );
+        hardware.stay(
+            chainplate - Vec3::X * 0.65,
+            Vec3::new(rig.mast_at, spreader.y, side * 0.10),
+        );
+    }
+    // The gooseneck is a 28 mm pivot with two cheeks and end washers, not a
+    // floating boom end. Fixed to the mast; the existing Boom rotates around it.
+    let pivot = Vec3::new(rig.mast_at - 0.10, rig.boom, 0.0);
+    hardware.tube(pivot - Vec3::Y * 0.22, pivot + Vec3::Y * 0.22, 0.014, 16);
+    for end in [-1.0, 1.0] {
+        let center = pivot + Vec3::Y * end * 0.20;
+        hardware.tube(
+            center - Vec3::Y * 0.008,
+            center + Vec3::Y * 0.008,
+            0.037,
+            16,
+        );
+        hardware.tube(center, center + Vec3::X * 0.22, 0.022, 12);
+    }
+    hardware.mesh()
+}
+
+#[derive(Default)]
+struct HardwareMesh {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+}
+
+impl HardwareMesh {
+    fn triangle(&mut self, points: [Vec3; 3], normals: [Vec3; 3], uvs: [[f32; 2]; 3]) {
+        self.positions.extend(points.map(|point| point.to_array()));
+        self.normals.extend(normals.map(|normal| normal.to_array()));
+        self.uvs.extend(uvs);
+    }
+
+    /// Closed cylinder with explicit cap normals and a round silhouette.
+    fn tube(&mut self, start: Vec3, end: Vec3, radius: f32, sides: usize) {
+        let axis = (end - start).normalize_or_zero();
+        if axis == Vec3::ZERO {
+            return;
+        }
+        let u = axis.any_orthonormal_vector();
+        let v = axis.cross(u);
+        let length = start.distance(end);
+        for side in 0..sides {
+            let a = side as f32 * std::f32::consts::TAU / sides as f32;
+            let b = (side + 1) as f32 * std::f32::consts::TAU / sides as f32;
+            let n0 = u * a.cos() + v * a.sin();
+            let n1 = u * b.cos() + v * b.sin();
+            let p = [
+                start + radius * n0,
+                start + radius * n1,
+                end + radius * n1,
+                end + radius * n0,
+            ];
+            let uv = [
+                [radius * a, 0.0],
+                [radius * b, 0.0],
+                [radius * b, length],
+                [radius * a, length],
+            ];
+            self.triangle([p[0], p[1], p[2]], [n0, n1, n1], [uv[0], uv[1], uv[2]]);
+            self.triangle([p[0], p[2], p[3]], [n0, n1, n0], [uv[0], uv[2], uv[3]]);
+            self.triangle([start, p[1], p[0]], [-axis; 3], [[0.0; 2]; 3]);
+            self.triangle([end, p[3], p[2]], [axis; 3], [[0.0; 2]; 3]);
+        }
+    }
+
+    fn stay(&mut self, anchor: Vec3, end: Vec3) {
+        let axis = (end - anchor).normalize_or_zero();
+        let cross_pin = axis.any_orthonormal_vector() * 0.032;
+        // Swaged wire, threaded stud, open turnbuckle cage, clevis and pin.
+        self.tube(anchor + axis * 0.37, end, 0.0045, 10);
+        self.tube(anchor + axis * 0.28, anchor + axis * 0.43, 0.008, 12);
+        for side in [-1.0, 1.0] {
+            let offset = cross_pin * side * 0.38;
+            self.tube(
+                anchor + axis * 0.09 + offset,
+                anchor + axis * 0.29 + offset,
+                0.0055,
+                10,
+            );
+            self.tube(anchor + offset, anchor + axis * 0.09 + offset, 0.008, 10);
+        }
+        for distance in [0.09, 0.29] {
+            self.tube(
+                anchor + axis * (distance - 0.013),
+                anchor + axis * (distance + 0.013),
+                0.020,
+                12,
+            );
+        }
+        self.tube(anchor - cross_pin, anchor + cross_pin, 0.008, 12);
+        // Exposed chainplate strap carries the terminal into the deck edge.
+        self.tube(anchor - Vec3::Y * 0.18, anchor, 0.016, 8);
+    }
+
+    fn mesh(self) -> Mesh {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
+    }
 }
 
 /// Spawns the model's hull, its mast and boom placed by the rig, and two sails
@@ -346,6 +722,13 @@ pub fn spawn(
     });
 
     let rig = Rig::from(&*engine);
+    let rigging_mesh = meshes.add(standing_rigging(&rig, &engine));
+    let steel = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.63, 0.66, 0.69),
+        metallic: 0.95,
+        perceptual_roughness: 0.27,
+        ..default()
+    });
     // One line at startup naming the geometry actually built. A frontend whose
     // spars are in the wrong place looks like a rendering bug and is almost
     // always a units or datum mistake, and this is what tells the two apart.
@@ -376,6 +759,12 @@ pub fn spawn(
                 Mesh3d(assets.load(model_mesh(MODEL_HULL))),
                 MeshMaterial3d(skin.clone()),
                 BoatFinish::Atlas,
+                layers.clone(),
+            ));
+            boat.spawn((
+                Mesh3d(rigging_mesh),
+                MeshMaterial3d(steel),
+                BoatFinish::Hardware,
                 layers.clone(),
             ));
 
@@ -428,15 +817,17 @@ pub fn spawn(
             {
                 let cut = Cut::of(sail, &rig);
                 boat.spawn((
-                    Mesh3d(meshes.add(sail_mesh(&shape, tack, mirror, cut))),
+                    Mesh3d(meshes.add(sail_mesh(&shape, tack, mirror, cut, None))),
                     MeshMaterial3d(cloth.clone()),
-                    BoatFinish::Cloth,
+                    BoatFinish::Cloth(sail),
                     TransmittedShadowReceiver,
                     DrawnSail {
                         sail,
                         shape,
                         mirror,
                         cut,
+                        motion_pending: false,
+                        time: engine.sim.time(),
                     },
                     layers.clone(),
                 ));
@@ -456,6 +847,9 @@ pub struct DrawnSail {
     /// The body-`y` mirror the mesh was built with — see [`sail_mesh`].
     mirror: f64,
     cut: Cut,
+    /// Settle the previous attribute once after a changed shape, not every frame.
+    motion_pending: bool,
+    time: f64,
 }
 
 /// How a sail is cut onto its rig; see [`sail_mesh`].
@@ -595,13 +989,35 @@ pub fn trim(
 
     for (sail, tack, shape) in &shapes {
         for (mut drawn, mesh) in &mut sails {
-            if drawn.sail != *sail || (drawn.shape == *shape && drawn.mirror == mirror) {
+            if drawn.sail != *sail {
+                continue;
+            }
+            let time = engine.sim.time();
+            let reset = time < drawn.time || time - drawn.time > 0.25;
+            drawn.time = time;
+            if drawn.shape == *shape && drawn.mirror == mirror {
+                if drawn.motion_pending {
+                    if let Some(mut existing) = meshes.get_mut(mesh) {
+                        let current = existing
+                            .attribute(Mesh::ATTRIBUTE_POSITION)
+                            .unwrap()
+                            .clone();
+                        existing.insert_attribute(PREVIOUS_POSITION, current);
+                        drawn.motion_pending = false;
+                    }
+                }
                 continue;
             }
             if let Some(mut existing) = meshes.get_mut(mesh) {
-                *existing = sail_mesh(shape, *tack, mirror, drawn.cut);
+                let previous = if reset {
+                    None
+                } else {
+                    existing.remove_attribute(Mesh::ATTRIBUTE_POSITION)
+                };
+                *existing = sail_mesh(shape, *tack, mirror, drawn.cut, previous);
                 drawn.shape = *shape;
                 drawn.mirror = mirror;
+                drawn.motion_pending = !reset;
             }
         }
     }
