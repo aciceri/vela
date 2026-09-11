@@ -24,8 +24,6 @@
 // A real sky model would be a Hosek-Wilkie fit or a Bruneton precompute, both of
 // which are larger than everything else in this frontend put together.
 
-const PI: f32 = 3.141592653589793;
-
 /// Zenith colour of the clear sky.
 const ZENITH: vec3<f32> = vec3<f32>(0.10, 0.26, 0.56);
 
@@ -59,129 +57,133 @@ fn hash(cell: vec2<f32>) -> f32 {
     return fract((scattered.x + scattered.y) * scattered.z);
 }
 
-/// Value noise with a smooth interpolant, in `[0, 1]`.
-fn value_noise(at: vec2<f32>) -> f32 {
+/// Value and analytic gradient of a smooth lattice, using the same four hashes.
+/// Quintic interpolation keeps the cloud-lighting normal smooth at cell edges.
+fn value_noise(at: vec2<f32>) -> vec3<f32> {
     let cell = floor(at);
     let offset = fract(at);
-    // Smoothstep weights: linear interpolation of a value lattice shows the
-    // lattice, because the derivative jumps at every cell edge.
-    let weight = offset * offset * (3.0 - 2.0 * offset);
+    let weight = offset * offset * offset * (offset * (offset * 6.0 - 15.0) + 10.0);
+    let derivative = 30.0 * offset * offset * (offset - 1.0) * (offset - 1.0);
     let a = hash(cell);
     let b = hash(cell + vec2<f32>(1.0, 0.0));
     let c = hash(cell + vec2<f32>(0.0, 1.0));
     let d = hash(cell + vec2<f32>(1.0, 1.0));
-    return mix(mix(a, b, weight.x), mix(c, d, weight.x), weight.y);
+    return vec3<f32>(
+        mix(mix(a, b, weight.x), mix(c, d, weight.x), weight.y),
+        mix(b - a, d - c, weight.y) * derivative.x,
+        mix(c - a, d - b, weight.x) * derivative.y,
+    );
 }
 
-/// Four octaves of value noise, in `[0, 1]`.
-///
-/// Four rather than more because these clouds are seen at a distance and through
-/// a haze; the fifth octave costs four hashes and lands under a pixel.
-fn fbm(at: vec2<f32>) -> f32 {
-    var total: f32 = 0.0;
-    var amplitude: f32 = 0.5;
-    var scaled: vec2<f32> = at;
-    for (var octave: i32 = 0; octave < 4; octave = octave + 1) {
-        total = total + amplitude * value_noise(scaled);
-        // Rotate as well as scale, so the octaves do not line up into a grid.
-        scaled = mat2x2<f32>(1.6, 1.2, -1.2, 1.6) * scaled;
+/// The cloud field and its slope, low-passed to a footprint in cloud coordinates.
+/// Removed octaves contribute their mean, not zero: filtering must not change
+/// the weather. Coarse octaves are shared with the dome, never independent noise.
+fn cloud_field(at: vec2<f32>, footprint: f32) -> vec3<f32> {
+    var field = vec3<f32>(0.5, 0.0, 0.0);
+    var amplitude = 8.0 / 15.0;
+    var frequency = 1.0;
+    var scaled = at;
+    var basis_x = vec2<f32>(1.0, 0.0);
+    var basis_z = vec2<f32>(0.0, 1.0);
+    let octave_transform = mat2x2<f32>(1.6, 1.2, -1.2, 1.6);
+    for (var octave = 0; octave < 4; octave = octave + 1) {
+        let visible = 1.0 - smoothstep(0.25, 0.75, footprint * frequency);
+        if (visible <= 0.0) {
+            break;
+        }
+        let sample = value_noise(scaled);
+        field = field + amplitude * visible * vec3<f32>(
+            sample.x - 0.5,
+            dot(sample.yz, basis_x),
+            dot(sample.yz, basis_z),
+        );
+        scaled = octave_transform * scaled + vec2<f32>(7.1, 3.7);
+        basis_x = octave_transform * basis_x;
+        basis_z = octave_transform * basis_z;
+        frequency = frequency * 2.0;
         amplitude = amplitude * 0.5;
     }
-    return total;
+    return field;
 }
 
-/// Cloud cover along a view direction, in `[0, 1]`.
-///
-/// The clouds live on a flat layer at a fixed height, and the direction is
-/// projected onto it — the standard trick, and the reason clouds crowd towards
-/// the horizon exactly as real ones do: the projection stretches without limit as
-/// the ray flattens. Looking down, or level, there are none.
-///
-/// `drift` moves the layer with time. It is passed in rather than read from a
-/// clock so that this file has no hidden state.
-fn cloud_cover(direction: vec3<f32>, drift: vec2<f32>) -> f32 {
-    // Below this the ray never reaches the layer within any useful distance, and
-    // the projection blows up.
-    if (direction.y < 0.02) {
-        return 0.0;
+/// Engine seconds to layer coordinates. Keep this velocity in agreement with
+/// `sky::cloud_drift`; converting the engine time to f32 happens before multiply
+/// on both CPU and GPU, so the dome and ocean sample the same moving field.
+fn cloud_offset(time: f32) -> vec2<f32> {
+    return vec2<f32>(0.014, 0.006) * time;
+}
+
+/// One atmosphere for the dome and every reflected/ambient lookup.
+/// `roughness` is perceptual GGX roughness; zero reproduces the visible clouds.
+/// Only the dome requests a solar disc: direct ocean GGX accounts for that light.
+fn sky_radiance(
+    direction: vec3<f32>,
+    sun: vec3<f32>,
+    drift: vec2<f32>,
+    roughness: f32,
+    solar_disc: bool,
+) -> vec3<f32> {
+    let up = direction.y;
+    let above = clamp(up, 0.0, 1.0);
+    var colour = mix(HAZE, ZENITH, pow(above, 0.42));
+    colour = mix(colour, NADIR, smoothstep(0.0, 0.08, -up));
+
+    let towards_sun = clamp(dot(direction, sun), 0.0, 1.0);
+    let daylight = smoothstep(-0.04, 0.03, sun.y);
+    // Broad atmospheric forward scattering belongs in reflections too.
+    colour = colour + SUN_COLOUR * (0.30 * daylight) * pow(towards_sun, 8.0);
+    if (solar_disc) {
+        colour = colour + SUN_COLOUR * (9.0 * daylight)
+            * smoothstep(0.99992, 0.99999, towards_sun);
     }
-    // Layer at unit height: the constant only sets the apparent scale, which the
-    // frequency below absorbs.
-    let plane = direction.xz / direction.y + drift;
 
-    let cover = fbm(plane * 0.09);
-    // Two thresholds rather than one: the lower cuts the flat overcast out of the
-    // noise so there is open sky, the upper keeps the tops from saturating into
-    // white paper.
-    let shaped = smoothstep(0.52, 0.78, cover);
+    // A shared flat layer naturally crowds clouds towards the horizon. Haze
+    // hides the projection's singularity rather than wrapping clouds below it.
+    let horizon_visibility = smoothstep(0.025, 0.12, up);
+    if (horizon_visibility <= 0.0) {
+        return colour;
+    }
+    let layer_height = max(up, 0.04);
+    let plane = (direction.xz / layer_height + drift) * 0.32 + vec2<f32>(17.1, 4.7);
+    let perceptual = clamp(roughness, 0.0, 1.0);
+    // A GGX cone grows with alpha = roughness²; planar projection magnifies it
+    // at grazing angles. The tiny common floor also filters distant dome detail.
+    let cone = max(0.0005, 0.8 * perceptual * perceptual);
+    let footprint = cone * 0.32 / (layer_height * layer_height);
+    let field = cloud_field(plane, footprint);
+    // Filtering the coverage threshold as well as the noise preserves soft
+    // cloud masses instead of erasing them as the fine octaves disappear.
+    let edge_width = 0.13 * smoothstep(0.03, 0.75, footprint);
+    let cover = smoothstep(0.46 - edge_width, 0.68 + edge_width, field.x);
+    let opacity = cover * 0.96 * horizon_visibility;
+    if (opacity <= 0.0) {
+        return colour;
+    }
 
-    // Fade out towards the zenith so the layer reads as a ceiling seen obliquely
-    // rather than as a texture wrapped over the whole dome.
-    let towards_horizon = 1.0 - smoothstep(0.0, 0.55, direction.y);
-    return shaped * mix(0.35, 1.0, towards_horizon);
+    // Density gradients give rounded sunward lobes without extra fBm probes.
+    // Dense undersides remain cool; thin sunward edges forward-scatter warm light.
+    let cloud_normal = normalize(vec3<f32>(-field.y * 0.85, 1.0, -field.z * 0.85));
+    let sunlit = max(dot(cloud_normal, sun), 0.0) * daylight;
+    let thickness = smoothstep(0.46, 0.80, field.x);
+    let underside = vec3<f32>(0.50, 0.58, 0.69) * (1.0 - 0.18 * thickness);
+    let edge_light = (0.22 + 0.55 * (1.0 - thickness)) * pow(towards_sun, 12.0);
+    let cloud = underside + SUN_COLOUR * (0.16 + 0.62 * sunlit + edge_light * daylight);
+    return mix(colour, cloud, opacity);
 }
 
-/// The sky colour along a unit direction, with the sun at `sun`.
-///
-/// `drift` is the cloud layer's offset; pass `vec2(0.0)` for a still sky.
-///
-/// Directions are in the render frame: `y` is up.
+/// Visible sky, including the solar disc, in the render frame (`y` is up).
+/// Direction and authoritative sun direction must be normalised.
 fn sky_colour(direction: vec3<f32>, sun: vec3<f32>, drift: vec2<f32>) -> vec3<f32> {
-    let up = direction.y;
-
-    // Gradient. The exponent is what puts the haze in a band near the horizon
-    // instead of smeared over the whole dome.
-    let above = clamp(up, 0.0, 1.0);
-    var colour = mix(HAZE, ZENITH, pow(above, 0.42));
-    // Below the horizon, fade to the nadir colour over a few degrees so a
-    // reflecting wave face does not step abruptly.
-    colour = mix(colour, NADIR, smoothstep(0.0, -0.08, up));
-
-    let towards_sun = clamp(dot(direction, sun), 0.0, 1.0);
-
-    // Aureole: the bright wash around the sun, which is most of what makes a sky
-    // read as having a sun in it at all.
-    colour = colour + SUN_COLOUR * 0.30 * pow(towards_sun, 8.0);
-    // And the disc. Half a degree of arc is a dot product of about 0.99996; this
-    // is deliberately softer and larger than the real thing, because a
-    // half-degree disc is a couple of pixels and aliases into a flicker.
-    colour = colour + SUN_COLOUR * 9.0 * smoothstep(0.9993, 0.99975, towards_sun);
-
-    // Clouds last, lit by how much of the sun they face. A cloud in front of the
-    // sun is brighter, not darker: these are thin enough to be translucent, and
-    // the alternative reads as a hole punched in the sky.
-    let cover = cloud_cover(direction, drift);
-    if (cover > 0.0) {
-        let shade = mix(vec3<f32>(0.52, 0.56, 0.62), vec3<f32>(1.0, 0.98, 0.95), 0.35 + 0.65 * towards_sun);
-        let bright = shade + SUN_COLOUR * 0.55 * pow(towards_sun, 5.0);
-        colour = mix(colour, bright, cover);
-    }
-
-    return colour;
+    return sky_radiance(direction, sun, drift, 0.0, true);
 }
 
-/// The sky as seen by a reflecting surface: gradient and aureole, no sun disc and
-/// no clouds.
-///
-/// Two omissions, both measured rather than assumed.
-///
-/// The **disc** is left out because a mirror-sharp sun reflected off an
-/// interpolated normal lands on whichever triangles happen to face it and
-/// flickers as the mesh slides under the water. The ocean adds its own specular
-/// lobe instead, computed from the analytic normal and therefore stable.
-///
-/// The **clouds** are left out because they cost four octaves of value noise —
-/// sixteen hashes, each a `sin` — and this function runs once per *sea* fragment,
-/// which is most of the screen. Including them cost ten frames a second, and
-/// bought an effect that a wavy surface scatters into an even grey anyway: a
-/// cloud reflected in chop is not a cloud, it is a slightly duller patch of sky.
-/// The dome still draws them at full detail, where they are actually legible.
-fn sky_reflection(direction: vec3<f32>, sun: vec3<f32>) -> vec3<f32> {
-    let up = direction.y;
-    let above = clamp(up, 0.0, 1.0);
-    var colour = mix(HAZE, ZENITH, pow(above, 0.42));
-    colour = mix(colour, NADIR, smoothstep(0.0, -0.08, up));
-
-    let towards_sun = clamp(dot(direction, sun), 0.0, 1.0);
-    return colour + SUN_COLOUR * 0.30 * pow(towards_sun, 8.0);
+/// The same animated sky, excluding only the solar disc owned by ocean GGX.
+/// Roughness filters coherent cloud detail and lighting, not a separate sky.
+fn sky_reflection(
+    direction: vec3<f32>,
+    sun: vec3<f32>,
+    drift: vec2<f32>,
+    roughness: f32,
+) -> vec3<f32> {
+    return sky_radiance(direction, sun, drift, roughness, false);
 }

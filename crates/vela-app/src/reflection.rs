@@ -23,10 +23,10 @@
 //! The mirror camera's view matrix is the chase camera's with a reflection
 //! composed in front of it, so a point's clip position in the mirror view is the
 //! chase view's clip position of that point's *mirror image*. That is exactly
-//! the screen position at which the reflection is seen, which is why the water
-//! samples the image at its own `clip_position.xy / viewport.zw` with no flip:
-//! the image is in the main view's orientation, and the boat within it is
-//! upside down, as a reflection is.
+//! the undisturbed reflection's screen position. The ocean projects its perturbed
+//! reflected ray into this image, filters it by surface roughness, and fades
+//! samples beyond the image bounds. Its orientation needs no additional flip;
+//! the boat within it is upside down, as a reflection is.
 //!
 //! # What it costs
 //!

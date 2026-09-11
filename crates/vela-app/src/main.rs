@@ -30,6 +30,7 @@
 //! split is stated in [`boat`] rather than papered over.
 
 mod boat;
+mod foam;
 mod frame;
 mod helm;
 mod hud;

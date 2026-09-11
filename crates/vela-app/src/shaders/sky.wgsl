@@ -17,5 +17,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // this is the same as the normalised dome position, but taking the difference
     // costs nothing and does not depend on that staying true.
     let direction = normalize(in.world_position.xyz - view.world_position);
+    // The zero-roughness atmosphere used by water, with only the solar disc
+    // added. `drift.xy` is sky::cloud_drift at the ocean's engine time.
     return vec4<f32>(sky_colour(direction, sun.xyz, drift.xy), 1.0);
 }

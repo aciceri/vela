@@ -22,24 +22,25 @@
 //!
 //! # What is physical and what is cosmetic
 //!
-//! The *geometry* is the realisation and nothing else: no vertex moves for any
-//! reason the physics does not know about, which is what keeps the hull's
-//! clip and the picture the same sea. Everything the eye needs below the
-//! realisation's shortest wave — three and a half metres in the sea it is
-//! validated in — is added to the **shading** only, as slope, foam and light:
+//! Near the hull, geometry is the exact physical realisation. Farther out,
+//! wavelengths smaller than the polar mesh can resolve are filtered before
+//! sampling; their slope variance survives as optical roughness. The renderer
+//! never feeds this level of detail back into the physics. Detail below the
+//! realisation's shortest wave is added only as slope, foam and light:
 //!
 //! - a wind sea of four Gerstner components between one and three metres,
-//!   running downwind in patches that drift with the wind, contributing slope
+//!   running downwind in independently modulated wave packets, contributing slope
 //!   and the whitecaps its own Jacobian says it would have broken;
-//! - crest sharpening of the physical slope (Horvath's peak enhancement), so
-//!   the swell's crests read as crests rather than as the rounded tops of a
-//!   sum of cosines;
-//! - whitecaps on the swell where its curvature says a trochoidal sea of that
-//!   height would have folded, the bow wave along the forward third of the
-//!   hull, and the wake along the stern's recorded track;
+//! - GGX sunlight with dielectric Fresnel and unresolved slope variance, rather
+//!   than an artificially capped reflection or magnified distant noise;
+//! - persistent whitecaps injected by swell compression and the bow/stern into
+//!   a scrolling parcel-space history texture; transport and decay follow the
+//!   engine clock, while cellular pores stretch with the physical wave orbit;
+//! - fixed-scale ripple bands and foam detail filtered by pixel footprint,
+//!   rather than rescaling their coordinates as the camera moves;
 //! - the statistical self-shadowing of a rough surface for a low sun;
-//! - the boat's mirror image, rendered by `crate::reflection` and composited
-//!   over the analytic sky.
+//! - the boat's planar reflection, distorted along the reflected ray and blurred
+//!   by roughness, composited over the same animated sky drawn above the sea.
 //!
 //! Each of these is a known lie stated as one, in the shader, next to the
 //! thing it fakes. None of them is fed back into the physics.
@@ -115,19 +116,11 @@ pub struct ShaderWave {
     pub phase: f32,
     /// Amplitude, m.
     pub amplitude: f32,
-    /// Cosine and sine of the phase this wave advances by over one
-    /// [`FOAM_MEMORY`] interval, so the shader can look the wave up in the past
-    /// with a rotation rather than another sine. The third is padding to the
-    /// 32-byte stride, never read.
-    pub memory_cos: f32,
-    pub memory_sin: f32,
-    pub pad: f32,
+    /// Scalar padding preserves the 32-byte uniform-array stride.
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
 }
-
-/// How far back the shader asks a parcel of water whether it was folding, s;
-/// it asks at one and two of these. The persistence a whitecap has in a fresh
-/// breeze: bright as it breaks, a patch for a few seconds, gone in five.
-pub const FOAM_MEMORY: f64 = 1.4;
 
 /// The scalars every wave shares.
 #[derive(ShaderType, Clone, Debug)]
@@ -188,6 +181,9 @@ pub struct SeaUniform {
     /// [`OceanMaterial::record`] so the shader can skip the track's loop
     /// for every fragment that is not near it, which is nearly all of them.
     pub trail_bounds: Vec4,
+    /// Parcel-space history bounds: `(origin.x, origin.z, span, enabled)`.
+    /// The origin follows the boat on a downwind-advected texel lattice.
+    pub foam_region: Vec4,
 }
 
 /// Samples of the stern's track the shader can carry.
@@ -224,6 +220,12 @@ pub struct OceanMaterial {
     #[texture(3)]
     #[sampler(4)]
     pub reflection: Option<Handle<Image>>,
+    /// Completed persistent foam, packed as `r + g / 255` in linear UNORM.
+    #[texture(5)]
+    #[sampler(6)]
+    pub foam_history: Option<Handle<Image>>,
+    /// A new physical realisation invalidates accumulated foam, even at rest.
+    pub(crate) foam_epoch: u64,
 }
 
 impl OceanMaterial {
@@ -261,10 +263,13 @@ impl OceanMaterial {
                 wind: Vec4::new(1.0, 0.0, 0.0, 0.0),
                 choppiness: 0.0,
                 trail_bounds: Vec4::ZERO,
+                foam_region: Vec4::ZERO,
             },
             waves: [ShaderWave::default(); MAX_WAVES],
             trail: [TrailPoint::default(); MAX_TRAIL],
             reflection: None,
+            foam_history: None,
+            foam_epoch: 0,
         };
         material.realise(sea);
         material
@@ -297,9 +302,9 @@ impl OceanMaterial {
                 frequency: wave.frequency as f32,
                 phase: wave.phase as f32,
                 amplitude: wave.amplitude as f32,
-                memory_cos: (wave.frequency * FOAM_MEMORY).cos() as f32,
-                memory_sin: (wave.frequency * FOAM_MEMORY).sin() as f32,
-                pad: 0.0,
+                pad0: 0.0,
+                pad1: 0.0,
+                pad2: 0.0,
             };
         }
 
@@ -319,6 +324,8 @@ impl OceanMaterial {
         self.sea.wind.x = downwind.x;
         self.sea.wind.y = downwind.y;
         self.sea.choppiness = sea.map_or(0.0, |sea| sea.state().choppiness as f32);
+        self.foam_epoch = self.foam_epoch.wrapping_add(1);
+        self.sea.foam_region = Vec4::ZERO;
     }
 
     /// Tells the water which way the hull points and how the bow is moving
@@ -504,7 +511,10 @@ pub struct OceanPlugin;
 impl Plugin for OceanPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/ocean.wgsl");
-        app.add_plugins(MaterialPlugin::<OceanMaterial>::default());
+        app.add_plugins((
+            MaterialPlugin::<OceanMaterial>::default(),
+            crate::foam::FoamPlugin,
+        ));
     }
 }
 

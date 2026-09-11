@@ -44,9 +44,9 @@ pub const SUN: Vec3 = Vec3::new(0.46, 0.30, -0.62);
 
 /// How fast the cloud layer drifts, in shader units per second.
 ///
-/// Slow enough to be a sky rather than a weather report. Driven by the engine's
-/// clock, not the render clock, for the same reason the sea is: two clocks would
-/// let the clouds and the water disagree about how long the run has been going.
+/// Slow enough to be a sky rather than a weather report. This matches the WGSL
+/// `cloud_offset` velocity in `shaders/atmosphere.wgsl`, which lets the ocean use
+/// its existing engine-time uniform instead of uploading another cloud clock.
 const CLOUD_DRIFT: Vec2 = Vec2::new(0.014, 0.006);
 
 /// Radius of the dome, m.
@@ -69,9 +69,8 @@ pub struct Sky;
 /// other.
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct SkyMaterial {
-    /// Direction towards the sun, and the cloud drift packed into `.w`-adjacent
-    /// slots: a single `vec4` pair, because a uniform of loose floats wastes a
-    /// binding on padding under WebGL2's alignment rules.
+    /// Direction towards the authoritative sun. Both bindings use `vec4`s to
+    /// preserve WebGL2 uniform alignment; the drift occupies the second `.xy`.
     #[uniform(0)]
     pub sun: Vec4,
     #[uniform(1)]
@@ -80,9 +79,9 @@ pub struct SkyMaterial {
 
 /// Where the cloud layer has drifted to by a given time.
 ///
-/// Public because the ocean reflects these clouds and has to reflect the ones
-/// that are there. Same function, one definition — the sea and the sky are the
-/// same arithmetic for the same reason the sea and the physics are.
+/// The atmosphere's `cloud_offset` uses this same velocity and f32 time
+/// conversion. The dome uploads this offset; the ocean derives it from its
+/// existing engine-time uniform, so both see the same animated cloud layer.
 #[must_use]
 pub fn cloud_drift(time: f64) -> Vec2 {
     CLOUD_DRIFT * time as f32

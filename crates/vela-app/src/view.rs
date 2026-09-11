@@ -328,9 +328,8 @@ pub fn spawn(
         //
         // Same `Sea` marker, so `follow_sea` carries this with the disc, and the
         // ring's sampling of the wave field moves with the boat as the disc's
-        // does — but a sixteen metre triangle drifting is not something an eye
-        // can find at that range, and the displacement is faded out over it
-        // anyway.
+        // does. Waves too short for these wider triangles are filtered before
+        // sampling; their unresolved slope energy still broadens reflections.
         commands.spawn((
             Mesh3d(meshes.add(horizon_ring(REACH, HORIZON, SEGMENTS, HORIZON_RINGS))),
             MeshMaterial3d(ocean),
