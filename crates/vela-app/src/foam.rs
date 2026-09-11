@@ -23,7 +23,7 @@ use bevy::render::{
         binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
-    renderer::{RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue},
+    renderer::{RenderContext, RenderGraph, RenderGraphSystems, RenderQueue},
     texture::GpuImage,
     RenderApp, RenderStartup,
 };
@@ -299,7 +299,6 @@ fn render_history(
     pipeline: Res<FoamPipeline>,
     cache: Res<PipelineCache>,
     images: Res<RenderAssets<GpuImage>>,
-    device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut gpu: ResMut<FoamGpu>,
     mut context: RenderContext,
@@ -323,9 +322,10 @@ fn render_history(
     // A fixed direction for this acknowledged request guarantees these are
     // different, even when preparation took several frames.
     debug_assert_ne!(request.source.id(), request.destination.id());
+    let device = context.render_device();
     let buffers = gpu.buffers.get_or_insert_with(|| {
         let mut trail = UniformBuffer::from([TrailPoint::default(); MAX_TRAIL]);
-        trail.write_buffer(&device, &queue);
+        trail.write_buffer(device, &queue);
         FoamBuffers {
             sea: UniformBuffer::from(request.sea.clone()),
             waves: UniformBuffer::from(request.waves),
@@ -337,9 +337,9 @@ fn render_history(
     buffers.sea.set(request.sea.clone());
     buffers.waves.set(request.waves);
     buffers.pass.set(request.pass);
-    buffers.sea.write_buffer(&device, &queue);
-    buffers.waves.write_buffer(&device, &queue);
-    buffers.pass.write_buffer(&device, &queue);
+    buffers.sea.write_buffer(device, &queue);
+    buffers.waves.write_buffer(device, &queue);
+    buffers.pass.write_buffer(device, &queue);
 
     let binding = &mut buffers.bindings[request.destination_index];
     if binding

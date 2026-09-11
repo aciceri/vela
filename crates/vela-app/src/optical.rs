@@ -23,7 +23,7 @@ use bevy::render::{
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_asset::RenderAssets,
     render_resource::{binding_types::uniform_buffer, *},
-    renderer::{RenderContext, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue},
+    renderer::{RenderContext, RenderGraph, RenderGraphSystems, RenderQueue},
     texture::GpuImage,
     view::{ViewUniform, ViewUniformOffset, ViewUniforms},
     RenderApp, RenderStartup,
@@ -208,14 +208,13 @@ fn spawn(
     ));
 }
 
+type OpticalOnly = (With<OpticalCamera>, Without<Chase>);
+
 fn synchronize(
     field: Option<ResMut<Field>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     chase: Query<(&Transform, &Projection), With<Chase>>,
-    mut cameras: Query<
-        (&mut Transform, &mut Projection, &mut RenderTarget),
-        (With<OpticalCamera>, Without<Chase>),
-    >,
+    mut cameras: Query<(&mut Transform, &mut Projection, &mut RenderTarget), OpticalOnly>,
     mut images: ResMut<Assets<Image>>,
     mut oceans: ResMut<Assets<OceanMaterial>>,
     mut exchange: ResMut<Exchange>,
@@ -300,8 +299,8 @@ fn initialize_pipeline(
         ShaderDefVal::UInt("MATERIAL_BIND_GROUP".into(), 1),
         ShaderDefVal::UInt("MAX_WAVES".into(), MAX_WAVES as u32),
         ShaderDefVal::UInt("MAX_TRAIL".into(), MAX_TRAIL as u32),
-        ShaderDefVal::UInt("OCEAN_COLUMNS".into(), crate::view::SEA_COLUMNS as u32),
-        ShaderDefVal::UInt("OCEAN_ROWS".into(), crate::view::SEA_ROWS as u32),
+        ShaderDefVal::UInt("OCEAN_COLUMNS".into(), crate::view::SEA_COLUMNS),
+        ShaderDefVal::UInt("OCEAN_ROWS".into(), crate::view::SEA_ROWS),
     ];
     let id = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("optical_field".into()),
@@ -351,12 +350,12 @@ fn begin_frame(mut gpu: ResMut<FieldGpu>) {
 
 fn render_field(
     exchange: Res<Exchange>,
-    pipeline: Res<FieldPipeline>,
-    cache: Res<PipelineCache>,
+    (pipeline, cache): (Res<FieldPipeline>, Res<PipelineCache>),
     images: Res<RenderAssets<GpuImage>>,
-    views: Query<&ViewUniformOffset, With<OpticalSource>>,
-    uniforms: Res<ViewUniforms>,
-    device: Res<RenderDevice>,
+    (views, uniforms): (
+        Query<&ViewUniformOffset, With<OpticalSource>>,
+        Res<ViewUniforms>,
+    ),
     queue: Res<RenderQueue>,
     mut gpu: ResMut<FieldGpu>,
     mut context: RenderContext,
@@ -375,6 +374,7 @@ fn render_field(
         return;
     };
     let gpu = &mut *gpu;
+    let device = context.render_device();
     if gpu
         .view_binding
         .as_ref()
@@ -392,8 +392,8 @@ fn render_field(
     let buffers = gpu.buffers.get_or_insert_with(|| {
         let mut sea = UniformBuffer::from(frame.sea.clone());
         let mut waves = UniformBuffer::from(*frame.waves);
-        sea.write_buffer(&device, &queue);
-        waves.write_buffer(&device, &queue);
+        sea.write_buffer(device, &queue);
+        waves.write_buffer(device, &queue);
         let binding = device.create_bind_group(
             "optical_sea",
             &cache.get_bind_group_layout(&pipeline.sea_layout),
@@ -407,10 +407,10 @@ fn render_field(
         }
     });
     buffers.sea.set(frame.sea.clone());
-    buffers.sea.write_buffer(&device, &queue);
+    buffers.sea.write_buffer(device, &queue);
     if !Arc::ptr_eq(&buffers.source, &frame.waves) {
         buffers.waves.set(*frame.waves);
-        buffers.waves.write_buffer(&device, &queue);
+        buffers.waves.write_buffer(device, &queue);
         buffers.source = frame.waves.clone();
     }
     let mut pass = context

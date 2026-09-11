@@ -506,8 +506,8 @@ impl Material for OceanMaterial {
     ) -> Result<(), SpecializedMeshPipelineError> {
         let waves = ShaderDefVal::UInt("MAX_WAVES".into(), MAX_WAVES as u32);
         let trail = ShaderDefVal::UInt("MAX_TRAIL".into(), MAX_TRAIL as u32);
-        let columns = ShaderDefVal::UInt("OCEAN_COLUMNS".into(), crate::view::SEA_COLUMNS as u32);
-        let rows = ShaderDefVal::UInt("OCEAN_ROWS".into(), crate::view::SEA_ROWS as u32);
+        let columns = ShaderDefVal::UInt("OCEAN_COLUMNS".into(), crate::view::SEA_COLUMNS);
+        let rows = ShaderDefVal::UInt("OCEAN_ROWS".into(), crate::view::SEA_ROWS);
         descriptor.vertex.shader_defs.push(waves.clone());
         descriptor.vertex.shader_defs.push(trail.clone());
         descriptor.vertex.shader_defs.push(columns.clone());
